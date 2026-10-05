@@ -163,13 +163,26 @@ final class SecureStore {
         return readAndMigrate(key, true);
     }
 
-    /** Encrypts and stores a value. Throws without touching the stored entry when that fails. */
+    /**
+     * Encrypts and stores a value. The ciphertext is decrypted once in memory first, so a keystore
+     * that encrypts but cannot decrypt never replaces a readable entry with one nobody can read.
+     * Throws without touching the stored entry when that fails.
+     */
     synchronized void set(String key, byte[] value) throws StorageException {
         startSweepOnce();
         String encoded;
         try {
             encoded = encryptV2(key, value, true);
+            byte[] storedBlob = base64.decode(encoded.substring(V2_PREFIX.length()));
+            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(storedBlob, aad(key)), this::isPermanentAes, true);
+            if (!Arrays.equals(roundTrip, value)) {
+                aesFailing = true;
+                throw new StorageException("Encrypted value does not decrypt back to the same bytes", null);
+            }
+        } catch (StorageException e) {
+            throw e;
         } catch (Exception e) {
+            aesFailing = true;
             throw new StorageException("Could not encrypt value", e);
         }
         aesFailing = false;

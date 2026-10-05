@@ -369,6 +369,33 @@ public class SecureStoreTest {
     }
 
     @Test
+    public void setRejectsWhenTheNewBlobDecryptsToOtherBytes() throws Exception {
+        backend.aesDecryptCorruptsForAad = SecureStore.aad("pin");
+
+        try {
+            secureStore.set("pin", utf8("1234"));
+            fail("set must reject a value that does not decrypt back");
+        } catch (StorageException expected) {
+            // fail closed
+        }
+        assertFalse("nothing is written", store.map.containsKey("pin"));
+    }
+
+    @Test
+    public void setRejectsWhenTheNewBlobDoesNotDecrypt() throws Exception {
+        backend.aesDecryptBadTagForAad = SecureStore.aad("pin");
+
+        try {
+            secureStore.set("pin", utf8("1234"));
+            fail("set must reject a value that does not decrypt back");
+        } catch (StorageException expected) {
+            // fail closed
+        }
+        assertFalse("nothing is written", store.map.containsKey("pin"));
+        assertEquals(0, secureStore.diagnostics().migrated);
+    }
+
+    @Test
     public void legacyEntryIsKeptWhenItsNewBlobDecryptsToOtherBytes() throws Exception {
         String legacy = Fakes.androidDefaultBase64(utf8("1234"));
         store.map.put("pin", legacy);
@@ -415,8 +442,13 @@ public class SecureStoreTest {
         assertEquals(a, store.map.get("a"));
         assertEquals(b, store.map.get("b"));
 
-        secureStore.set("c", utf8("3"));
-        assertTrue("set follows its normal path", store.map.get("c").startsWith("v2:"));
+        try {
+            secureStore.set("c", utf8("3"));
+            fail("set fails closed while the keystore cannot decrypt what it encrypts");
+        } catch (StorageException expected) {
+            // the round-trip check rejects the write
+        }
+        assertFalse("nothing is written for c", store.map.containsKey("c"));
 
         backend.aesDecryptAlwaysThrows = null;
         assertEquals("1", getString("a"));

@@ -110,6 +110,13 @@ export interface SecureStorageDiagnostics {
    */
   conflictingDuplicates?: number;
   /**
+   * Android only: keys whose legacy entry was kept because the re-encrypted value did not decrypt back to the same
+   * bytes, could not be encrypted, or could not be written. Optional because iOS and web do not report it.
+   *
+   * @since 1.0.0
+   */
+  migrationSkipped?: number;
+  /**
    * Key that encrypts values. On iOS `secureEnclave`, `software` (the simulator fallback), or `unusable` once the key kept
    * refusing on an unlocked device and values fall back to plaintext for the rest of the process. On Android
    * `keystoreAes`, or `keystoreRsaLegacy` while only the upstream RSA key exists. `none` means no key exists yet or it could
