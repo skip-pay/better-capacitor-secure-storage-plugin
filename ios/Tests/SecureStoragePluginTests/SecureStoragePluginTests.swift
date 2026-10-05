@@ -116,16 +116,28 @@ private func settle(_ vault: SecureStorageVault) {
     vault.queue.sync {}
 }
 
+private func describe(_ result: SecureStorageVault.DecodeResult) -> String {
+    switch result {
+    case .plaintext(let value): return "plaintext(\(value))"
+    case .decrypted(let value): return "decrypted(\(value))"
+    case .locked: return "locked"
+    case .invalid: return "invalid"
+    }
+}
+
 private func makeVault(
     _ accessibility: SecureStorageVault.Accessibility = .whenUnlockedThisDeviceOnly,
     protectedData: @escaping () -> Bool? = { true },
     active: @escaping () -> Bool = { true },
     refresh: @escaping () -> Void = {},
     probe: @escaping () -> Bool = { true },
-    ticker: SecureStorageTicker = ManualTicker()
+    ticker: SecureStorageTicker = ManualTicker(),
+    // The key reference cache is per tag and process wide, a tag per vault keeps the tests apart.
+    keyTag: String = "unit.\(UUID().uuidString)"
 ) -> SecureStorageVault {
     return SecureStorageVault(
         configuration: SecureStorageVault.Configuration(accessibility: accessibility),
+        keyTag: keyTag,
         bundleIdentifier: nil,
         isProtectedDataAvailable: protectedData,
         isApplicationActive: active,
@@ -133,6 +145,76 @@ private func makeVault(
         unlockProbe: probe,
         ticker: ticker
     )
+}
+
+/// An in-memory P-256 key, no keychain needed.
+private func makeSoftwareKey() -> SecKey {
+    let attributes: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom, kSecAttrKeySizeInBits as String: 256]
+    var error: Unmanaged<CFError>?
+    return SecKeyCreateRandomKey(attributes as CFDictionary, &error)!
+}
+
+private func encrypt(_ plaintext: Data, for key: SecKey) -> Data {
+    var error: Unmanaged<CFError>?
+    let ciphertext = SecKeyCreateEncryptedData(SecKeyCopyPublicKey(key)!, .eciesEncryptionCofactorVariableIVX963SHA256AESGCM, plaintext as CFData, &error)! as Data
+    return SecureStorageVault.magic + ciphertext
+}
+
+private func encrypt(_ value: String, for key: SecKey) -> Data {
+    return encrypt(Data(value.utf8), for: key)
+}
+
+/// A `get` of fixed item bytes: the decoding and the lost escape of the real vault, no keychain item behind it.
+private func submitDecodingGet(_ vault: SecureStorageVault, _ data: Data, log: EventLog) {
+    vault.submitOperation(named: "get", key: "pin", run: {
+        switch vault.decodeValue(data) {
+        case .plaintext(let value), .decrypted(let value):
+            return .resolve(["value": value])
+        case .locked:
+            return .locked
+        case .invalid:
+            return .reject(SecureStorageVault.missingItemMessage, code: .unreadable)
+        }
+    }, lost: { vault.lostValue(forKey: "pin") }, completion: { log.record("get \(describe($0))") })
+}
+
+private func osStatusError(_ code: OSStatus) -> Unmanaged<CFError> {
+    return Unmanaged.passRetained(CFErrorCreate(nil, kCFErrorDomainOSStatus, CFIndex(code), nil)!)
+}
+
+/// Stubs the key lookup with `status`, handing out `key` on success, and counts the lookups.
+private func stubKeyLookup(_ vault: SecureStorageVault, key: SecKey?, status: @escaping () -> OSStatus = { errSecSuccess }) -> Flag<Int> {
+    let lookups = Flag(0)
+    vault.queue.sync {
+        vault.copyMatchingKey = { _, result in
+            lookups.write(lookups.read() + 1)
+            let current = status()
+            if current == errSecSuccess {
+                result?.pointee = key
+            }
+            return current
+        }
+        vault.decryptRetryDelays = [0, 0]
+    }
+    return lookups
+}
+
+/// Fails the decryption with the codes in turn, then decrypts for real once they are used up. `nil` decrypts for real.
+private func stubDecryption(_ vault: SecureStorageVault, failures: [OSStatus?], repeatLast: Bool = false) -> Flag<Int> {
+    let calls = Flag(0)
+    vault.queue.sync {
+        vault.decryptCiphertext = { key, algorithm, ciphertext, error in
+            let index = calls.read()
+            calls.write(index + 1)
+            let failure = index < failures.count ? failures[index] : (repeatLast ? failures.last ?? nil : nil)
+            guard let code = failure else {
+                return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
+            }
+            error?.pointee = osStatusError(code)
+            return nil
+        }
+    }
+    return calls
 }
 
 final class SecureStorageConfigurationTests: XCTestCase {
@@ -577,6 +659,142 @@ final class SecureStorageEscapeTests: XCTestCase {
     }
 }
 
+final class SecureStorageDecryptTests: XCTestCase {
+    func testTransientDecryptFailureIsRetriedWithAFreshKeyLookup() {
+        let vault = makeVault()
+        let key = makeSoftwareKey()
+        let lookups = stubKeyLookup(vault, key: key)
+        let calls = stubDecryption(vault, failures: [errSecInternalError])
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt("1234", for: key))) }, "decrypted(1234)")
+        XCTAssertEqual(calls.read(), 2)
+        XCTAssertEqual(lookups.read(), 2, "the cached key was dropped and looked up again")
+        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 1)
+    }
+
+    func testWrongKeyOrCorruptCiphertextIsInvalidAfterTwoRetries() {
+        for code in [errSecParam, errSecDecode] {
+            let vault = makeVault()
+            let key = makeSoftwareKey()
+            let lookups = stubKeyLookup(vault, key: key)
+            let calls = stubDecryption(vault, failures: [code], repeatLast: true)
+            XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt("1234", for: key))) }, "invalid", "\(code)")
+            XCTAssertEqual(calls.read(), 3, "\(code)")
+            XCTAssertEqual(lookups.read(), 3, "\(code)")
+            XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 2, "\(code)")
+        }
+    }
+
+    func testCiphertextOfAnotherKeyIsInvalid() {
+        let vault = makeVault()
+        _ = stubKeyLookup(vault, key: makeSoftwareKey())
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt("1234", for: makeSoftwareKey()))) }, "invalid")
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(SecureStorageVault.magic + Data(repeating: 0x5A, count: 97))) }, "invalid")
+    }
+
+    func testFailureNotKnownToBePermanentParksAndEndsThroughTheLostEscape() {
+        let ticker = ManualTicker()
+        let vault = makeVault(ticker: ticker)
+        let key = makeSoftwareKey()
+        _ = stubKeyLookup(vault, key: key)
+        _ = stubDecryption(vault, failures: [errSecInternalError], repeatLast: true)
+        let log = EventLog()
+        submitDecodingGet(vault, encrypt("1234", for: key), log: log)
+        vault.queue.sync {}
+        ticker.fire(times: 2)
+        XCTAssertTrue(log.events.isEmpty, "never UNREADABLE on the first attempts")
+        ticker.fire()
+        XCTAssertEqual(log.events, ["get reject Item with given key does not exist UNREADABLE"])
+        XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 1)
+        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 8, "two retries in each of four runs")
+    }
+
+    func testFailureThatRecoversOnALaterTickResolvesWithTheValue() {
+        let ticker = ManualTicker()
+        let vault = makeVault(ticker: ticker)
+        let key = makeSoftwareKey()
+        _ = stubKeyLookup(vault, key: key)
+        let calls = stubDecryption(vault, failures: [errSecInternalError, -25293, errSecInternalError])
+        let log = EventLog()
+        submitDecodingGet(vault, encrypt("1234", for: key), log: log)
+        vault.queue.sync {}
+        XCTAssertTrue(log.events.isEmpty)
+        XCTAssertEqual(calls.read(), 3)
+        ticker.fire()
+        XCTAssertEqual(log.events, ["get resolve 1234"])
+        XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 0)
+    }
+
+    func testLockedDecryptionParksWithoutRetries() {
+        let cases: [(String, () -> Bool?, OSStatus)] = [
+            ("protected data unavailable", { false }, errSecParam),
+            ("protected data unknown", { nil }, errSecParam),
+            ("errSecInteractionNotAllowed", { true }, errSecInteractionNotAllowed),
+        ]
+        for (name, protectedData, code) in cases {
+            let vault = makeVault(protectedData: protectedData)
+            let key = makeSoftwareKey()
+            _ = stubKeyLookup(vault, key: key)
+            let calls = stubDecryption(vault, failures: [code], repeatLast: true)
+            XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt("1234", for: key))) }, "locked", name)
+            XCTAssertEqual(calls.read(), 1, name)
+            XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 0, name)
+        }
+    }
+
+    func testWrongKeyStaysParkedWhileTheProbeSaysLocked() {
+        let vault = makeVault(probe: { false })
+        let key = makeSoftwareKey()
+        _ = stubKeyLookup(vault, key: key)
+        _ = stubDecryption(vault, failures: [errSecParam], repeatLast: true)
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt("1234", for: key))) }, "locked")
+    }
+
+    func testKeyLookupFailureParksInsteadOfRejecting() {
+        let vault = makeVault()
+        _ = stubKeyLookup(vault, key: nil, status: { errSecMissingEntitlement })
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt("1234", for: makeSoftwareKey()))) }, "locked")
+    }
+
+    func testMissingKeyIsInvalidOnlyWhileTheProbeConfirmsUnlock() {
+        let unlocked = Flag(true)
+        let vault = makeVault(probe: { unlocked.read() })
+        _ = stubKeyLookup(vault, key: nil, status: { errSecItemNotFound })
+        let data = encrypt("1234", for: makeSoftwareKey())
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(data)) }, "invalid")
+        unlocked.write(false)
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(data)) }, "locked")
+        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 0, "a key that is not there is not retried")
+    }
+
+    func testKeyThatDisappearsAfterAFailedDecryptionIsLookedUpOnEveryRetry() {
+        let vault = makeVault()
+        let key = makeSoftwareKey()
+        let lookupStatus = Flag(errSecSuccess)
+        let lookups = stubKeyLookup(vault, key: key, status: { lookupStatus.read() })
+        vault.queue.sync {
+            vault.decryptCiphertext = { _, _, _, error in
+                lookupStatus.write(errSecItemNotFound)
+                error?.pointee = osStatusError(errSecInternalError)
+                return nil
+            }
+        }
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt("1234", for: key))) }, "invalid", "a key that stays missing while unlocked is final")
+        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 2)
+        XCTAssertGreaterThan(lookups.read(), 2)
+    }
+
+    func testStructuralProblemsAreInvalidWithoutAKeyLookup() {
+        let vault = makeVault()
+        let key = makeSoftwareKey()
+        let lookups = stubKeyLookup(vault, key: key)
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(SecureStorageVault.magic)) }, "invalid", "prefix without ciphertext")
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(Data([0xFF, 0xFE, 0x00]))) }, "invalid", "plaintext that is not UTF-8")
+        XCTAssertEqual(lookups.read(), 0)
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt(Data([0xFF, 0xFE]), for: key))) }, "invalid", "decrypted bytes that are not UTF-8")
+        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 0)
+    }
+}
+
 final class SecureStorageSweepTests: XCTestCase {
     func testSweepSkipsLockedKeysAndContinues() {
         let vault = makeVault()
@@ -700,12 +918,13 @@ final class SecureStoragePluginTests: XCTestCase {
     func testGetDiagnosticsResolvesWithoutConfiguredVault() {
         let result = invoke(SecureStoragePlugin.getDiagnostics)
         XCTAssertNil(result.rejected)
-        for counter in ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks"] {
+        let counters = ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries"]
+        for counter in counters {
             XCTAssertEqual(result.resolved?[counter] as? Int, 0, counter)
         }
         XCTAssertEqual(result.resolved?["keyBackend"] as? String, "none")
         XCTAssertEqual(result.resolved?["accessGroupMode"] as? String, "default")
-        XCTAssertEqual(result.resolved?.count, 8)
+        XCTAssertEqual(result.resolved?.count, counters.count + 2)
     }
 
     func testPluginMethodsAreAdditive() {

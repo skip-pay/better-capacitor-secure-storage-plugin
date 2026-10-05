@@ -178,7 +178,21 @@ func describe(_ result: SecureStorageVault.DecodeResult) -> String {
     case .decrypted(let s): return "decrypted(\(s))"
     case .locked: return "locked"
     case .invalid: return "invalid"
-    case .failure: return "failure"
+    }
+}
+
+func osStatusError(_ code: OSStatus) -> Unmanaged<CFError> {
+    return Unmanaged.passRetained(CFErrorCreate(nil, kCFErrorDomainOSStatus, CFIndex(code), nil)!)
+}
+
+/// Wraps the real decryption and records the code of every failure.
+func recordingDecryption(_ codes: @escaping (Int) -> Void) -> (SecKey, SecKeyAlgorithm, CFData, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFData? {
+    return { key, algorithm, ciphertext, error in
+        let result = SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
+        if result == nil, let failure = error?.pointee {
+            codes(CFErrorGetCode(failure.takeUnretainedValue()))
+        }
+        return result
     }
 }
 
@@ -346,7 +360,12 @@ vault.queue.sync {
     print("--- 5 invalid ciphertext")
     let garbage = magic + Data((0..<80).map { UInt8(truncatingIfNeeded: $0 &* 37) })
     check("5 write garbage", write(vault, "bad", garbage) == errSecSuccess)
+    var garbageCodes: [Int] = []
+    vault.decryptCiphertext = recordingDecryption { garbageCodes.append($0) }
+    let retriesBefore = vault.counters.decryptRetries
     check("5 decodeValue invalid (not locked)", describe(vault.decodeValue(garbage)) == "invalid")
+    check("5 garbage fails with errSecParam or errSecDecode on each of three attempts", garbageCodes.count == 3 && garbageCodes.allSatisfy { $0 == Int(errSecParam) || $0 == Int(errSecDecode) } && vault.counters.decryptRetries - retriesBefore == 2, "\(garbageCodes)")
+    vault.decryptCiphertext = SecKeyCreateDecryptedData
     let badRead = vault.loadValue(forKey: "bad")
     check("5 loadValue reports undecryptable as missing with code UNREADABLE", describe(badRead) == "reject Item with given key does not exist" && code(badRead) == "UNREADABLE", "\(describe(badRead)) \(code(badRead))")
     check("5 item still exists", items(account: "bad").count == 1)
@@ -869,7 +888,7 @@ explicitVault.queue.sync {
 }
 let explicitDiagnostics = diagnostics(explicitVault)
 check("27 diagnostics accessGroupMode explicit, keyBackend secureEnclave", explicitDiagnostics["accessGroupMode"] as? String == "explicit" && explicitDiagnostics["keyBackend"] as? String == "secureEnclave", "\(explicitDiagnostics)")
-check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "keyBackend", "accessGroupMode"])
+check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "keyBackend", "accessGroupMode"], "\(explicitDiagnostics.keys.sorted())")
 fallbackVault.queue.sync {
     check("27 fallback mode moves an app-ID item into the default group", addRaw("fb2", Data("__secured_fb2".utf8), group: appIdGroup) == errSecSuccess && describe(fallbackVault.loadValue(forKey: "fb2")) == "resolve __secured_fb2" && groups("fb2") == [sharedGroup], "\(groups("fb2"))")
 }
@@ -986,6 +1005,56 @@ check("32 parked while locked, nothing migrated", gateLog.events.isEmpty && grou
 gateFlag.write(true)
 gateTicker.fire()
 check("32 resolves with the value after unlock, migrated", gateLog.events == ["get resolve __secured_1234"] && groups("pin") == [appIdGroup] && encrypted("pin") && accessible("pin") == ["aku"], "\(gateLog.events)")
+
+print("--- 33 decryption failures on an unlocked device")
+cleanAll()
+// cleanAll deletes the keys but not the process-wide key reference cache, so a section that retries a lookup needs its own tag.
+let retryTags = tags("harness.33")
+let retryVault = makeVault(keyTag: retryTags.name)
+retryVault.queue.sync {
+    check("33 seed encrypted value", describe(retryVault.storeValue("__secured_retry", forKey: "r1")) == "resolve true")
+    var calls = 0
+    retryVault.decryptCiphertext = { key, algorithm, ciphertext, error in
+        calls += 1
+        guard calls > 1 else {
+            error?.pointee = osStatusError(errSecInternalError)
+            return nil
+        }
+        return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
+    }
+    let retriesBefore = retryVault.counters.decryptRetries
+    check("33 a transient failure is retried with a fresh key lookup and get resolves", describe(retryVault.loadValue(forKey: "r1")) == "resolve __secured_retry" && calls == 2 && retryVault.counters.decryptRetries - retriesBefore == 1, "\(calls)")
+    retryVault.decryptCiphertext = { _, _, _, error in
+        error?.pointee = osStatusError(errSecInternalError)
+        return nil
+    }
+    check("33 a failure that is not known to be permanent parks instead of UNREADABLE", describe(retryVault.loadValue(forKey: "r1")) == "locked")
+    retryVault.decryptCiphertext = { _, _, _, error in
+        error?.pointee = osStatusError(errSecDecode)
+        return nil
+    }
+    let decodeRead = retryVault.loadValue(forKey: "r1")
+    check("33 errSecDecode after the retries is UNREADABLE", code(decodeRead) == "UNREADABLE", describe(decodeRead))
+    retryVault.decryptCiphertext = SecKeyCreateDecryptedData
+    check("33 nothing was deleted, the value still reads back", describe(retryVault.loadValue(forKey: "r1")) == "resolve __secured_retry" && items(account: "r1").count == 1)
+}
+let parkTicker = HarnessTicker()
+let parkVault = SecureStorageVault(keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: parkTicker)
+let parkLog = EventLog()
+parkVault.queue.sync {
+    parkVault.decryptRetryDelays = [0, 0]
+    parkVault.decryptCiphertext = { _, _, _, error in
+        error?.pointee = osStatusError(errSecInternalError)
+        return nil
+    }
+}
+parkVault.submitOperation(named: "get", key: "r1", run: { parkVault.loadValue(forKey: "r1") }, lost: { parkVault.lostValue(forKey: "r1") }, completion: { parkLog.record("get \(describe($0)) \(code($0))") })
+parkVault.queue.sync {}
+parkTicker.fire(times: 2)
+check("33 a get that keeps failing waits through the tick retries", parkLog.events.isEmpty, "\(parkLog.events)")
+parkTicker.fire()
+check("33 then rejects as missing UNREADABLE through the lost escape", parkLog.events == ["get reject Item with given key does not exist UNREADABLE"] && counter(diagnostics(parkVault), "lostItems") == 1, "\(parkLog.events)")
+check("33 the item is untouched", items(account: "r1").count == 1 && encrypted("r1"))
 
 cleanAll()
 check("cleanup items", items().isEmpty && allKeyCount() == 0)

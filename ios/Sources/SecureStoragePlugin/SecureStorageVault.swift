@@ -326,12 +326,13 @@ final class SecureStorageVault {
         case failure
     }
 
+    /// `.invalid` is final: the bytes cannot be decoded with any key this app has. `.locked` parks the call, also for a
+    /// failure that is not known to be permanent, so the tick-bounded lost escape decides instead of the first attempt.
     enum DecodeResult {
         case plaintext(String)
         case decrypted(String)
         case locked
         case invalid
-        case failure
     }
 
     /// Rejection codes, additive to the unchanged messages.
@@ -366,6 +367,7 @@ final class SecureStorageVault {
         var lostItems = 0
         var decryptFailures = 0
         var plaintextFallbacks = 0
+        var decryptRetries = 0
     }
 
     private enum KeyResult {
@@ -380,6 +382,18 @@ final class SecureStorageVault {
         case notFound
         case locked
         case failed
+    }
+
+    private enum DecryptResult {
+        case plaintext(Data)
+        case locked
+        case invalid
+    }
+
+    /// Why the last decryption attempt failed.
+    private enum DecryptFailure {
+        case missingKey
+        case code(Int)
     }
 
     private final class PendingOperation {
@@ -454,6 +468,11 @@ final class SecureStorageVault {
     private(set) var counters = Counters()
     /// Test hook for the plaintext fallback: encryption reports a non-lock failure. Set on `queue` only.
     var simulatesEncryptionFailure = false
+    /// Test hooks in place of `SecItemCopyMatching` for the key lookup and `SecKeyCreateDecryptedData`. Set on `queue` only.
+    var copyMatchingKey: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching
+    var decryptCiphertext: (SecKey, SecKeyAlgorithm, CFData, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFData? = SecKeyCreateDecryptedData
+    /// Waits before the second and third decryption attempt. Set on `queue` only.
+    var decryptRetryDelays: [TimeInterval] = [0.05, 0.2]
 
     /// - Parameters:
     ///   - bundleIdentifier: builds the app-private access group `<TEAM>.<bundle id>`. `nil` keeps the default group.
@@ -839,8 +858,6 @@ final class SecureStorageVault {
             counters.decryptFailures += 1
             logger.error("\(key, privacy: .public) cannot be decoded, reported as missing, other copies kept")
             return .unreadable
-        case .failure:
-            return .failure
         }
         if migrate {
             migrateCopies(of: key, value: value, data: read.data, sources: sources, mode: mode)
@@ -881,25 +898,74 @@ final class SecureStorageVault {
             guard let value = String(data: data, encoding: .utf8) else { return .invalid }
             return .plaintext(value)
         }
-        let key: SecKey
-        // Never create a key to decrypt, a new key cannot open old ciphertext.
-        switch acquirePrivateKey(creating: false) {
-        case .key(let acquired):
-            key = acquired
-        case .missing:
-            return isLockedFailure(code: Int(errSecItemNotFound), context: "decrypt without key") ? .locked : .invalid
+        let ciphertext = Data(data.dropFirst(SecureStorageVault.magic.count))
+        // A prefix without ciphertext is broken whatever key or retry, so is plaintext that is not UTF-8.
+        guard !ciphertext.isEmpty else { return .invalid }
+        switch decrypt(ciphertext, context: "decrypt") {
+        case .plaintext(let plaintext):
+            guard let value = String(data: plaintext, encoding: .utf8) else { return .invalid }
+            return .decrypted(value)
         case .locked:
             return .locked
-        case .failure:
-            return .failure
+        case .invalid:
+            return .invalid
         }
-        let ciphertext = Data(data.dropFirst(SecureStorageVault.magic.count))
-        var error: Unmanaged<CFError>?
-        guard let plaintext = SecKeyCreateDecryptedData(key, algorithm, ciphertext as CFData, &error) as Data? else {
-            return isLockedFailure(error, context: "decrypt") ? .locked : .invalid
+    }
+
+    /// Decrypts with the key under the tag and never creates one, a new key cannot open old ciphertext. A decryption that
+    /// fails while the device is known to be unlocked drops the cached key, looks the key up again and retries after each of
+    /// `decryptRetryDelays`. What still fails is `.invalid` only for a wrong key or corrupt ciphertext (`errSecParam`,
+    /// `errSecDecode`) or a key that does not exist, and only when the unlock probe agrees. Any other failure, a key lookup
+    /// that fails included, is `.locked`: the call parks and the tick-bounded lost escape ends it if it never recovers.
+    private func decrypt(_ ciphertext: Data, context: String) -> DecryptResult {
+        var failure = DecryptFailure.missingKey
+        for attempt in 0...decryptRetryDelays.count {
+            if attempt > 0 {
+                counters.decryptRetries += 1
+                Thread.sleep(forTimeInterval: decryptRetryDelays[attempt - 1])
+                SecureStorageVault.dropCachedKey(for: keyTag)
+            }
+            let key: SecKey
+            switch acquirePrivateKey(creating: false) {
+            case .key(let acquired):
+                key = acquired
+            case .missing where attempt == 0:
+                return isLockedFailure(code: Int(errSecItemNotFound), context: "\(context) without key") ? .locked : .invalid
+            case .missing:
+                // The key was there a moment ago, give the lookup the remaining attempts.
+                failure = .missingKey
+                continue
+            case .locked, .failure:
+                return .locked
+            }
+            var error: Unmanaged<CFError>?
+            if let plaintext = decryptCiphertext(key, algorithm, ciphertext as CFData, &error) as Data? {
+                if attempt > 0 {
+                    logger.notice("\(context, privacy: .public) succeeded on attempt \(attempt + 1, privacy: .public)")
+                }
+                return .plaintext(plaintext)
+            }
+            let code = extractCode(from: error)
+            if code == Int(errSecInteractionNotAllowed) || isProtectedDataAvailable() != true {
+                logger.notice("\(context, privacy: .public) locked \(code, privacy: .public)")
+                return .locked
+            }
+            logger.notice("\(context, privacy: .public) attempt \(attempt + 1, privacy: .public) failed \(code, privacy: .public)")
+            failure = .code(code)
         }
-        guard let value = String(data: plaintext, encoding: .utf8) else { return .invalid }
-        return .decrypted(value)
+        switch failure {
+        case .missingKey:
+            return isLockedFailure(code: Int(errSecItemNotFound), context: "\(context) without key") ? .locked : .invalid
+        case .code(let code):
+            if isLockedFailure(code: code, context: context) {
+                return .locked
+            }
+            guard code == Int(errSecParam) || code == Int(errSecDecode) else {
+                logger.error("\(context, privacy: .public) failure \(code, privacy: .public) is not known to be permanent, parked")
+                return .locked
+            }
+            return .invalid
+        }
     }
 
     /// Writes and deletes a throwaway item with an unlock-bound class. Only an explicit `errSecInteractionNotAllowed` counts as
@@ -1059,7 +1125,7 @@ final class SecureStorageVault {
         switch decodeValue(read.data) {
         case .plaintext(let decoded), .decrypted(let decoded):
             return decoded == value
-        case .locked, .invalid, .failure:
+        case .locked, .invalid:
             return false
         }
     }
@@ -1185,7 +1251,7 @@ final class SecureStorageVault {
                 query[kSecAttrAccessGroup as String] = group
             }
             var result: CFTypeRef?
-            switch classifyStatus(SecItemCopyMatching(query as CFDictionary, &result), context: "key lookup") {
+            switch classifyStatus(copyMatchingKey(query as CFDictionary, &result), context: "key lookup") {
             case .ok:
                 guard let reference = result, CFGetTypeID(reference) == SecKeyGetTypeID() else {
                     logger.error("key lookup returned no key reference")
@@ -1233,6 +1299,13 @@ final class SecureStorageVault {
         return cachedKeys[tag]
     }
 
+    /// Forgets the key reference after a failed decryption, so the next attempt looks the key up again.
+    private static func dropCachedKey(for tag: Data) {
+        keyLock.lock()
+        cachedKeys[tag] = nil
+        keyLock.unlock()
+    }
+
     /// Access control of the key object this process holds, for tests. A key created in this process reports its creation
     /// class, a key looked up from the keychain may not (the simulator reports `cku;dacl(true)` for every looked-up key).
     func keyAccessControlDescription() -> String? {
@@ -1259,6 +1332,7 @@ final class SecureStorageVault {
             "lostItems": counters.lostItems,
             "decryptFailures": counters.decryptFailures,
             "plaintextFallbacks": counters.plaintextFallbacks,
+            "decryptRetries": counters.decryptRetries,
             "keyBackend": keyBackend(),
             "accessGroupMode": resolveAccessGroup()?.isExplicit == true ? "explicit" : "default",
         ]
@@ -1272,6 +1346,7 @@ final class SecureStorageVault {
         "lostItems": 0,
         "decryptFailures": 0,
         "plaintextFallbacks": 0,
+        "decryptRetries": 0,
         "keyBackend": "none",
         "accessGroupMode": "default",
     ]
