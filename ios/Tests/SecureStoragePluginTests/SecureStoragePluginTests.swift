@@ -795,6 +795,117 @@ final class SecureStorageDecryptTests: XCTestCase {
     }
 }
 
+final class SecureStorageUnusableKeyTests: XCTestCase {
+    /// A `set` reduced to its encoding: an encrypted value, the plaintext fallback, or parked.
+    private func submitEncodingSet(_ vault: SecureStorageVault, log: EventLog) {
+        vault.submitOperation(named: "set", key: "pin", run: {
+            switch vault.encodeValue("1234") {
+            case .encoded(let data):
+                return .resolve(["value": vault.isEncodedValue(data) ? "encrypted" : "plaintext"])
+            case .failure:
+                return .resolve(["value": "plaintext fallback"])
+            case .locked:
+                return .locked
+            }
+        }, completion: { log.record("set \(describe($0))") })
+    }
+
+    func testKeyLookupThatKeepsRefusingWhileUnlockedMakesTheKeyUnusable() {
+        let ticker = ManualTicker()
+        let vault = makeVault(ticker: ticker)
+        let lookups = stubKeyLookup(vault, key: nil, status: { errSecInteractionNotAllowed })
+        let log = EventLog()
+        submitEncodingSet(vault, log: log)
+        vault.queue.sync {}
+        ticker.fire(times: 2)
+        XCTAssertTrue(log.events.isEmpty, "the first refusal and two tick retries")
+        XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "none")
+        ticker.fire()
+        XCTAssertEqual(log.events, ["set resolve plaintext fallback"], "the set ends through the plaintext fallback, not the lost escape")
+        XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 0)
+        XCTAssertEqual(vault.queue.sync { vault.diagnostics()["keyBackend"] as? String }, "unusable")
+        let lookupsWhenUnusable = lookups.read()
+        XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(encrypt("1234", for: makeSoftwareKey()))) }, "invalid")
+        XCTAssertEqual(vault.queue.sync { () -> Bool in
+            if case .failure = vault.encodeValue("5678") { return true }
+            return false
+        }, true)
+        XCTAssertEqual(lookups.read(), lookupsWhenUnusable, "no further lookups for this process")
+        XCTAssertFalse(ticker.isRunning)
+    }
+
+    func testRefusalsOnlyCountWhileTheProbeConfirmsUnlock() {
+        let ticker = ManualTicker()
+        let unlocked = Flag(false)
+        let vault = makeVault(probe: { unlocked.read() }, ticker: ticker)
+        _ = stubKeyLookup(vault, key: nil, status: { errSecInteractionNotAllowed })
+        let log = EventLog()
+        submitEncodingSet(vault, log: log)
+        vault.queue.sync {}
+        ticker.fire(times: 20)
+        XCTAssertTrue(log.events.isEmpty)
+        XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "none")
+        unlocked.write(true)
+        ticker.fire(times: 3)
+        XCTAssertTrue(log.events.isEmpty)
+        ticker.fire()
+        XCTAssertEqual(log.events, ["set resolve plaintext fallback"])
+    }
+
+    func testUnknownOrUnavailableProtectedDataNeverMakesTheKeyUnusable() {
+        for protectedData in [{ nil }, { false }] as [() -> Bool?] {
+            let ticker = ManualTicker()
+            let vault = makeVault(.afterFirstUnlock, protectedData: protectedData, ticker: ticker)
+            _ = stubKeyLookup(vault, key: nil, status: { errSecInteractionNotAllowed })
+            let log = EventLog()
+            submitEncodingSet(vault, log: log)
+            vault.queue.sync {}
+            ticker.fire(times: 20)
+            XCTAssertTrue(log.events.isEmpty)
+            XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "none")
+        }
+    }
+
+    func testAKeyFoundByALookupResetsTheCount() {
+        let ticker = ManualTicker()
+        let vault = makeVault(ticker: ticker)
+        let lookupStatus = Flag(errSecInteractionNotAllowed)
+        _ = stubKeyLookup(vault, key: makeSoftwareKey(), status: { lookupStatus.read() })
+        let log = EventLog()
+        submitEncodingSet(vault, log: log)
+        vault.queue.sync {}
+        ticker.fire(times: 2)
+        lookupStatus.write(errSecSuccess)
+        ticker.fire()
+        XCTAssertEqual(log.events, ["set resolve encrypted"])
+        vault.forgetCachedKey()
+        lookupStatus.write(errSecInteractionNotAllowed)
+        submitEncodingSet(vault, log: log)
+        vault.queue.sync {}
+        ticker.fire(times: 2)
+        XCTAssertEqual(log.events, ["set resolve encrypted"], "the count started again from zero")
+        XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "none")
+    }
+
+    func testDecryptionThatKeepsRefusingWhileUnlockedMakesTheKeyUnusable() {
+        let ticker = ManualTicker()
+        let vault = makeVault(ticker: ticker)
+        let key = makeSoftwareKey()
+        _ = stubKeyLookup(vault, key: key)
+        let calls = stubDecryption(vault, failures: [errSecInteractionNotAllowed], repeatLast: true)
+        let log = EventLog()
+        submitDecodingGet(vault, encrypt("1234", for: key), log: log)
+        vault.queue.sync {}
+        ticker.fire(times: 2)
+        XCTAssertTrue(log.events.isEmpty)
+        ticker.fire()
+        XCTAssertEqual(log.events, ["get reject Item with given key does not exist UNREADABLE"])
+        XCTAssertEqual(calls.read(), 4, "one attempt per run, no retries for a locked result")
+        XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 0, "ended by the unusable key, not the lost escape")
+        XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "unusable")
+    }
+}
+
 final class SecureStorageSweepTests: XCTestCase {
     func testSweepSkipsLockedKeysAndContinues() {
         let vault = makeVault()

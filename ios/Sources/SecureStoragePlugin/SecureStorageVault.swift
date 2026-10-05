@@ -375,6 +375,8 @@ final class SecureStorageVault {
         case missing
         case locked
         case failure
+        /// The key keeps refusing with -25308 on a device confirmed to be unlocked, see `noteKeyRefusal`.
+        case unusable
     }
 
     private enum StatusClass {
@@ -388,6 +390,7 @@ final class SecureStorageVault {
         case plaintext(Data)
         case locked
         case invalid
+        case unusable
     }
 
     /// Why the last decryption attempt failed.
@@ -464,6 +467,11 @@ final class SecureStorageVault {
     private var sweepQueued = false
     private var sweepRuns = 0
     private var sweepBody: (SecureStorageVault) -> Bool = { $0.runSweep() }
+    /// -25308 results of the key while the device was confirmed unlocked, at most one per tick, reset by a working key.
+    private var keyRefusals = 0
+    private var lastKeyRefusalTick: Int?
+    /// Set once the key kept refusing, for the rest of the process. The key itself is never deleted.
+    private var keyUnusable = false
     /// Only read or written on `queue`.
     private(set) var counters = Counters()
     /// Test hook for the plaintext fallback: encryption reports a non-lock failure. Set on `queue` only.
@@ -879,7 +887,7 @@ final class SecureStorageVault {
             key = acquired
         case .locked:
             return .locked
-        case .missing, .failure:
+        case .missing, .failure, .unusable:
             return .failure
         }
         guard let publicKey = SecKeyCopyPublicKey(key) else {
@@ -907,7 +915,7 @@ final class SecureStorageVault {
             return .decrypted(value)
         case .locked:
             return .locked
-        case .invalid:
+        case .invalid, .unusable:
             return .invalid
         }
     }
@@ -917,13 +925,14 @@ final class SecureStorageVault {
     /// `decryptRetryDelays`. What still fails is `.invalid` only for a wrong key or corrupt ciphertext (`errSecParam`,
     /// `errSecDecode`) or a key that does not exist, and only when the unlock probe agrees. Any other failure, a key lookup
     /// that fails included, is `.locked`: the call parks and the tick-bounded lost escape ends it if it never recovers.
+    /// A -25308 counts towards `noteKeyRefusal` like one from the key lookup.
     private func decrypt(_ ciphertext: Data, context: String) -> DecryptResult {
         var failure = DecryptFailure.missingKey
         for attempt in 0...decryptRetryDelays.count {
             if attempt > 0 {
                 counters.decryptRetries += 1
                 Thread.sleep(forTimeInterval: decryptRetryDelays[attempt - 1])
-                SecureStorageVault.dropCachedKey(for: keyTag)
+                forgetCachedKey()
             }
             let key: SecKey
             switch acquirePrivateKey(creating: false) {
@@ -937,16 +946,23 @@ final class SecureStorageVault {
                 continue
             case .locked, .failure:
                 return .locked
+            case .unusable:
+                return .unusable
             }
             var error: Unmanaged<CFError>?
             if let plaintext = decryptCiphertext(key, algorithm, ciphertext as CFData, &error) as Data? {
                 if attempt > 0 {
                     logger.notice("\(context, privacy: .public) succeeded on attempt \(attempt + 1, privacy: .public)")
                 }
+                keyRefusals = 0
                 return .plaintext(plaintext)
             }
             let code = extractCode(from: error)
-            if code == Int(errSecInteractionNotAllowed) || isProtectedDataAvailable() != true {
+            if code == Int(errSecInteractionNotAllowed) {
+                logger.notice("\(context, privacy: .public) locked \(code, privacy: .public)")
+                return noteKeyRefusal() ? .unusable : .locked
+            }
+            if isProtectedDataAvailable() != true {
                 logger.notice("\(context, privacy: .public) locked \(code, privacy: .public)")
                 return .locked
             }
@@ -1226,13 +1242,44 @@ final class SecureStorageVault {
     }
 
     /// Looks the key up by tag, the explicit group first. `creating` adds a new key when none exists, only encryption asks for that.
+    /// A lookup refused with -25308 counts towards `noteKeyRefusal`, a key found by a lookup resets the count.
     private func acquirePrivateKey(creating: Bool) -> KeyResult {
+        guard !keyUnusable else { return .unusable }
+        let found = lookUpOrCreateKey(creating: creating)
+        if found.refused {
+            return noteKeyRefusal() ? .unusable : .locked
+        }
+        if case .key = found.result, found.lookedUp {
+            keyRefusals = 0
+        }
+        return found.result
+    }
+
+    /// Counts a -25308 of the key lookup or of a decryption while protected data is available and the unlock probe agrees,
+    /// at most once per timer tick, the way `countLockedWhileUnlocked` counts a call. After the first one and
+    /// `lockedRetriesBeforeLost` more the key is unusable for the rest of the process, as after a Quick Start that carried
+    /// the key item but not a working Secure Enclave key: encryption reports a failure, so `set` stores plaintext with the
+    /// strict class, and ciphertext reads as invalid. The key is never deleted, a misjudged transient would destroy every
+    /// ciphertext, and the next launch tries it again. True once the key is unusable.
+    private func noteKeyRefusal() -> Bool {
+        guard !keyUnusable else { return true }
+        guard lastKeyRefusalTick != tickCount, isProtectedDataAvailable() == true, confirmUnlocked() else { return false }
+        lastKeyRefusalTick = tickCount
+        keyRefusals += 1
+        guard keyRefusals > SecureStorageVault.lockedRetriesBeforeLost else { return false }
+        keyUnusable = true
+        logger.fault("key refused \(self.keyRefusals, privacy: .public) times while unlocked, unusable for this process")
+        return true
+    }
+
+    /// `refused` is a lookup that returned -25308, `lookedUp` a key that came from the keychain and not from the cache.
+    private func lookUpOrCreateKey(creating: Bool) -> (result: KeyResult, refused: Bool, lookedUp: Bool) {
         let mode = SecureStorageVault.cachedKey(for: keyTag) == nil ? resolveAccessGroup() : nil
         let group = mode?.explicitGroup
         SecureStorageVault.keyLock.lock()
         defer { SecureStorageVault.keyLock.unlock() }
         if let cached = SecureStorageVault.cachedKeys[keyTag] {
-            return .key(cached.key)
+            return (.key(cached.key), false, false)
         }
         // The explicit group first, then any group the app can access, so a key created before the group existed is reused.
         let lookups: [(candidate: KeyCandidate, group: String?)] = (group.map { group in keyCandidates.map { ($0, Optional(group)) } } ?? []) + keyCandidates.map { ($0, nil) }
@@ -1255,36 +1302,36 @@ final class SecureStorageVault {
             case .ok:
                 guard let reference = result, CFGetTypeID(reference) == SecKeyGetTypeID() else {
                     logger.error("key lookup returned no key reference")
-                    return .failure
+                    return (.failure, false, false)
                 }
                 let key = reference as! SecKey
                 SecureStorageVault.cachedKeys[keyTag] = (key, lookup.candidate.secureEnclave)
-                return .key(key)
+                return (.key(key), false, true)
             case .notFound:
                 continue
             case .locked:
-                return .locked
+                return (.locked, true, false)
             case .failed:
-                return .failure
+                return (.failure, false, false)
             }
         }
-        guard creating else { return .missing }
+        guard creating else { return (.missing, false, false) }
         guard mode != nil else {
             // Without a resolved group the key would land in the wrong place, the access group probe was locked.
-            return .locked
+            return (.locked, false, false)
         }
         for candidate in keyCandidates {
             switch generatePrivateKey(candidate, accessGroup: group) {
             case .key(let key):
                 SecureStorageVault.cachedKeys[keyTag] = (key, candidate.secureEnclave)
-                return .key(key)
+                return (.key(key), false, false)
             case .locked:
-                return .locked
-            case .missing, .failure:
+                return (.locked, false, false)
+            case .missing, .failure, .unusable:
                 continue
             }
         }
-        return .failure
+        return (.failure, false, false)
     }
 
     /// The key follows the configured item class: `whenUnlockedThisDeviceOnly` unless the configuration asks for an
@@ -1299,11 +1346,11 @@ final class SecureStorageVault {
         return cachedKeys[tag]
     }
 
-    /// Forgets the key reference after a failed decryption, so the next attempt looks the key up again.
-    private static func dropCachedKey(for tag: Data) {
-        keyLock.lock()
-        cachedKeys[tag] = nil
-        keyLock.unlock()
+    /// Forgets the key reference after a failed decryption, so the next attempt looks the key up again. Also a test hook.
+    func forgetCachedKey() {
+        SecureStorageVault.keyLock.lock()
+        SecureStorageVault.cachedKeys[keyTag] = nil
+        SecureStorageVault.keyLock.unlock()
     }
 
     /// Access control of the key object this process holds, for tests. A key created in this process reports its creation
@@ -1313,9 +1360,13 @@ final class SecureStorageVault {
         return attributes[kSecAttrAccessControl as String].map { String(describing: $0) }
     }
 
-    /// `secureEnclave`, `software` (simulator fallback) or `none` when no key exists or it cannot be looked up right now.
-    /// Looks the key up but never creates one.
+    /// `secureEnclave`, `software` (simulator fallback), `unusable` once the key kept refusing while unlocked (see
+    /// `noteKeyRefusal`), or `none` when no key exists or it cannot be looked up right now. Looks the key up but never
+    /// creates one.
     func keyBackend() -> String {
+        if keyUnusable {
+            return "unusable"
+        }
         if SecureStorageVault.cachedKey(for: keyTag) == nil {
             _ = acquirePrivateKey(creating: false)
         }

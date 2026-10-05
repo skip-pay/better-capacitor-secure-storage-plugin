@@ -1056,6 +1056,36 @@ parkTicker.fire()
 check("33 then rejects as missing UNREADABLE through the lost escape", parkLog.events == ["get reject Item with given key does not exist UNREADABLE"] && counter(diagnostics(parkVault), "lostItems") == 1, "\(parkLog.events)")
 check("33 the item is untouched", items(account: "r1").count == 1 && encrypted("r1"))
 
+print("--- 34 a key that keeps refusing with -25308 while unlocked (Quick Start zombie)")
+cleanAll()
+let zombieTags = tags("harness.34")
+let zombieTicker = HarnessTicker()
+let zombieVault = SecureStorageVault(keyTag: zombieTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: zombieTicker)
+let zombieLog = EventLog()
+zombieVault.queue.sync {
+    check("34 seed an encrypted value while the key works", describe(zombieVault.storeValue("__secured_z1", forKey: "zk1")) == "resolve true" && encrypted("zk1"))
+    zombieVault.forgetCachedKey()
+    zombieVault.copyMatchingKey = { _, _ in errSecInteractionNotAllowed }
+}
+zombieVault.submitOperation(named: "set", key: "zk2", run: { zombieVault.storeValue("__secured_z2", forKey: "zk2") }, lost: { zombieVault.replaceLostValue("__secured_z2", forKey: "zk2") }, completion: { zombieLog.record("set \(describe($0))") })
+zombieVault.queue.sync {}
+zombieTicker.fire(times: 2)
+check("34 set waits while the refusals are counted", zombieLog.events.isEmpty, "\(zombieLog.events)")
+zombieTicker.fire()
+check("34 then stores plaintext with the strict class instead of parking for ever", zombieLog.events == ["set resolve true"] && storedData("zk2") == [Data("__secured_z2".utf8)] && accessible("zk2") == ["aku"] && groups("zk2") == [appIdGroup], "\(zombieLog.events) \(accessible("zk2"))")
+let zombieDiagnostics = diagnostics(zombieVault)
+check("34 diagnostics: keyBackend unusable, one plaintext fallback, no lost item", zombieDiagnostics["keyBackend"] as? String == "unusable" && counter(zombieDiagnostics, "plaintextFallbacks") == 1 && counter(zombieDiagnostics, "lostItems") == 0, "\(zombieDiagnostics)")
+zombieVault.queue.sync {
+    let read = zombieVault.loadValue(forKey: "zk1")
+    check("34 ciphertext of the refused key reads as missing UNREADABLE right away", code(read) == "UNREADABLE", describe(read))
+    check("34 the plaintext fallback reads back", describe(zombieVault.loadValue(forKey: "zk2")) == "resolve __secured_z2")
+}
+check("34 the ciphertext item and the key are kept", encrypted("zk1") && items(account: "zk1").count == 1 && keyCount(zombieTags.secureEnclave) + keyCount(zombieTags.software) == 1)
+let zombieReader = makeVault(keyTag: zombieTags.name)
+zombieReader.queue.sync {
+    check("34 a process whose key works again still decrypts the kept ciphertext", describe(zombieReader.loadValue(forKey: "zk1")) == "resolve __secured_z1")
+}
+
 cleanAll()
 check("cleanup items", items().isEmpty && allKeyCount() == 0)
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
