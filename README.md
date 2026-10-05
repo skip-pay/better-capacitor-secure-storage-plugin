@@ -15,7 +15,7 @@ What differs from upstream:
 - iOS no longer fails a read as "missing" while the device is locked. Calls that hit a locked keychain are queued and run in order after unlock.
 - The SwiftKeychainWrapper dependency is gone. iOS talks to the keychain directly through Security.framework.
 - iOS items live in the app-private keychain access group `<team id>.<bundle id>`, not in whatever group the app's entitlements make the default (often a group shared with extensions).
-- Existing iOS items are migrated once per launch and on first read: moved into the app-private group, encrypted, given at least the configured class, and duplicate copies in other groups are collapsed into the newest one.
+- Existing iOS items are migrated once per launch and on first read: moved into the app-private group, encrypted, given at least the configured class, and duplicate copies in other groups are collapsed into one: a copy this fork wrote, otherwise the copy upstream 0.13.0 read.
 - iOS rejections carry a `code` in addition to the unchanged messages, and `getDiagnostics()` reports what the plugin did.
 - Android encrypts with AES-256-GCM in AndroidKeyStore instead of chunked RSA, migrates RSA and plaintext entries, and rejects a write it cannot encrypt instead of storing it in plaintext.
 
@@ -360,11 +360,11 @@ It does not stop code that runs on a jailbroken, unlocked device with access to 
 
 #### Migration
 
-Every key is settled by one migration unit. It lists all copies of the key in `cap_sec` across every group the app can access, together with the copy in the app bundle id service. The `cap_sec` copy with the newest modification date wins. A bundle id copy only counts when `cap_sec` has none, whatever its date. The unit then writes the winning value into the app-private group with the target class and the current encoding: an update when a copy already sits in that group, an add otherwise. It reads the written item back and decodes it. Only when that value matches does it delete every other copy, by persistent reference. A failed or unverified write deletes nothing, and the next run tries again.
+Every key is settled by one migration unit. It lists all copies of the key in `cap_sec` across every group the app can access, together with the copy in the app bundle id service. A copy that carries this fork's label wins over copies without it, and among labelled copies the newest modification date wins. When no copy carries the label, the winner is the copy upstream 0.13.0 returned: the plugin runs the 0.13.0 query (service, account and generic, not synchronizable, no access group, limit one) and takes the copy it finds. That is the value the app has been using, and the newest modification date can belong to a different copy. A bundle id copy only counts when `cap_sec` has none, whatever its date, and the same 0.13.0 query picks among bundle id copies. `getDiagnostics()` counts deleted or overwritten copies whose value differed from the winner in `conflictingDuplicates`. The unit then writes the winning value into the app-private group with the target class and the current encoding: an update when a copy already sits in that group, an add otherwise. It reads the written item back and decodes it. Only when that value matches does it delete every other copy, by persistent reference. A failed or unverified write deletes nothing, and the next run tries again.
 
 The unit runs in two places.
 
-- `get` settles its key inside the call, so the first read after an upgrade already returns the newest value and never a stale copy left in the app-ID group. A migration problem never fails the `get`, the value read is returned anyway. While protected data is known to be unavailable `get` only reads.
+- `get` settles its key inside the call, so the first read after an upgrade already returns the value 0.13.0 returned and never another copy left in a second group. A migration problem never fails the `get`, the value read is returned anyway. While protected data is known to be unavailable `get` only reads.
 - A sweep settles every `cap_sec` key once per process. It runs whatever `encryptValues` says, after the queue of app calls has drained, in the foreground, and only once protected data is known to be available. Keys that are locked are skipped and the sweep runs again on a later drain, at most three times per launch.
 
 `set` writes into the app-private group and then deletes the copies of that key in other groups and in the bundle id service.
@@ -425,7 +425,7 @@ Web resolves zeros with `keyBackend: 'none'` and `accessGroupMode: 'default'`. A
 
 #### Never downgrade after encryption was used
 
-A build without this fork cannot read encrypted items. Its writes land in the default group next to the encrypted copy in the app-private group, and its reads may return either copy. Encryption is on by default, so do not switch back to upstream once this fork has written values with the defaults. If it happens anyway, upgrading again recovers the newest value, because the newest copy wins. To stop encrypting, set `encryptValues` to `false`. New writes are plaintext again and the fork still reads the encrypted items that remain.
+A build without this fork cannot read encrypted items. Its writes land in the default group next to the encrypted copy in the app-private group, and its reads may return either copy. Encryption is on by default, so do not switch back to upstream once this fork has written values with the defaults. If it happens anyway, upgrading again returns the value this fork wrote last, because a copy with the fork's label wins over the copies the older build added next to it. Values the older build wrote in the meantime are dropped. To stop encrypting, set `encryptValues` to `false`. New writes are plaintext again and the fork still reads the encrypted items that remain.
 
 #### Tests
 

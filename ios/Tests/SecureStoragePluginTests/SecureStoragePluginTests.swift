@@ -1095,7 +1095,7 @@ final class SecureStoragePluginTests: XCTestCase {
     func testGetDiagnosticsResolvesWithoutConfiguredVault() {
         let result = invoke(SecureStoragePlugin.getDiagnostics)
         XCTAssertNil(result.rejected)
-        let counters = ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries"]
+        let counters = ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates"]
         for counter in counters {
             XCTAssertEqual(result.resolved?[counter] as? Int, 0, counter)
         }

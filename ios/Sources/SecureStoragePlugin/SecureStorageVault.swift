@@ -58,6 +58,16 @@ struct SecureStorageItemStore {
         return (status, copies)
     }
 
+    /// The copy upstream 0.13.0 read: SwiftKeychainWrapper's query without an access group, limit one, as a persistent reference.
+    func upstreamCopyReference(of key: String) -> (status: OSStatus, reference: Data?) {
+        var query = makeItemQuery(key)
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecReturnPersistentRef as String] = true
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        return (status, result as? Data)
+    }
+
     /// Reads the data of one copy, by its group.
     func readCopy(_ copy: Copy, of key: String) -> (status: OSStatus, data: Data) {
         guard let group = copy.accessGroup else { return (errSecParam, Data()) }
@@ -391,6 +401,7 @@ final class SecureStorageVault {
         var decryptFailures = 0
         var plaintextFallbacks = 0
         var decryptRetries = 0
+        var conflictingDuplicates = 0
     }
 
     private enum KeyResult {
@@ -842,7 +853,7 @@ final class SecureStorageVault {
         return .resolve(["skipped": skipped])
     }
 
-    /// Reads a key across all of its copies, the newest `cap_sec` copy wins, the bundle id service only counts when
+    /// Reads a key across all of its copies, the `cap_sec` copy `rank` puts first wins, the bundle id service only counts when
     /// `cap_sec` has none (or for cleanup with `includeLegacyService`). With `migrate` the winner is written into the target
     /// group with the target class and encoding, read back and verified, and only then every other copy is deleted.
     func settleKey(_ key: String, includeLegacyService: Bool, migrate: Bool) -> SettleResult {
@@ -856,12 +867,16 @@ final class SecureStorageVault {
         case .failed:
             return .failure
         }
-        var sources = rank(found.copies, in: dedicated, legacy: false, target: mode.targetGroup)
+        guard var sources = rank(found.copies, of: key, in: dedicated, legacy: false, target: mode.targetGroup) else { return .locked }
         if sources.isEmpty || includeLegacyService {
             let legacy = standard.copies(of: key)
             switch classifyStatus(legacy.status, context: "find standard \(key)") {
             case .ok, .notFound:
-                sources += rank(legacy.copies, in: standard, legacy: true, target: nil)
+                if let ranked = rank(legacy.copies, of: key, in: standard, legacy: true, target: nil) {
+                    sources += ranked
+                } else if sources.isEmpty {
+                    return .locked
+                }
             case .locked where sources.isEmpty:
                 return .locked
             case .failed where sources.isEmpty:
@@ -1094,8 +1109,15 @@ final class SecureStorageVault {
         counters.duplicatesResolved += removed
     }
 
-    private func rank(_ copies: [SecureStorageItemStore.Copy], in store: SecureStorageItemStore, legacy: Bool, target: String?) -> [Source] {
-        let sorted = copies.enumerated().sorted { lhs, rhs in
+    /// Orders the copies of a key in one service, the winner first. Copies this version wrote (marked) come first, the newest
+    /// of them first. When no copy is marked, the copy upstream 0.13.0 read wins, so the first read after the upgrade returns
+    /// the value the app has been using: SwiftKeychainWrapper's query without a group and limit one decides, not the
+    /// modification date, which can belong to another copy. `nil` when that query hits a locked keychain.
+    private func rank(_ copies: [SecureStorageItemStore.Copy], of key: String, in store: SecureStorageItemStore, legacy: Bool, target: String?) -> [Source]? {
+        var sorted = copies.enumerated().sorted { lhs, rhs in
+            if lhs.element.isMarked != rhs.element.isMarked {
+                return lhs.element.isMarked
+            }
             let left = lhs.element.modified ?? .distantPast
             let right = rhs.element.modified ?? .distantPast
             if left != right {
@@ -1107,8 +1129,23 @@ final class SecureStorageVault {
                 return leftInTarget
             }
             return lhs.offset < rhs.offset
+        }.map { $0.element }
+        if sorted.count > 1, !sorted.contains(where: { $0.isMarked }) {
+            let upstream = store.upstreamCopyReference(of: key)
+            switch classifyStatus(upstream.status, context: "upstream read of \(key) in \(store.service)") {
+            case .ok:
+                if let reference = upstream.reference, let index = sorted.firstIndex(where: { $0.persistentRef == reference }) {
+                    sorted.insert(sorted.remove(at: index), at: 0)
+                } else {
+                    logger.error("upstream copy of \(key, privacy: .public) is not among the listed copies, newest copy first")
+                }
+            case .locked:
+                return nil
+            case .notFound, .failed:
+                break
+            }
         }
-        return sorted.map { Source(store: store, copy: $0.element, isLegacyService: legacy) }
+        return sorted.map { Source(store: store, copy: $0, isLegacyService: legacy) }
     }
 
     /// The migration unit for one key. `sources` are ranked, the first one holds `value` as `data`.
@@ -1141,10 +1178,12 @@ final class SecureStorageVault {
         let needsWrite = !isTargetCopy(chosen) || targetData != data || currentClass != targetClass
         guard needsWrite || !others.isEmpty else { return }
         var added = 0
+        var conflicting = 0
         if needsWrite {
             let target = sources.first(where: isTargetCopy)
             // What the target copy holds now, so a write that does not verify can be put back.
             var original: (data: Data, accessibility: String?, label: String?, group: String)?
+            var overwritten: Data?
             let status: OSStatus
             if let target = target {
                 guard let group = target.copy.accessGroup else { return }
@@ -1154,6 +1193,7 @@ final class SecureStorageVault {
                     let read = dedicated.readCopy(target.copy, of: key)
                     guard case .ok = classifyStatus(read.status, context: "read target copy of \(key)") else { return }
                     original = (read.data, target.copy.accessibility, target.copy.label, group)
+                    overwritten = read.data
                 }
                 status = dedicated.updateItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: group)
             } else {
@@ -1189,15 +1229,41 @@ final class SecureStorageVault {
                 counters.plaintextFallbacks += 1
                 logger.fault("migrated \(key, privacy: .public) as plaintext \(targetClass.rawValue, privacy: .public), encryption unavailable")
             }
+            if let overwritten = overwritten, holdsAnotherValue(overwritten, than: value) {
+                conflicting += 1
+            }
         }
         var deleted = 0
-        for source in sources where !isTargetCopy(source) {
+        for (index, source) in sources.enumerated() where !isTargetCopy(source) {
+            // The winner holds `value`, every other copy is read before it goes.
+            let differs = index > 0 && holdsAnotherValue(source, of: key, than: value)
             if case .ok = classifyStatus(source.store.deleteCopy(source.copy, of: key), context: "delete migrated copy of \(key)") {
                 deleted += 1
+                conflicting += differs ? 1 : 0
             }
         }
         counters.duplicatesResolved += max(0, deleted - added)
+        counters.conflictingDuplicates += conflicting
+        if conflicting > 0 {
+            logger.notice("settled \(key, privacy: .public) over \(conflicting, privacy: .public) copies with another value")
+        }
         logger.notice("settled \(key, privacy: .public) wrote \(needsWrite, privacy: .public) removed \(deleted, privacy: .public)")
+    }
+
+    /// True when a copy decodes to another value than the winner. A copy that cannot be read or decoded is not counted.
+    private func holdsAnotherValue(_ source: Source, of key: String, than value: String) -> Bool {
+        let read = source.store.readCopy(source.copy, of: key)
+        guard read.status == errSecSuccess else { return false }
+        return holdsAnotherValue(read.data, than: value)
+    }
+
+    private func holdsAnotherValue(_ data: Data, than value: String) -> Bool {
+        switch decodeValue(data) {
+        case .plaintext(let decoded), .decrypted(let decoded):
+            return decoded != value
+        case .locked, .invalid:
+            return false
+        }
     }
 
     /// Deletes the `cap_sec` copies of a key that are not among `sources`, the ones a migration write just added.
@@ -1460,6 +1526,7 @@ final class SecureStorageVault {
             "decryptFailures": counters.decryptFailures,
             "plaintextFallbacks": counters.plaintextFallbacks,
             "decryptRetries": counters.decryptRetries,
+            "conflictingDuplicates": counters.conflictingDuplicates,
             "keyBackend": keyBackend(),
             "accessGroupMode": resolveAccessGroup()?.isExplicit == true ? "explicit" : "default",
         ]
@@ -1474,6 +1541,7 @@ final class SecureStorageVault {
         "decryptFailures": 0,
         "plaintextFallbacks": 0,
         "decryptRetries": 0,
+        "conflictingDuplicates": 0,
         "keyBackend": "none",
         "accessGroupMode": "default",
     ]

@@ -74,7 +74,7 @@ func encrypted(_ account: String, in itemService: String = service) -> Bool {
 }
 
 /// Adds an item with the SwiftKeychainWrapper shape directly, optionally in a given group.
-func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFString = kSecAttrAccessibleAfterFirstUnlock, in itemService: String = service) -> OSStatus {
+func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFString = kSecAttrAccessibleAfterFirstUnlock, in itemService: String = service, label: String? = nil) -> OSStatus {
     let encoded = Data(account.utf8)
     var query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
@@ -86,6 +86,7 @@ func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFSt
         kSecValueData as String: data,
     ]
     if let group = group { query[kSecAttrAccessGroup as String] = group }
+    if let label = label { query[kSecAttrLabel as String] = label }
     return SecItemAdd(query as CFDictionary, nil)
 }
 
@@ -741,31 +742,39 @@ check("22a seed stale copy in the app-ID group (written before the entitlement c
 Thread.sleep(forTimeInterval: 0.05)
 check("22a seed newer copy in the shared group (first add after the change)", legacy.set("__secured_new", forKey: "d1", withAccessibility: .afterFirstUnlock))
 check("22a two copies", groups("d1") == [appIdGroup, sharedGroup], "\(groups("d1"))")
+// What 0.13.0 returned: SwiftKeychainWrapper without a group, limit one, read before the vault touches the key.
+let upstreamD1 = legacy.string(forKey: "d1") ?? "nil"
 dupVault.queue.sync {
-    check("22a get returns the newer shared copy, not the stale app-ID one", describe(dupVault.loadValue(forKey: "d1")) == "resolve __secured_new")
+    check("22a get returns the copy upstream 0.13.0 read, not the newest one", describe(dupVault.loadValue(forKey: "d1")) == "resolve \(upstreamD1)", upstreamD1)
     check("22a one copy left: app-ID group, encrypted, aku, marked", groups("d1") == [appIdGroup] && encrypted("d1") && accessible("d1") == ["aku"] && marked("d1") == [true], "\(groups("d1")) \(accessible("d1"))")
-    check("22a next get returns the same value", describe(dupVault.loadValue(forKey: "d1")) == "resolve __secured_new")
+    check("22a next get returns the same value", describe(dupVault.loadValue(forKey: "d1")) == "resolve \(upstreamD1)")
 }
 check("22b seed older copy in the shared group", legacy.set("__secured_old2", forKey: "d2", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 0.05)
 check("22b seed newer copy in the app-ID group", legacyAppGroup.set("__secured_new2", forKey: "d2", withAccessibility: .afterFirstUnlock))
+let upstreamD2 = legacy.string(forKey: "d2") ?? "nil"
+let conflictsBefore22 = counter(diagnostics(dupVault), "conflictingDuplicates")
 dupVault.queue.sync {
-    check("22b get returns the newer app-ID copy", describe(dupVault.loadValue(forKey: "d2")) == "resolve __secured_new2")
-    check("22b shared copy deleted after the verified write", groups("d2") == [appIdGroup] && encrypted("d2"), "\(groups("d2"))")
+    check("22b get returns the copy upstream 0.13.0 read", describe(dupVault.loadValue(forKey: "d2")) == "resolve \(upstreamD2)", upstreamD2)
+    check("22b other copy deleted after the verified write", groups("d2") == [appIdGroup] && encrypted("d2"), "\(groups("d2"))")
+    check("22b next get returns the same value", describe(dupVault.loadValue(forKey: "d2")) == "resolve \(upstreamD2)")
 }
+check("22b the copy with the other value counts as a conflicting duplicate", counter(diagnostics(dupVault), "conflictingDuplicates") - conflictsBefore22 == 1)
+check("22ab the upstream read differs from the newest copy at least once, so the rule is exercised", upstreamD1 == "__secured_old" || upstreamD2 == "__secured_old2", "\(upstreamD1) \(upstreamD2)")
 check("22c seed stale app-ID copy", legacyAppGroup.set("__secured_s_old", forKey: "d3", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 0.05)
 check("22c seed newer shared copy", legacy.set("__secured_s_new", forKey: "d3", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 0.05)
 check("22c seed an even newer bundle id copy", KeychainWrapper.standard.set("__secured_s_std", forKey: "d3"))
+let upstreamD3 = legacy.string(forKey: "d3") ?? "nil"
 let before22 = diagnostics(dupVault)
 dupVault.queue.sync {
     check("22c sweep resolves", describe(dupVault.migrateLegacyValues()) == "resolve -")
-    check("22c sweep kept the newest cap_sec copy, the bundle id copy ranks below cap_sec", describe(dupVault.loadValue(forKey: "d3")) == "resolve __secured_s_new")
+    check("22c sweep kept the cap_sec copy upstream read, the bundle id copy ranks below cap_sec", describe(dupVault.loadValue(forKey: "d3")) == "resolve \(upstreamD3)", upstreamD3)
 }
 check("22c one copy left and the bundle id copy is gone", groups("d3") == [appIdGroup] && !KeychainWrapper.standard.hasValue(forKey: "d3"), "\(groups("d3"))")
 let after22 = diagnostics(dupVault)
-check("22c diagnostics: one migration, two duplicates resolved", counter(after22, "migrated") - counter(before22, "migrated") == 1 && counter(after22, "duplicatesResolved") - counter(before22, "duplicatesResolved") == 2, "\(before22) \(after22)")
+check("22c diagnostics: one migration, two duplicates resolved, both with another value", counter(after22, "migrated") - counter(before22, "migrated") == 1 && counter(after22, "duplicatesResolved") - counter(before22, "duplicatesResolved") == 2 && counter(after22, "conflictingDuplicates") - counter(before22, "conflictingDuplicates") == 2, "\(before22) \(after22)")
 check("22d seed two copies of d4", legacyAppGroup.set("__secured_a", forKey: "d4", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_b", forKey: "d4", withAccessibility: .afterFirstUnlock))
 dupVault.queue.sync {
     check("22d set over two copies leaves one fresh copy", describe(dupVault.storeValue("__secured_c", forKey: "d4")) == "resolve true" && groups("d4") == [appIdGroup] && describe(dupVault.loadValue(forKey: "d4")) == "resolve __secured_c", "\(groups("d4"))")
@@ -776,6 +785,14 @@ dupVault.queue.sync {
     }())
 }
 check("22f the 0.13.0 query shape (no group, account + generic) still finds migrated items", legacy.hasValue(forKey: "d1") && legacy.hasValue(forKey: "d3") && legacy.hasValue(forKey: "d4"))
+dupVault.queue.sync {
+    check("22g seed a copy written by this version", describe(dupVault.storeValue("__secured_marked", forKey: "d5")) == "resolve true" && marked("d5") == [true])
+}
+Thread.sleep(forTimeInterval: 0.05)
+check("22g seed a newer unmarked copy in the shared group", legacy.set("__secured_unmarked", forKey: "d5", withAccessibility: .afterFirstUnlock) && groups("d5") == [appIdGroup, sharedGroup], "\(groups("d5"))")
+dupVault.queue.sync {
+    check("22g a copy written by this version beats a newer unmarked one", describe(dupVault.loadValue(forKey: "d5")) == "resolve __secured_marked" && groups("d5") == [appIdGroup], "\(groups("d5"))")
+}
 
 print("--- 23 legacy bundle id service item")
 check("23a seed bundle id item", KeychainWrapper.standard.set("__secured_std1", forKey: "std1"))
@@ -826,7 +843,7 @@ cleanAll()
 let badVault = makeVault()
 check("25 seed older plaintext copy in the shared group", legacy.set("__secured_older", forKey: "u1", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 0.05)
-check("25 seed newer undecryptable copy in the app-ID group", addRaw("u1", magic + Data(repeating: 0x5A, count: 97), group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly) == errSecSuccess)
+check("25 seed newer undecryptable copy in the app-ID group, written by this version", addRaw("u1", magic + Data(repeating: 0x5A, count: 97), group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
 let before25 = diagnostics(badVault)
 badVault.queue.sync {
     let read = badVault.loadValue(forKey: "u1")
@@ -888,7 +905,7 @@ explicitVault.queue.sync {
 }
 let explicitDiagnostics = diagnostics(explicitVault)
 check("27 diagnostics accessGroupMode explicit, keyBackend secureEnclave", explicitDiagnostics["accessGroupMode"] as? String == "explicit" && explicitDiagnostics["keyBackend"] as? String == "secureEnclave", "\(explicitDiagnostics)")
-check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "keyBackend", "accessGroupMode"], "\(explicitDiagnostics.keys.sorted())")
+check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates", "keyBackend", "accessGroupMode"], "\(explicitDiagnostics.keys.sorted())")
 fallbackVault.queue.sync {
     check("27 fallback mode moves an app-ID item into the default group", addRaw("fb2", Data("__secured_fb2".utf8), group: appIdGroup) == errSecSuccess && describe(fallbackVault.loadValue(forKey: "fb2")) == "resolve __secured_fb2" && groups("fb2") == [sharedGroup], "\(groups("fb2"))")
 }
