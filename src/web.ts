@@ -52,6 +52,8 @@ export class SecureStoragePluginWeb extends WebPlugin implements SecureStoragePl
       lostItems: 0,
       decryptFailures: 0,
       plaintextFallbacks: 0,
+      decryptRetries: 0,
+      conflictingDuplicates: 0,
       keyBackend: 'none',
       accessGroupMode: 'default',
     });

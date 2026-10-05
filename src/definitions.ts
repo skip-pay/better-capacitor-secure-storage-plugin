@@ -62,45 +62,65 @@ export type SecureStorageErrorCode =
 
 /**
  * State of the native storage for support and monitoring. Counters start at zero when the app process starts.
+ * On Android `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a`.
  *
  * @since 1.0.0
  */
 export interface SecureStorageDiagnostics {
   /**
-   * Calls that had to wait for protected data, for example because the device was locked.
+   * Calls that had to wait for protected data, for example because the device was locked. Always `0` on Android.
    */
   parked: number;
   /**
    * Keys rewritten by a migration: moved into the app-private access group, re-encrypted or given a stricter class.
+   * On Android entries rewritten from RSA or plaintext to AES-GCM.
    */
   migrated: number;
   /**
-   * Extra copies of a key deleted after the surviving copy was written and verified.
+   * Extra copies of a key deleted after the surviving copy was written and verified. Always `0` on Android.
    */
   duplicatesResolved: number;
   /**
    * Calls whose item kept reporting a locked keychain while the device was unlocked and that were completed as if the item
-   * were missing.
+   * were missing. On Android distinct keys whose entry is intact but does not decrypt.
    */
   lostItems: number;
   /**
-   * Reads of an item that could not be decrypted or decoded.
+   * Reads of an item that could not be decrypted or decoded. On Android distinct keys in an unknown format or failing after
+   * all retries.
    */
   decryptFailures: number;
   /**
-   * Values stored as plaintext with the strict class because encryption was unavailable.
+   * Values stored as plaintext with the strict class because encryption was unavailable. Always `0` on Android, which
+   * rejects such a write instead.
    */
   plaintextFallbacks: number;
   /**
-   * Key that encrypts values. `software` is the simulator fallback, `none` means no key exists yet or it could not be looked
-   * up at this moment.
+   * Decryption attempts repeated after a failure on an unlocked device, with the key looked up again (iOS, web resolves `0`).
+   * Optional because Android does not report it.
+   *
+   * @since 1.0.0
    */
-  keyBackend: 'secureEnclave' | 'software' | 'none';
+  decryptRetries?: number;
+  /**
+   * Copies a migration deleted or overwrote whose value differed from the copy that won (iOS, web resolves `0`).
+   * Optional because Android does not report it.
+   *
+   * @since 1.0.0
+   */
+  conflictingDuplicates?: number;
+  /**
+   * Key that encrypts values. On iOS `secureEnclave`, `software` (the simulator fallback), or `unusable` once the key kept
+   * refusing on an unlocked device and values fall back to plaintext for the rest of the process. On Android
+   * `keystoreAes`, or `keystoreRsaLegacy` while only the upstream RSA key exists. `none` means no key exists yet or it could
+   * not be looked up at this moment.
+   */
+  keyBackend: 'secureEnclave' | 'software' | 'unusable' | 'keystoreAes' | 'keystoreRsaLegacy' | 'none';
   /**
    * `explicit` when items live in the app-private `<team id>.<bundle id>` keychain access group, `default` when the plugin
-   * fell back to the app's default access group or could not determine it yet.
+   * fell back to the app's default access group or could not determine it yet. `n/a` on Android.
    */
-  accessGroupMode: 'explicit' | 'default';
+  accessGroupMode: 'explicit' | 'default' | 'n/a';
 }
 
 declare module '@capacitor/cli' {
@@ -164,7 +184,9 @@ export interface SecureStoragePluginPlugin {
   remove(options: { key: string }): Promise<{ value: boolean }>;
   /**
    * Remove all values in the plugin's keychain service plus the legacy bundle id copies of those keys.
-   * On iOS legacy items left only in the bundle id service are kept and `get` can still return them.
+   * On iOS a bundle id copy is removed only for a key that also exists in the plugin's service. Legacy items left only in
+   * the bundle id service are kept and `get` can still return them, so an app that needs a hard wipe also calls `remove`
+   * for each key it knows.
    *
    * @returns `true` on success, otherwise the promise rejects.
    */
@@ -185,8 +207,9 @@ export interface SecureStoragePluginPlugin {
   /**
    * Read counters and the key and access group state of the native storage, for support and monitoring.
    * Resolves right away, also while other calls wait for the device to unlock.
-   * Web resolves zeros with `keyBackend: 'none'` and `accessGroupMode: 'default'`. Android resolves zeros once its
-   * implementation is in, a build without it rejects as not implemented.
+   * Web resolves zeros with `keyBackend: 'none'` and `accessGroupMode: 'default'`. Android resolves real `migrated`,
+   * `lostItems` and `decryptFailures` counters and `keyBackend` `keystoreAes`, `keystoreRsaLegacy` or `none`, while
+   * `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a`.
    *
    * @since 1.0.0
    * @returns The diagnostics snapshot.
