@@ -4,13 +4,17 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -18,14 +22,63 @@ jobs:
       - run: npm run build
       - run: npx eslint src --ext ts
       - run: npx prettier --check "src/**/*.ts"
+      - run: npx prettier --plugin=prettier-plugin-java --check "android/src/**/*.java"
       - run: git diff --exit-code -- README.md
 
   ios:
+    # macos-26 is GA (macos-latest points to it) and defaults to the newest
+    # installed Xcode, so no xcode-select is needed.
+    # https://github.com/actions/runner-images
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
-      - name: Test
+      - uses: actions/checkout@v7
+      - run: xcodebuild -version
+      - name: Boot simulator
+        id: sim
         run: |
           UDID=$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | startswith("iPhone"))][0].udid')
           test -n "$UDID" && test "$UDID" != "null"
-          xcodebuild test -scheme BetterCapacitorSecureStoragePlugin -destination "id=$UDID"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+      - name: Unit tests
+        run: xcodebuild test -scheme BetterCapacitorSecureStoragePlugin -destination "id=${{ steps.sim.outputs.udid }}"
+      - name: Keychain harness
+        env:
+          SIMULATOR_ID: ${{ steps.sim.outputs.udid }}
+        run: bash ios/Tests/harness/build.sh
+      - name: Upload harness output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-harness-output
+          path: ios/Tests/harness/.build/run.txt
+          if-no-files-found: ignore
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # settings.gradle includes :capacitor-android from node_modules
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+      - name: Unit tests
+        working-directory: android
+        run: ./gradlew test --no-daemon
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-test-reports
+          path: |
+            android/build/reports/tests/
+            android/build/test-results/
+          if-no-files-found: ignore

@@ -49,3 +49,9 @@ Build
 /.build
 # Claude Code worktrees
 .claude/worktrees/
+
+# Build caches
+android/.gradle/
+android/build/
+ios/Tests/harness/.build/
+.swiftpm/
