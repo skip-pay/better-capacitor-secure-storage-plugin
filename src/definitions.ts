@@ -123,7 +123,8 @@ declare module '@capacitor/cli' {
       /**
        * Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default, set `false` to opt out.
        * Plaintext items in the plugin's `cap_sec` keychain service are encrypted by a sweep that runs once per app launch,
-       * in the foreground and after the app's first calls, and by the first `get` of the key.
+       * in the foreground, after the app's first call has completed (or about five seconds after load when the app makes no
+       * call), and by the first `get` of the key.
        * Items in the app bundle id service move into `cap_sec` and are encrypted lazily when `get` reads them.
        * A migrated item keeps its keychain class when that class is stricter than the configured default.
        * Android always encrypts with AndroidKeyStore, web ignores the option.

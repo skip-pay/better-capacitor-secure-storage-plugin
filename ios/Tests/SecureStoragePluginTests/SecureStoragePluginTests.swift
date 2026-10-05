@@ -1046,10 +1046,60 @@ final class SecureStorageSweepTests: XCTestCase {
         let vault = makeVault()
         let log = EventLog()
         vault.requestSweep { _ in log.record("sweep"); return false }
+        // The sweep waits for the app's first completed call.
+        vault.submitOperation(named: "get", key: "k", run: { .resolve(["value": "v"]) })
         for _ in 0..<6 {
             settle(vault)
         }
         XCTAssertEqual(log.events.count, SecureStorageVault.sweepAttempts)
+    }
+
+    func testSweepWaitsForTheFirstCompletedAppCall() {
+        let vault = makeVault()
+        let log = EventLog()
+        vault.requestSweep(backstop: .seconds(60)) { _ in log.record("sweep"); return true }
+        for _ in 0..<5 {
+            settle(vault)
+        }
+        XCTAssertTrue(log.events.isEmpty, "empty queue, foreground and protected data are not enough on a cold start")
+        vault.submitOperation(named: "get", key: "k", run: { log.record("run get"); return .resolve(["value": "v"]) }, completion: { log.record("get \(describe($0))") })
+        settle(vault)
+        XCTAssertEqual(log.events, ["run get", "get resolve v", "sweep"])
+    }
+
+    func testARejectedAppCallAlsoOpensTheSweep() {
+        let vault = makeVault()
+        let log = EventLog()
+        vault.requestSweep(backstop: .seconds(60)) { _ in log.record("sweep"); return true }
+        vault.submitOperation(named: "get", key: "k", run: { .reject(SecureStorageVault.missingItemMessage, code: .notFound) }, completion: { log.record("get \(describe($0))") })
+        settle(vault)
+        XCTAssertEqual(log.events, ["get reject Item with given key does not exist NOT_FOUND", "sweep"])
+    }
+
+    func testBackstopRunsTheSweepWhenTheAppMakesNoCall() {
+        let vault = makeVault()
+        let swept = expectation(description: "the backstop opens the sweep without any app call")
+        vault.requestSweep(backstop: .milliseconds(50)) { _ in
+            swept.fulfill()
+            return true
+        }
+        settle(vault)
+        wait(for: [swept], timeout: 5)
+    }
+
+    func testBackstopStillWaitsForForegroundAndProtectedData() {
+        let active = Flag(false)
+        let vault = makeVault(active: { active.read() })
+        let log = EventLog()
+        vault.requestSweep(backstop: .milliseconds(20)) { _ in log.record("sweep"); return true }
+        let fired = expectation(description: "backstop fired")
+        vault.queue.asyncAfter(deadline: .now() + .milliseconds(200)) { fired.fulfill() }
+        wait(for: [fired], timeout: 5)
+        settle(vault)
+        XCTAssertTrue(log.events.isEmpty)
+        active.write(true)
+        settle(vault)
+        XCTAssertEqual(log.events, ["sweep"])
     }
 }
 

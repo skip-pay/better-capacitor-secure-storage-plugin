@@ -442,16 +442,19 @@ final class SecureStorageVault {
         let run: () -> Outcome
         let lost: (() -> Outcome)?
         let complete: ((Outcome) -> Void)?
+        /// The per-launch sweep, queued by the vault itself and not by the app.
+        let isSweep: Bool
         var wasParked = false
         var confirmedLockedAttempts = 0
         var lastCountedTick: Int?
 
-        init(name: String, key: String, run: @escaping () -> Outcome, lost: (() -> Outcome)?, complete: ((Outcome) -> Void)?) {
+        init(name: String, key: String, run: @escaping () -> Outcome, lost: (() -> Outcome)?, complete: ((Outcome) -> Void)?, isSweep: Bool = false) {
             self.name = name
             self.key = key
             self.run = run
             self.lost = lost
             self.complete = complete
+            self.isSweep = isSweep
         }
     }
 
@@ -503,6 +506,10 @@ final class SecureStorageVault {
     private var sweepRequested = false
     private var sweepQueued = false
     private var sweepRuns = 0
+    /// The sweep waits until an app call has completed, or until the backstop after the first request fired, so on a cold
+    /// start it never runs ahead of the app's first call.
+    private var sweepGateOpen = false
+    private var sweepBackstopScheduled = false
     private var sweepBody: (SecureStorageVault) -> Bool = { $0.runSweep() }
     /// -25308 results of the key while the device was confirmed unlocked, at most one per tick, reset by a working key.
     private var keyRefusals = 0
@@ -579,15 +586,24 @@ final class SecureStorageVault {
         }
     }
 
-    /// Asks for the per-launch sweep. It is queued behind the app's calls once the queue has drained, the app is in the
-    /// foreground and protected data is known to be available. `body` replaces the keychain sweep in tests and returns
+    /// Asks for the per-launch sweep. It is queued behind the app's calls once an app call has completed and the queue has
+    /// drained, the app is in the foreground and protected data is known to be available. When the app makes no call, the
+    /// first request opens that gate after `backstop` instead. `body` replaces the keychain sweep in tests and returns
     /// `false` when keys were skipped and the sweep should run again later.
-    func requestSweep(_ body: ((SecureStorageVault) -> Bool)? = nil) {
+    func requestSweep(backstop: DispatchTimeInterval = .seconds(5), _ body: ((SecureStorageVault) -> Bool)? = nil) {
         queue.async {
             if let body = body {
                 self.sweepBody = body
             }
             self.sweepRequested = true
+            if !self.sweepBackstopScheduled {
+                self.sweepBackstopScheduled = true
+                self.queue.asyncAfter(deadline: .now() + backstop) { [weak self] in
+                    guard let self = self, !self.sweepGateOpen else { return }
+                    self.sweepGateOpen = true
+                    self.runParkedOperations()
+                }
+            }
             self.runParkedOperations()
         }
     }
@@ -1314,7 +1330,7 @@ final class SecureStorageVault {
     }
 
     private func enqueueSweepIfDue() -> Bool {
-        guard sweepRequested, !sweepQueued, sweepRuns < SecureStorageVault.sweepAttempts else { return false }
+        guard sweepRequested, sweepGateOpen, !sweepQueued, sweepRuns < SecureStorageVault.sweepAttempts else { return false }
         guard isApplicationActive(), isProtectedDataAvailable() == true else { return false }
         sweepRequested = false
         sweepQueued = true
@@ -1327,7 +1343,7 @@ final class SecureStorageVault {
                 self.sweepRequested = true
             }
             return .resolve([:])
-        }, lost: { .resolve([:]) }, complete: nil))
+        }, lost: { .resolve([:]) }, complete: nil, isSweep: true))
         return true
     }
 
@@ -1366,6 +1382,9 @@ final class SecureStorageVault {
             logger.notice("rejected \(operation.name, privacy: .public) \(operation.key, privacy: .public): \(message, privacy: .public)")
         case .reject, .resolve:
             break
+        }
+        if !operation.isSweep {
+            sweepGateOpen = true
         }
         operation.complete?(outcome)
         return true
