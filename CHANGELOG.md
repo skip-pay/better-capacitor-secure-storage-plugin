@@ -1,3 +1,11 @@
+## 1.0.0 (unreleased)
+
+- Fork of capacitor-secure-storage-plugin 0.13.0 maintained by Skip Pay
+- Package renamed to `better-capacitor-secure-storage-plugin` (`npm install better-capacitor-secure-storage-plugin`), the plugin name `SecureStoragePlugin` and the JavaScript API are unchanged
+- Capacitor >= 8.3.0 only, iOS 15+, Android minSdk 24
+
+## Upstream history (capacitor-secure-storage-plugin)
+
 ## v0.13.0
 
 - migrate to capacitor 8.0

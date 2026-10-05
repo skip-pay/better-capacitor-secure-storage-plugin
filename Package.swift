@@ -2,15 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "CapacitorSecureStoragePlugin",
+    name: "BetterCapacitorSecureStoragePlugin",
     platforms: [.iOS(.v15)],
     products: [
         .library(
-            name: "CapacitorSecureStoragePlugin",
+            name: "BetterCapacitorSecureStoragePlugin",
             targets: ["SecureStoragePlugin"])
     ],
     dependencies: [
-        .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", from: "8.0.0"),
+        .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", from: "8.3.0"),
         .package(url: "https://github.com/jrendel/SwiftKeychainWrapper.git", from: "4.0.0")
     ],
     targets: [

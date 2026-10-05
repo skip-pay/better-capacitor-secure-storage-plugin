@@ -1,100 +1,28 @@
-[![npm version](https://badge.fury.io/js/capacitor-secure-storage-plugin.svg)](https://badge.fury.io/js/capacitor-secure-storage-plugin)
+[![npm version](https://badge.fury.io/js/better-capacitor-secure-storage-plugin.svg)](https://badge.fury.io/js/better-capacitor-secure-storage-plugin)
 
-# capacitor-secure-storage-plugin
+# better-capacitor-secure-storage-plugin
 
-Capacitor plugin for storing string values securly on iOS and Android.
+Capacitor plugin for storing string values securely on iOS and Android.
+
+## Fork notice
+
+This is a Skip Pay fork of [martinkasa/capacitor-secure-storage-plugin](https://github.com/martinkasa/capacitor-secure-storage-plugin), created to harden the Keychain/Keystore configuration after a penetration test. It keeps the same JavaScript API and the plugin name `SecureStoragePlugin`, so switching from upstream is an import change.
+
+Requirements: Capacitor >= 8.3.0, iOS 15+, Android minSdk 24. For older Capacitor versions use the upstream package.
 
 ## How to install
 
-For Capacitor v8
-
 ```bash
-npm install capacitor-secure-storage-plugin
-```
-
-For Capacitor v7 - install with fixed version 0.12.0
-
-```bash
-npm install capacitor-secure-storage-plugin@0.12.0
-```
-
-For Capacitor v6 - install with fixed version 0.10.0
-
-```bash
-npm install capacitor-secure-storage-plugin@0.10.0
-```
-
-For Capacitor v5 - install with fixed version 0.9.0
-
-```bash
-npm install capacitor-secure-storage-plugin@0.9.0
-```
-
-For Capacitor v4 - install with fixed version 0.8.1
-
-```bash
-npm install capacitor-secure-storage-plugin@0.8.1
-```
-
-For Capacitor v3 - install with fixed version 0.7.1
-
-```bash
-npm install capacitor-secure-storage-plugin@0.7.1
-```
-
-For Capacitor v2 - install with fixed version 0.5.1
-
-```bash
-npm install capacitor-secure-storage-plugin@0.5.1
+npm install better-capacitor-secure-storage-plugin
+npx cap sync
 ```
 
 ## Usage
 
-### For Capacitor v3 & v4
-
 In a component where you want to use this plugin add to or modify imports:
-
-```jsx
-import { SecureStoragePlugin } from 'capacitor-secure-storage-plugin';
-```
-
-### For Capacitor v2
-
-In a component where you want to use this plugin add to or modify imports:
-
-```jsx
-import 'capacitor-secure-storage-plugin';
-import { Plugins } from '@capacitor/core';
-
-const { SecureStoragePlugin } = Plugins;
-```
-
-First line is needed because of web part of the plugin (current behavior of Capacitor, this may change in future releases).
-
-#### Capacitor V2 - Android
-
-In Android with Capacitor v2 you have to register plugins manually in MainActivity class of your app.
-
-[How to register plugins for Capacitor V2](https://capacitorjs.com/docs/v2/plugins/android#export-to-capacitor)
 
 ```ts
-import com.whitestein.securestorage.SecureStoragePlugin;
-
-...
-
-public class MainActivity extends BridgeActivity {
-  @Override
-  public void onCreate(Bundle savedInstanceState) {
-    super.onCreate(savedInstanceState);
-
-    // Initializes the Bridge
-    this.init(savedInstanceState, new ArrayList<Class<? extends Plugin>>() {{
-      // Additional plugins you've installed go here
-      // Ex: add(TotallyAwesomePlugin.class);
-      add(SecureStoragePlugin.class);
-    }});
-  }
-}
+import { SecureStoragePlugin } from 'better-capacitor-secure-storage-plugin';
 ```
 
 ## Methods

@@ -4,7 +4,7 @@ export default {
     {
       file: 'dist/plugin.js',
       format: 'iife',
-      name: 'capacitorSecureStoragePlugin',
+      name: 'betterCapacitorSecureStoragePlugin',
       globals: {
         '@capacitor/core': 'capacitorExports',
       },
