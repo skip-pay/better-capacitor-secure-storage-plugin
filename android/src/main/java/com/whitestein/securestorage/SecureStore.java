@@ -83,7 +83,11 @@ final class SecureStore {
         final int migrated;
         final int lostItems;
         final int decryptFailures;
-        /** Distinct keys whose readable legacy entry was kept because migrating it failed. */
+        /**
+         * Distinct keys whose legacy entry is still stored after its migration was skipped. A key
+         * is dropped once a migration or {@code set} rewrote it, or {@code remove}/{@code clear}
+         * deleted it.
+         */
         final int migrationSkipped;
         final String keyBackend;
 
@@ -189,6 +193,7 @@ final class SecureStore {
         if (!store.putString(key, encoded)) {
             throw new StorageException("Could not write value", null);
         }
+        migrationSkippedKeys.remove(key);
     }
 
     synchronized boolean contains(String key) {
@@ -198,13 +203,21 @@ final class SecureStore {
 
     synchronized boolean remove(String key) {
         startSweepOnce();
-        return store.remove(key);
+        boolean removed = store.remove(key);
+        if (removed) {
+            migrationSkippedKeys.remove(key);
+        }
+        return removed;
     }
 
     /** Clears the preferences file. Keystore keys are kept. */
     synchronized boolean clear() {
         startSweepOnce();
-        return store.clear();
+        boolean cleared = store.clear();
+        if (cleared) {
+            migrationSkippedKeys.clear();
+        }
+        return cleared;
     }
 
     synchronized String[] keys() {
@@ -386,7 +399,8 @@ final class SecureStore {
 
     /**
      * Rewrites a legacy entry in the v2 format. The new blob is written only when it decrypts back
-     * to the same bytes. Any failure leaves the legacy entry in place and counts the key as skipped.
+     * to the same bytes. Any failure leaves the legacy entry in place and counts the key as skipped
+     * until a later migration or write replaces the entry.
      */
     private void migrate(String key, byte[] value) {
         boolean retry = !aesFailing;
@@ -418,6 +432,7 @@ final class SecureStore {
         aesFailing = false;
         if (store.putString(key, encoded)) {
             migrated++;
+            migrationSkippedKeys.remove(key);
         } else {
             skipMigration(key, "Could not write migrated entry", null);
         }

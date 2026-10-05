@@ -488,7 +488,7 @@ When the RSA decrypt fails on a 256 byte multiple, step 4 still runs, because a 
 
 #### Migration
 
-An entry read through step 3 or 4 is encrypted with the AES key, decrypted again and written back with `commit()` before `get` resolves, but only when the decrypted bytes equal the value that was read. Otherwise the legacy entry stays untouched, `get` returns its value and the key is counted in `migrationSkipped`.
+An entry read through step 3 or 4 is encrypted with the AES key, decrypted again and written back with `commit()` before `get` resolves, but only when the decrypted bytes equal the value that was read. Otherwise the legacy entry stays untouched, `get` returns its value and the key is counted in `migrationSkipped` until the entry is migrated, overwritten or removed.
 
 Before the first migration write of the process the plugin encrypts and decrypts a constant with a fixed AAD. Until that self-test passes no entry is migrated, older entries keep being read as they are and the background walk stops. The test runs again on the next migration, so a keystore that recovers is used again. `set` does not run the self-test, but it decrypts its own ciphertext once in memory before writing and rejects when the result differs.
 
@@ -555,7 +555,7 @@ The key stays non-exportable inside AndroidKeyStore (hardware-backed where the d
 
 #### Diagnostics
 
-`getDiagnostics()` resolves with counters of the current process: `migrated` (entries rewritten from RSA or plaintext), `lostItems` (distinct keys whose entry is intact but does not decrypt), `decryptFailures` (distinct keys in an unknown format or failing after all retries), `migrationSkipped` (Android only, distinct keys whose readable older entry was kept because the self-test, the encryption, the decrypt check or the write-back failed) and `keyBackend` (`keystoreAes`, `keystoreRsaLegacy` or `none`). `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a` on Android.
+`getDiagnostics()` resolves with counters of the current process: `migrated` (entries rewritten from RSA or plaintext), `lostItems` (distinct keys whose entry is intact but does not decrypt), `decryptFailures` (distinct keys in an unknown format or failing after all retries), `migrationSkipped` (Android only, legacy entries still stored whose migration was skipped because the self-test, the encryption, the decrypt check or the write-back failed. A key leaves the count once a later migration or `set` rewrites it, or `remove` or `clear` deletes it) and `keyBackend` (`keystoreAes`, `keystoreRsaLegacy` or `none`). `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a` on Android.
 
 #### Never downgrade after the upgrade
 

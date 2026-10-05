@@ -168,7 +168,7 @@ public class SecureStoragePluginPlugin extends Plugin {
     /**
      * Counters of this process since the plugin loaded. Fields that only apply to iOS are always 0
      * or "n/a" on Android. lostItems, decryptFailures and migrationSkipped count distinct keys.
-     * migrationSkipped is Android only.
+     * migrationSkipped is Android only: legacy entries still stored whose migration was skipped.
      */
     @PluginMethod
     public void getDiagnostics(PluginCall call) {

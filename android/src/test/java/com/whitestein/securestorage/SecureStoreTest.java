@@ -302,6 +302,42 @@ public class SecureStoreTest {
         backend.aesCreatable = true;
         assertEquals("1234", getString("pin"));
         assertTrue("migrated once the keystore works", store.map.get("pin").startsWith("v2:"));
+        assertEquals("migrated key no longer skipped", 1, secureStore.diagnostics().migrationSkipped);
+        assertEquals("abc", getString("plain"));
+        assertEquals(0, secureStore.diagnostics().migrationSkipped);
+    }
+
+    @Test
+    public void migrationSkippedForgetsKeysThatSetRemoveOrClearReplaced() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        store.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        store.map.put("c", Fakes.androidDefaultBase64(utf8("3")));
+        store.failWrites = true;
+        assertEquals("1", getString("a"));
+        assertEquals("2", getString("b"));
+        assertEquals("3", getString("c"));
+        assertEquals(3, secureStore.diagnostics().migrationSkipped);
+        store.failWrites = false;
+
+        secureStore.set("a", utf8("new"));
+        assertEquals("set rewrote a", 2, secureStore.diagnostics().migrationSkipped);
+        assertTrue(secureStore.remove("b"));
+        assertEquals("remove deleted b", 1, secureStore.diagnostics().migrationSkipped);
+        assertTrue(secureStore.clear());
+        assertEquals("clear deleted c", 0, secureStore.diagnostics().migrationSkipped);
+    }
+
+    @Test
+    public void failedSetKeepsTheKeyInMigrationSkipped() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        store.failWrites = true;
+        assertEquals("1", getString("a"));
+        try {
+            secureStore.set("a", utf8("new"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+
+        assertEquals("legacy entry still stored", 1, secureStore.diagnostics().migrationSkipped);
     }
 
     @Test
