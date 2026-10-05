@@ -9,6 +9,13 @@
 - iOS - with `encryptValues` on, plaintext items in `cap_sec` are encrypted when the plugin loads, bundle id service items still move lazily on read
 - iOS - remove the SwiftKeychainWrapper dependency, the keychain is accessed directly through Security.framework
 - Android and web - `accessibility` is accepted and ignored
+- Android - values are encrypted with an AES-256-GCM AndroidKeyStore key (alias `<packageName>_cap_sec_aes_v2`) and stored as `v2:` + base64(IV, ciphertext, tag), with the storage key as additional authenticated data
+- Android - upstream RSA entries and plaintext base64 entries are still read and are rewritten in the new format on read and in a background pass on first use. The RSA key is kept for that, no new RSA key is ever generated
+- Android - `set` rejects with `error` / code `STORAGE_ERROR` when the value cannot be encrypted, instead of silently storing nothing or falling back to plaintext. Keystore errors are retried and never latched for the process
+- Android - `get` rejects with code `NOT_FOUND` for a missing key and `UNREADABLE` for an entry that cannot be decrypted, the message stays `Item with given key does not exist`. `remove` deletes an unreadable entry instead of reporting it missing
+- Android - `getDiagnostics()` with migration and failure counters
+- Android - no keystore work in `load()`, storage calls run in order on a plugin thread. The API < 23 code and the SDK16/SDK18 split are removed
+- Android - do not downgrade after values were written or migrated, older builds cannot read the `v2:` format
 - `KeychainAccessibility` and `SecureStorageSetOptions` types exported, `PluginsConfig` of `@capacitor/cli` augmented with `SecureStoragePlugin`
 - Do not downgrade to a build without this fork after values were written with encryption on, see the README
 
