@@ -517,10 +517,15 @@ final class SecureStorageVault {
     private var sweepRequested = false
     private var sweepQueued = false
     private var sweepRuns = 0
-    /// The sweep waits until an app call has completed, or until the backstop after the first request fired, so on a cold
-    /// start it never runs ahead of the app's first call.
+    /// The sweep waits until `sweepQuietPeriod` passed after a completed app call without another one, or until the backstop
+    /// after a request fired, so on a cold start it never runs ahead of the app's first call or between two of its calls.
+    /// Every app call closes it again.
     private var sweepGateOpen = false
     private var sweepBackstopScheduled = false
+    private var sweepQuietPeriod: DispatchTimeInterval = .milliseconds(1500)
+    /// Bumped when an app call is queued and when it completes. A quiet check opens the gate only when it is unchanged.
+    private var appCallGeneration = 0
+    private var lastAppCall: DispatchTime?
     private var sweepBody: (SecureStorageVault) -> Bool = { $0.runSweep() }
     /// -25308 results of the key while the device was confirmed unlocked, at most one per tick, reset by a working key.
     private var keyRefusals = 0
@@ -586,6 +591,7 @@ final class SecureStorageVault {
     func submitOperation(named name: String, key: String, run: @escaping () -> Outcome, lost: (() -> Outcome)? = nil, completion: ((Outcome) -> Void)? = nil) {
         let operation = PendingOperation(name: name, key: key, run: run, lost: lost, complete: completion)
         queue.async {
+            self.noteAppCall()
             self.parkedOperations.append(operation)
             self.runParkedOperations()
         }
@@ -597,24 +603,56 @@ final class SecureStorageVault {
         }
     }
 
-    /// Asks for the per-launch sweep. It is queued behind the app's calls once an app call has completed and the queue has
-    /// drained, the app is in the foreground and protected data is known to be available. When the app makes no call, the
-    /// first request opens that gate after `backstop` instead. `body` replaces the keychain sweep in tests and returns
-    /// `false` when keys were skipped and the sweep should run again later.
-    func requestSweep(backstop: DispatchTimeInterval = .seconds(5), _ body: ((SecureStorageVault) -> Bool)? = nil) {
+    /// Asks for the per-launch sweep. It is queued behind the app's calls once `quietPeriod` passed after a completed app call
+    /// without another app call, the queue has drained, the app is in the foreground and protected data is known to be
+    /// available. When the app makes no call, the request opens that gate after `backstop` instead, later while an app call
+    /// came within the last `quietPeriod`. `body` replaces the keychain sweep in tests and returns `false` when keys were
+    /// skipped and the sweep should run again later.
+    func requestSweep(backstop: DispatchTimeInterval = .seconds(5), quietPeriod: DispatchTimeInterval = .milliseconds(1500), _ body: ((SecureStorageVault) -> Bool)? = nil) {
         queue.async {
             if let body = body {
                 self.sweepBody = body
             }
+            self.sweepQuietPeriod = quietPeriod
             self.sweepRequested = true
-            if !self.sweepBackstopScheduled {
+            if !self.sweepGateOpen, !self.sweepBackstopScheduled {
                 self.sweepBackstopScheduled = true
                 self.queue.asyncAfter(deadline: .now() + backstop) { [weak self] in
-                    guard let self = self, !self.sweepGateOpen else { return }
-                    self.sweepGateOpen = true
-                    self.runParkedOperations()
+                    self?.fireSweepBackstop()
                 }
             }
+            self.runParkedOperations()
+        }
+    }
+
+    /// Opens the gate unless an app call came within the last quiet period, then it checks again once that has passed.
+    private func fireSweepBackstop() {
+        if !sweepGateOpen, let last = lastAppCall, DispatchTime.now() < last + sweepQuietPeriod {
+            queue.asyncAfter(deadline: last + sweepQuietPeriod) { [weak self] in
+                self?.fireSweepBackstop()
+            }
+            return
+        }
+        sweepBackstopScheduled = false
+        guard !sweepGateOpen else { return }
+        sweepGateOpen = true
+        runParkedOperations()
+    }
+
+    /// An app call was queued or completed. The sweep gate stays closed until the next quiet period.
+    private func noteAppCall() {
+        appCallGeneration += 1
+        lastAppCall = .now()
+        sweepGateOpen = false
+    }
+
+    /// After a completed app call: opens the gate once `sweepQuietPeriod` passed without another app call, then drains.
+    private func scheduleQuietCheck() {
+        guard sweepRequested else { return }
+        let generation = appCallGeneration
+        queue.asyncAfter(deadline: .now() + sweepQuietPeriod) { [weak self] in
+            guard let self = self, self.appCallGeneration == generation else { return }
+            self.sweepGateOpen = true
             self.runParkedOperations()
         }
     }
@@ -1444,7 +1482,9 @@ final class SecureStorageVault {
             break
         }
         if !operation.isSweep {
-            sweepGateOpen = true
+            // Not in this pass: the app's next call is often already on its way.
+            noteAppCall()
+            scheduleQuietCheck()
         }
         operation.complete?(outcome)
         return true

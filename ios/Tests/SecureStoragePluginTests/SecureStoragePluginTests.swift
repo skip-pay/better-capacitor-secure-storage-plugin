@@ -116,6 +116,15 @@ private func settle(_ vault: SecureStorageVault) {
     vault.queue.sync {}
 }
 
+private extension XCTestCase {
+    /// Waits until `delay` has passed on the vault queue, so vault timers due well before it have fired.
+    func pause(_ vault: SecureStorageVault, _ delay: DispatchTimeInterval) {
+        let passed = expectation(description: "pause")
+        vault.queue.asyncAfter(deadline: .now() + delay) { passed.fulfill() }
+        wait(for: [passed], timeout: 5)
+    }
+}
+
 private func describe(_ result: SecureStorageVault.DecodeResult) -> String {
     switch result {
     case .plaintext(let value): return "plaintext(\(value))"
@@ -1007,13 +1016,14 @@ final class SecureStorageSweepTests: XCTestCase {
         let active = Flag(false)
         let vault = makeVault(protectedData: { available.read() }, active: { active.read() })
         let log = EventLog()
-        vault.requestSweep { _ in log.record("sweep"); return true }
+        vault.requestSweep(quietPeriod: .milliseconds(20)) { _ in log.record("sweep"); return true }
         vault.submitOperation(named: "get", key: "k", run: { log.record("run get"); return .resolve(["value": "v"]) }, completion: { log.record("get \(describe($0))") })
         settle(vault)
         XCTAssertTrue(log.events.isEmpty)
         available.write(nil)
         active.write(true)
         settle(vault)
+        pause(vault, .milliseconds(200))
         XCTAssertEqual(log.events, ["run get", "get resolve v"], "unknown protected data is not enough for the sweep")
         available.write(true)
         active.write(false)
@@ -1034,20 +1044,23 @@ final class SecureStorageSweepTests: XCTestCase {
         let log = EventLog()
         var locked = true
         vault.submitOperation(named: "get", key: "k", run: { locked ? .locked : .resolve(["value": "v"]) }, completion: { log.record("get \(describe($0))") })
-        vault.requestSweep { _ in log.record("sweep"); return true }
+        vault.requestSweep(quietPeriod: .milliseconds(20)) { _ in log.record("sweep"); return true }
         settle(vault)
         XCTAssertTrue(log.events.isEmpty)
         vault.queue.sync { locked = false }
         settle(vault)
+        pause(vault, .milliseconds(200))
         XCTAssertEqual(log.events, ["get resolve v", "sweep"])
     }
 
     func testIncompleteSweepRunsAgainOnLaterDrainsUpToTheLimit() {
         let vault = makeVault()
         let log = EventLog()
-        vault.requestSweep { _ in log.record("sweep"); return false }
-        // The sweep waits for the app's first completed call.
+        vault.requestSweep(quietPeriod: .milliseconds(20)) { _ in log.record("sweep"); return false }
+        // The sweep waits for a quiet period after the app's first completed call.
         vault.submitOperation(named: "get", key: "k", run: { .resolve(["value": "v"]) })
+        settle(vault)
+        pause(vault, .milliseconds(200))
         for _ in 0..<6 {
             settle(vault)
         }
@@ -1057,23 +1070,84 @@ final class SecureStorageSweepTests: XCTestCase {
     func testSweepWaitsForTheFirstCompletedAppCall() {
         let vault = makeVault()
         let log = EventLog()
-        vault.requestSweep(backstop: .seconds(60)) { _ in log.record("sweep"); return true }
+        let lastCompletion = Flag<DispatchTime?>(nil)
+        let sweptAt = Flag<DispatchTime?>(nil)
+        let swept = expectation(description: "the sweep runs once the app is quiet")
+        vault.requestSweep(backstop: .seconds(60), quietPeriod: .milliseconds(100)) { _ in
+            sweptAt.write(.now())
+            log.record("sweep")
+            swept.fulfill()
+            return true
+        }
         for _ in 0..<5 {
             settle(vault)
         }
         XCTAssertTrue(log.events.isEmpty, "empty queue, foreground and protected data are not enough on a cold start")
-        vault.submitOperation(named: "get", key: "k", run: { log.record("run get"); return .resolve(["value": "v"]) }, completion: { log.record("get \(describe($0))") })
+        // Two startup calls back to back: the second is already queued when the first completes.
+        for key in ["a", "b"] {
+            vault.submitOperation(named: "get", key: key, run: { log.record("run get \(key)"); return .resolve(["value": key]) }, completion: {
+                lastCompletion.write(.now())
+                log.record("get \(key) \(describe($0))")
+            })
+        }
+        wait(for: [swept], timeout: 5)
+        XCTAssertEqual(log.events, ["run get a", "get a resolve a", "run get b", "get b resolve b", "sweep"], "the second call does not wait behind the sweep")
+        XCTAssertTrue(sweptAt.read()! >= lastCompletion.read()! + .milliseconds(80), "about one quiet period after the last call")
+    }
+
+    func testAnAppCallWithinTheQuietPeriodDefersTheSweep() {
+        let vault = makeVault()
+        let log = EventLog()
+        let lastCompletion = Flag<DispatchTime?>(nil)
+        let sweptAt = Flag<DispatchTime?>(nil)
+        let swept = expectation(description: "the sweep runs once the app is quiet")
+        vault.requestSweep(backstop: .seconds(60), quietPeriod: .milliseconds(300)) { _ in
+            sweptAt.write(.now())
+            log.record("sweep")
+            swept.fulfill()
+            return true
+        }
+        let submitGet = { (key: String) in
+            vault.submitOperation(named: "get", key: key, run: { .resolve(["value": key]) }, completion: {
+                lastCompletion.write(.now())
+                log.record("get \(key) \(describe($0))")
+            })
+        }
+        submitGet("a")
         settle(vault)
-        XCTAssertEqual(log.events, ["run get", "get resolve v", "sweep"])
+        pause(vault, .milliseconds(100))
+        submitGet("b")
+        settle(vault)
+        wait(for: [swept], timeout: 5)
+        XCTAssertEqual(log.events, ["get a resolve a", "get b resolve b", "sweep"])
+        XCTAssertTrue(sweptAt.read()! >= lastCompletion.read()! + .milliseconds(280), "the quiet check of the first call did not open the gate")
     }
 
     func testARejectedAppCallAlsoOpensTheSweep() {
         let vault = makeVault()
         let log = EventLog()
-        vault.requestSweep(backstop: .seconds(60)) { _ in log.record("sweep"); return true }
+        vault.requestSweep(backstop: .seconds(60), quietPeriod: .milliseconds(20)) { _ in log.record("sweep"); return true }
         vault.submitOperation(named: "get", key: "k", run: { .reject(SecureStorageVault.missingItemMessage, code: .notFound) }, completion: { log.record("get \(describe($0))") })
         settle(vault)
+        pause(vault, .milliseconds(200))
         XCTAssertEqual(log.events, ["get reject Item with given key does not exist NOT_FOUND", "sweep"])
+    }
+
+    func testBackstopWaitsForAQuietPeriodAfterAnAppCall() {
+        let vault = makeVault()
+        let completedAt = Flag<DispatchTime?>(nil)
+        let sweptAt = Flag<DispatchTime?>(nil)
+        // Completes before the request, so only the backstop can open the gate.
+        vault.submitOperation(named: "get", key: "k", run: { .resolve(["value": "v"]) }, completion: { _ in completedAt.write(.now()) })
+        settle(vault)
+        let swept = expectation(description: "the re-armed backstop opens the sweep")
+        vault.requestSweep(backstop: .milliseconds(20), quietPeriod: .milliseconds(300)) { _ in
+            sweptAt.write(.now())
+            swept.fulfill()
+            return true
+        }
+        wait(for: [swept], timeout: 5)
+        XCTAssertTrue(sweptAt.read()! >= completedAt.read()! + .milliseconds(280), "the backstop at 20 ms re-armed until the quiet period passed")
     }
 
     func testBackstopRunsTheSweepWhenTheAppMakesNoCall() {

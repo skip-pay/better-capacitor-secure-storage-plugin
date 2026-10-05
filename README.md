@@ -372,7 +372,7 @@ Every key is settled by one migration unit. It lists all copies of the key in `c
 The unit runs in two places.
 
 - `get` settles its key inside the call, so the first read after an upgrade already returns the value 0.13.0 returned and never another copy left in a second group. A migration problem never fails the `get`, the value read is returned anyway. While protected data is known to be unavailable `get` only reads.
-- A sweep settles every `cap_sec` key once per process. It runs whatever `encryptValues` says. It waits until the first app call of the process has completed, so on a cold start it never delays that call, or until about five seconds after load when the app makes no call. Then it runs once the queue of app calls has drained, in the foreground, and only once protected data is known to be available. Keys that are locked are skipped and the sweep runs again on a later drain, at most three times per launch.
+- A sweep settles every `cap_sec` key once per process. It runs whatever `encryptValues` says. It waits until an app call has completed and about 1.5 seconds have passed without another app call, so on a cold start it never delays the app's first call and never runs between two calls the app makes in a row. When the app makes no call it waits about five seconds after load instead, longer while an app call came within the last 1.5 seconds. Then it runs once the queue of app calls has drained, in the foreground, and only once protected data is known to be available. Keys that are locked are skipped and the sweep runs again on a later drain while the app makes no call, at most three times per launch.
 
 `set` writes into the app-private group and then deletes the copies of that key in other groups and in the bundle id service.
 
@@ -448,7 +448,7 @@ A build without this fork cannot read encrypted items. Its writes land in the de
 
 The iOS tests come in two parts.
 
-The unit tests in `ios/Tests/SecureStoragePluginTests` cover configuration parsing, the accessibility mapping, the class combination rule for all 25 pairs, the locked-device queue, the retry timer, the lost-item escape, the sweep scheduling and its wait for the first app call, the decryption retries and which failures are final, the unusable key, the ciphertext check before a write, the app-private group name, the rejection codes and `getDiagnostics`. They inject the protected-data signal, the unlock probe, the timer, the key lookup and the decryption, use in-memory keys, and need no keychain. CI runs them. Set `SIMULATOR_ID` to the UDID of an available simulator (`xcrun simctl list devices available`) and run them from the repository root:
+The unit tests in `ios/Tests/SecureStoragePluginTests` cover configuration parsing, the accessibility mapping, the class combination rule for all 25 pairs, the locked-device queue, the retry timer, the lost-item escape, the sweep scheduling and its wait for a quiet period after the app's calls, the decryption retries and which failures are final, the unusable key, the ciphertext check before a write, the app-private group name, the rejection codes and `getDiagnostics`. They inject the protected-data signal, the unlock probe, the timer, the key lookup and the decryption, use in-memory keys, and need no keychain. CI runs them. Set `SIMULATOR_ID` to the UDID of an available simulator (`xcrun simctl list devices available`) and run them from the repository root:
 
 ```bash
 xcodebuild test -scheme BetterCapacitorSecureStoragePlugin -destination "id=$SIMULATOR_ID"
