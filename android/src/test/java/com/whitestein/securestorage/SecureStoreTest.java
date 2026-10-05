@@ -238,11 +238,50 @@ public class SecureStoreTest {
     @Test
     public void legacyNonUtf8IsUndecodable() {
         store.map.put("bin", Fakes.androidDefaultBase64(new byte[] { (byte) 0xff, (byte) 0xfe, 0x00 }));
+        // android.util.Base64 decodes "%%%" to zero bytes without throwing, like the fake now does,
+        // so this holds on a device only because the reader rejects non-base64 text itself.
         store.map.put("notBase64", "%%%");
 
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("bin").status);
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("notBase64").status);
+        assertEquals("%%%", store.map.get("notBase64"));
         assertEquals(2, secureStore.diagnostics().decryptFailures);
+    }
+
+    @Test
+    public void legacyWithCharactersOutsideBase64IsUndecodable() {
+        // On a device "QUJD%" decodes to "ABC" and "\n" to nothing.
+        store.map.put("junk", Fakes.androidDefaultBase64(utf8("ABC")).trim() + "%");
+        store.map.put("blank", "\n");
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("junk").status);
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("blank").status);
+        assertEquals(2, secureStore.diagnostics().decryptFailures);
+        assertEquals(0, secureStore.diagnostics().migrated);
+    }
+
+    @Test
+    public void fakeBase64DecodesLikeAndroid() {
+        assertArrayEquals(new byte[0], Fakes.BASE64.decode("%%%"));
+        assertArrayEquals(utf8("ABC"), Fakes.BASE64.decode("QU%J\nD"));
+        assertArrayEquals(utf8("A"), Fakes.BASE64.decode("QQ=="));
+        assertArrayEquals(utf8("A"), Fakes.BASE64.decode("QQ"));
+        assertArrayEquals(utf8("AB"), Fakes.BASE64.decode("QUI="));
+        for (String bad : new String[] { "Q", "QQ=", "=QQQ", "QQ==Q", "QUI=Q" }) {
+            try {
+                Fakes.BASE64.decode(bad);
+                fail("must throw for " + bad);
+            } catch (IllegalArgumentException expected) {}
+        }
+    }
+
+    @Test
+    public void base64TextCheck() {
+        assertTrue(SecureStore.isBase64Text(""));
+        assertTrue(SecureStore.isBase64Text("QUJD\nQUI=\r\n"));
+        assertFalse(SecureStore.isBase64Text("QUJD%"));
+        assertFalse(SecureStore.isBase64Text("v2:QUJD"));
+        assertFalse(SecureStore.isBase64Text("QUJD\u00e9"));
     }
 
     @Test

@@ -258,6 +258,25 @@ public class ExampleInstrumentedTest {
     }
 
     @Test
+    public void legacyEntryOutsideBase64IsUnreadable() throws Exception {
+        // android.util.Base64 skips characters outside the alphabet instead of throwing.
+        assertEquals(0, Base64.decode("%%%", Base64.DEFAULT).length);
+        prefs.edit().putString("garbage", "%%%").putString("junk", "QUJD%").commit();
+
+        SecureStoragePluginPlugin plugin = newPlugin();
+        for (String key : new String[] { "garbage", "junk" }) {
+            try {
+                plugin._get(key);
+                fail("must not read as a value: " + key);
+            } catch (Exception expected) {
+                assertEquals("Item with given key does not exist", expected.getMessage());
+            }
+        }
+        assertEquals("%%%", prefs.getString("garbage", null));
+        assertEquals(2, plugin._getDiagnostics().getInteger("decryptFailures").intValue());
+    }
+
+    @Test
     public void clearKeepsKeystoreKeys() throws Exception {
         SecureStoragePluginPlugin plugin = newPlugin();
         plugin._set("pin", "1234");

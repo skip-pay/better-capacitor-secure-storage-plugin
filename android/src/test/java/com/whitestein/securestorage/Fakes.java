@@ -30,6 +30,7 @@ final class Fakes {
 
     private Fakes() {}
 
+    /** Encodes like android.util.Base64.NO_WRAP and decodes like android.util.Base64.DEFAULT. */
     static final Base64Codec BASE64 = new Base64Codec() {
         @Override
         public String encode(byte[] data) {
@@ -38,9 +39,113 @@ final class Fakes {
 
         @Override
         public byte[] decode(String data) {
-            return Base64.getDecoder().decode(data.replaceAll("\\s", ""));
+            return androidDecode(data);
         }
     };
+
+    /**
+     * The decoder state machine of android.util.Base64.Decoder: characters outside the alphabet,
+     * whitespace included, are skipped. It throws only for padding in the wrong place, characters
+     * after the padding and an incomplete final quantum (one character, or two plus a single '=').
+     */
+    static byte[] androidDecode(String data) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int state = 0;
+        int value = 0;
+        for (int i = 0; i < data.length(); i++) {
+            int d = decodeValue(data.charAt(i));
+            switch (state) {
+                case 0:
+                case 1:
+                    if (d >= 0) {
+                        value = (value << 6) | d;
+                        state++;
+                    } else if (d != SKIP) {
+                        throw new IllegalArgumentException("bad base-64");
+                    }
+                    break;
+                case 2:
+                    if (d >= 0) {
+                        value = (value << 6) | d;
+                        state = 3;
+                    } else if (d == EQUALS) {
+                        out.write(value >> 4);
+                        state = 4;
+                    } else if (d != SKIP) {
+                        throw new IllegalArgumentException("bad base-64");
+                    }
+                    break;
+                case 3:
+                    if (d >= 0) {
+                        value = (value << 6) | d;
+                        out.write(value >> 16);
+                        out.write(value >> 8);
+                        out.write(value);
+                        value = 0;
+                        state = 0;
+                    } else if (d == EQUALS) {
+                        out.write(value >> 10);
+                        out.write(value >> 2);
+                        state = 5;
+                    } else if (d != SKIP) {
+                        throw new IllegalArgumentException("bad base-64");
+                    }
+                    break;
+                case 4:
+                    if (d == EQUALS) {
+                        state = 5;
+                    } else if (d != SKIP) {
+                        throw new IllegalArgumentException("bad base-64");
+                    }
+                    break;
+                default:
+                    if (d != SKIP) {
+                        throw new IllegalArgumentException("bad base-64");
+                    }
+                    break;
+            }
+        }
+        switch (state) {
+            case 1:
+            case 4:
+                throw new IllegalArgumentException("bad base-64");
+            case 2:
+                out.write(value >> 4);
+                break;
+            case 3:
+                out.write(value >> 10);
+                out.write(value >> 2);
+                break;
+            default:
+                break;
+        }
+        return out.toByteArray();
+    }
+
+    private static final int SKIP = -1;
+    private static final int EQUALS = -2;
+
+    private static int decodeValue(char c) {
+        if (c >= 'A' && c <= 'Z') {
+            return c - 'A';
+        }
+        if (c >= 'a' && c <= 'z') {
+            return c - 'a' + 26;
+        }
+        if (c >= '0' && c <= '9') {
+            return c - '0' + 52;
+        }
+        if (c == '+') {
+            return 62;
+        }
+        if (c == '/') {
+            return 63;
+        }
+        if (c == '=') {
+            return EQUALS;
+        }
+        return SKIP;
+    }
 
     /** Encodes like android.util.Base64.DEFAULT: 76 character lines and a trailing newline. */
     static String androidDefaultBase64(byte[] data) {

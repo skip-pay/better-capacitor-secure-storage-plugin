@@ -302,11 +302,19 @@ final class SecureStore {
     }
 
     private ReadResult readLegacy(String key, String raw, boolean retry) {
+        // android.util.Base64 skips characters outside the alphabet, so a corrupt entry would
+        // decode to fewer bytes, or none, and read as a shorter value or "".
+        if (!isBase64Text(raw)) {
+            return undecodable(key, null);
+        }
         byte[] bytes;
         try {
             bytes = base64.decode(raw);
         } catch (IllegalArgumentException e) {
             return undecodable(key, e);
+        }
+        if (bytes.length == 0 && !raw.isEmpty()) {
+            return undecodable(key, null);
         }
         Throwable rsaFailure = null;
         if (bytes.length > 0 && bytes.length % RSA_BLOCK_BYTES == 0) {
@@ -493,6 +501,23 @@ final class SecureStore {
 
     static byte[] aad(String key) {
         return (V2_PREFIX + key).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * True when every character matches {@code [A-Za-z0-9+/=\s]}, with {@code \s} as in {@link
+     * java.util.regex.Pattern}: space, tab, line feed, vertical tab, form feed, carriage return.
+     */
+    static boolean isBase64Text(String text) {
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            boolean alphabet =
+                (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
+            boolean whitespace = c == ' ' || c == '\t' || c == '\n' || c == 0x0B || c == '\f' || c == '\r';
+            if (!alphabet && !whitespace) {
+                return false;
+            }
+        }
+        return true;
     }
 
     static boolean isValidUtf8(byte[] bytes) {

@@ -5,7 +5,11 @@ interface Base64Codec {
     /** Encodes without line breaks. */
     String encode(byte[] data);
 
-    /** Decodes, ignoring line breaks. Throws IllegalArgumentException on invalid input. */
+    /**
+     * Decodes like android.util.Base64.DEFAULT: characters outside the alphabet, line breaks
+     * included, are skipped. Throws IllegalArgumentException only for misplaced padding or an
+     * incomplete final quantum, so callers check the alphabet themselves.
+     */
     byte[] decode(String data);
 
     Base64Codec ANDROID = new Base64Codec() {
