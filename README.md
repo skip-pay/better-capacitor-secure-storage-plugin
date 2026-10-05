@@ -17,8 +17,9 @@ What differs from upstream:
 - iOS items live in the app-private keychain access group `<team id>.<bundle id>`, not in whatever group the app's entitlements make the default (often a group shared with extensions).
 - Existing iOS items are migrated once per launch and on first read: moved into the app-private group, encrypted, given at least the configured class, and duplicate copies in other groups are collapsed into the newest one.
 - iOS rejections carry a `code` in addition to the unchanged messages, and `getDiagnostics()` reports what the plugin did.
+- Android encrypts with AES-256-GCM in AndroidKeyStore instead of chunked RSA, migrates RSA and plaintext entries, and rejects a write it cannot encrypt instead of storing it in plaintext.
 
-The defaults on iOS are hardened: values are encrypted with a Secure Enclave key and stored with the `whenUnlockedThisDeviceOnly` class, so they are not available while the device is locked and do not leave the device in backups. Setting `encryptValues` to `false` and `accessibility` to `afterFirstUnlock` gives the upstream storage format and class, items still move into the app-private access group. Android and web behave as in upstream 0.13.0.
+The defaults on iOS are hardened: values are encrypted with a Secure Enclave key and stored with the `whenUnlockedThisDeviceOnly` class, so they are not available while the device is locked and do not leave the device in backups. Setting `encryptValues` to `false` and `accessibility` to `afterFirstUnlock` gives the upstream storage format and class, items still move into the app-private access group. On Android values are encrypted with an AES-256-GCM AndroidKeyStore key and older entries are migrated on read, see Android below. Web behaves as in upstream 0.13.0.
 
 Requirements: Capacitor >= 8.3.0, iOS 15+, Android minSdk 24. For older Capacitor versions use the upstream package.
 
@@ -420,7 +421,7 @@ The messages are the same as in upstream. iOS adds a `code` to the error:
 | `keyBackend`         | `secureEnclave`, `software` on the simulator, or `none` when no key exists or the lookup was refused. |
 | `accessGroupMode`    | `explicit` for the app-private group, `default` after a fallback or before the group is known.        |
 
-Web resolves zeros with `keyBackend: 'none'` and `accessGroupMode: 'default'`. The Android implementation lands separately and resolves zeros, an Android build without it rejects the call as not implemented.
+Web resolves zeros with `keyBackend: 'none'` and `accessGroupMode: 'default'`. Android reports `keyBackend` as `keystoreAes` or `keystoreRsaLegacy`, `accessGroupMode` as `n/a`, and `parked`, `duplicatesResolved` and `plaintextFallbacks` as zero.
 
 #### Never downgrade after encryption was used
 
@@ -452,10 +453,97 @@ Without `SIMULATOR_ID` the script uses the booted simulator. The first run clone
 
 ### Android
 
-On Android it is implemented by AndroidKeyStore and SharedPreferences. Source: [Apriorit](https://www.apriorit.com/dev-blog/432-using-androidkeystore)
+Values live in the SharedPreferences file `cap_sec` (`MODE_PRIVATE`). Each value is encrypted with an AES-256-GCM key in AndroidKeyStore. `keys()` lists the entries of that file.
 
-> **Warning**
-> For Android API < 18 values are stored as simple base64 encoded strings.
+#### Storage format
+
+A value is stored as the string `v2:` followed by base64 of the 12 byte IV, the ciphertext and the 16 byte GCM tag. The key alias is `<packageName>_cap_sec_aes_v2`, with purposes encrypt and decrypt, GCM, no padding and randomized encryption, so AndroidKeyStore picks a fresh IV for every write. The additional authenticated data is `v2:` plus the storage key, so an encrypted value copied to another key does not decrypt. The key is created on the first write and the plugin never deletes it, `clear()` empties the preferences file only.
+
+Readers detect the format per entry, in this order:
+
+1. starts with `v2:` → AES-GCM. The `:` is not in the base64 alphabet, so no older entry starts with it.
+2. the RSA key pair of upstream versions (`<packageName>_cap_sec`) exists and the base64 decodes to a non-zero multiple of 256 bytes → RSA/ECB/PKCS1Padding in 256 byte blocks, as upstream wrote it.
+3. the base64 decodes to valid UTF-8 → plaintext entry. Upstream fell back to plaintext base64 silently when AndroidKeyStore failed to initialise, so some installs have such entries.
+4. anything else → unreadable.
+
+When the RSA decrypt fails on a 256 byte multiple, step 3 still runs, because a plaintext value of exactly that length is possible. Undecryptable RSA output is random and practically never valid UTF-8.
+
+#### Migration
+
+An entry read through step 2 or 3 is encrypted with the AES key and written back with `commit()` before `get` resolves. On the first storage call of the process the plugin also walks the file on a background thread and migrates every older entry. The walk takes the storage lock per entry, so calls from JavaScript are not held up behind it, and an entry written by `set` in the meantime is left alone. When the AES key cannot be created or the write-back fails, `get` still returns the old value and the entry stays as it was until a later read or walk migrates it. The RSA key is kept for that reason, and the plugin never generates a new RSA key.
+
+The upgrade needs nothing from the app. Users are not logged out and nothing is prompted.
+
+#### Failure behaviour
+
+- Reads fail open for older formats as described above.
+- Writes fail closed. If the AES key cannot be created or used, `set` rejects with `error` and code `STORAGE_ERROR` and the previous entry stays untouched. The plugin never writes plaintext and never falls back to RSA.
+- Keystore calls that fail with a transient error are retried up to three times (after 50 ms and 200 ms). Nothing is latched: the next call tries the keystore again, so a keystore that fails at startup does not degrade the whole process.
+- An entry that exists but cannot be decrypted (a wrong GCM tag, a missing AES key, a failing RSA decrypt) rejects `get` with `Item with given key does not exist` and code `UNREADABLE`. The entry and the keys are not deleted, `set` overwrites the entry and `remove` deletes it. A missing key rejects with the same message and code `NOT_FOUND`. The messages are the same as upstream, only the codes are new.
+- Undecryptable entries are expected after a device-to-device transfer that copied `cap_sec.xml` without the keystore key. Upstream read them as missing too.
+- No keystore work happens in `load()`. The store is created on the first call, and all storage calls run in order on the plugin's own thread.
+
+#### No lock-bound key flags
+
+The AES key does not use `setUnlockedDeviceRequired`, `setUserAuthenticationRequired` or StrongBox:
+
+- JavaScript keeps running in the background on Android, and the app reads values while the screen is locked, for example when the inactivity logout reloads the page after 20 minutes. A key bound to the unlocked state would fail those reads, and the app would treat the value as missing.
+- On Android 12 to 14 keys with these flags have been reported to become permanently unusable on some devices, for example after lock screen changes. That would lose every stored value.
+
+The key stays non-exportable inside AndroidKeyStore (hardware-backed where the device supports it), so a copy of `cap_sec.xml` alone does not reveal values.
+
+#### Keep `cap_sec.xml` out of backups and transfers
+
+`android:allowBackup="false"` does not stop device-to-device transfer on Android 12 and later. The copied file cannot be decrypted on the new device, because the key stays behind. Exclude the file in the app, not in the plugin.
+
+`android/app/src/main/res/xml/data_extraction_rules.xml` (Android 12 and later):
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="cap_sec.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="cap_sec.xml" />
+    </device-transfer>
+</data-extraction-rules>
+```
+
+`android/app/src/main/res/xml/backup_rules.xml` (Android 11 and earlier):
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <exclude domain="sharedpref" path="cap_sec.xml" />
+</full-backup-content>
+```
+
+`AndroidManifest.xml`:
+
+```xml
+<application
+    android:allowBackup="false"
+    android:dataExtractionRules="@xml/data_extraction_rules"
+    android:fullBackupContent="@xml/backup_rules"
+    ...>
+```
+
+#### Diagnostics
+
+`getDiagnostics()` resolves with counters of the current process: `migrated` (entries rewritten from RSA or plaintext), `lostItems` (distinct keys whose entry is intact but does not decrypt), `decryptFailures` (distinct keys in an unknown format or failing after all retries) and `keyBackend` (`keystoreAes`, `keystoreRsaLegacy` or `none`). `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a` on Android.
+
+#### Never downgrade after the upgrade
+
+Upstream versions and earlier builds of this fork cannot read `v2:` entries. After this version has written or migrated values, going back makes them unreadable.
+
+#### Tests
+
+```bash
+cd android
+./gradlew test                  # JVM tests of the format, reader order and migration
+./gradlew connectedAndroidTest  # real AndroidKeyStore, needs a device or emulator
+```
 
 ### Web
 

@@ -47,3 +47,5 @@ Podfile.lock
 Package.resolved
 Build
 /.build
+# Claude Code worktrees
+.claude/worktrees/
