@@ -462,26 +462,33 @@ A value is stored as the string `v2:` followed by base64 of the 12 byte IV, the 
 Readers detect the format per entry, in this order:
 
 1. starts with `v2:` → AES-GCM. The `:` is not in the base64 alphabet, so no older entry starts with it.
-2. the RSA key pair of upstream versions (`<packageName>_cap_sec`) exists and the base64 decodes to a non-zero multiple of 256 bytes → RSA/ECB/PKCS1Padding in 256 byte blocks, as upstream wrote it.
-3. the base64 decodes to valid UTF-8 → plaintext entry. Upstream fell back to plaintext base64 silently when AndroidKeyStore failed to initialise, so some installs have such entries.
-4. anything else → unreadable.
+2. contains a character other than `A-Z`, `a-z`, `0-9`, `+`, `/`, `=` and whitespace, or is not empty but decodes to zero bytes → unreadable. `android.util.Base64` skips such characters instead of failing, so without this check a corrupt entry would read as a shorter value or as `""`.
+3. the RSA key pair of upstream versions (`<packageName>_cap_sec`) exists and the base64 decodes to a non-zero multiple of 256 bytes → RSA/ECB/PKCS1Padding in 256 byte blocks, as upstream wrote it.
+4. the base64 decodes to valid UTF-8 → plaintext entry. Upstream fell back to plaintext base64 silently when AndroidKeyStore failed to initialise, so some installs have such entries.
+5. anything else → unreadable.
 
-When the RSA decrypt fails on a 256 byte multiple, step 3 still runs, because a plaintext value of exactly that length is possible. Undecryptable RSA output is random and practically never valid UTF-8.
+When the RSA decrypt fails on a 256 byte multiple, step 4 still runs, because a plaintext value of exactly that length is possible. Undecryptable RSA output is random and practically never valid UTF-8.
 
 #### Migration
 
-An entry read through step 2 or 3 is encrypted with the AES key and written back with `commit()` before `get` resolves. On the first storage call of the process the plugin also walks the file on a background thread and migrates every older entry. The walk takes the storage lock per entry, so calls from JavaScript are not held up behind it, and an entry written by `set` in the meantime is left alone. When the AES key cannot be created or the write-back fails, `get` still returns the old value and the entry stays as it was until a later read or walk migrates it. The RSA key is kept for that reason, and the plugin never generates a new RSA key.
+An entry read through step 3 or 4 is encrypted with the AES key, decrypted again and written back with `commit()` before `get` resolves, but only when the decrypted bytes equal the value that was read. Otherwise the legacy entry stays untouched, `get` returns its value and the key is counted in `migrationSkipped`.
+
+Before the first migration write of the process the plugin encrypts and decrypts a constant with a fixed AAD. Until that self-test passes no entry is migrated, older entries keep being read as they are and the background walk stops. The test runs again on the next migration, so a keystore that recovers is used again. `set` does not depend on it.
+
+On the first storage call of the process the plugin also walks the file on a background thread and migrates every older entry. The walk takes the storage lock per entry, so calls from JavaScript are not held up behind it, and an entry written by `set` in the meantime is left alone. When the AES key cannot be created, the check fails or the write-back fails, `get` still returns the old value and the entry stays as it was until a later read or walk migrates it. The RSA key is kept for that reason, and the plugin never generates a new RSA key.
 
 The upgrade needs nothing from the app. Users are not logged out and nothing is prompted.
 
 #### Failure behaviour
 
 - Reads fail open for older formats as described above.
-- Writes fail closed. If the AES key cannot be created or used, `set` rejects with `error` and code `STORAGE_ERROR` and the previous entry stays untouched. The plugin never writes plaintext and never falls back to RSA.
-- Keystore calls that fail with a transient error are retried up to three times (after 50 ms and 200 ms). Nothing is latched: the next call tries the keystore again, so a keystore that fails at startup does not degrade the whole process.
+- Writes fail closed. If the AES key cannot be created or used, `set` rejects with `error` and code `STORAGE_ERROR` and the previous entry stays untouched. The plugin never writes plaintext and never falls back to RSA. This is the one accepted user-visible change versus upstream on Android, by product owner decision: it only happens on devices whose AndroidKeyStore cannot create or use the AES key, where upstream stored the value as plaintext base64.
+- Keystore calls that fail with a transient error are tried up to three times (again after 50 ms and 200 ms). Nothing is latched: the next call tries the keystore again, so a keystore that fails at startup does not degrade the whole process.
+- Which errors count as permanent depends on the path. AES-GCM: only a wrong tag (`AEADBadTagException`) and a missing AES key. AndroidKeyStore reports most other `doFinal` failures as `IllegalBlockSizeException`, so that and a plain `BadPaddingException` are retried, and if they persist the read ends as `UNREADABLE` counted in `decryptFailures`, not in `lostItems`. Legacy RSA: `BadPaddingException`, `IllegalBlockSizeException` and a missing RSA key are permanent, so a plaintext entry of 256 × n bytes still reaches the UTF-8 reader. On Android 13 and later an error caused by an `android.security.KeyStoreException` that reports `isTransientFailure()` is always retried.
+- After an AES encrypt, the self-test or the check of a migrated entry failed on every attempt, migrations and the background walk make a single attempt without delays until an AES operation succeeds again, so a broken keystore does not add about 250 ms to every read of an older entry. `get` of the value itself and `set` keep all three attempts.
 - An entry that exists but cannot be decrypted (a wrong GCM tag, a missing AES key, a failing RSA decrypt) rejects `get` with `Item with given key does not exist` and code `UNREADABLE`. The entry and the keys are not deleted, `set` overwrites the entry and `remove` deletes it. A missing key rejects with the same message and code `NOT_FOUND`. The messages are the same as upstream, only the codes are new.
 - Undecryptable entries are expected after a device-to-device transfer that copied `cap_sec.xml` without the keystore key. Upstream read them as missing too.
-- No keystore work happens in `load()`. The store is created on the first call, and all storage calls run in order on the plugin's own thread.
+- No keystore work happens in `load()`. The store is created on the first call, and all storage calls run in order on one plugin thread per process, shared by every plugin instance.
 
 #### No lock-bound key flags
 
@@ -531,7 +538,7 @@ The key stays non-exportable inside AndroidKeyStore (hardware-backed where the d
 
 #### Diagnostics
 
-`getDiagnostics()` resolves with counters of the current process: `migrated` (entries rewritten from RSA or plaintext), `lostItems` (distinct keys whose entry is intact but does not decrypt), `decryptFailures` (distinct keys in an unknown format or failing after all retries) and `keyBackend` (`keystoreAes`, `keystoreRsaLegacy` or `none`). `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a` on Android.
+`getDiagnostics()` resolves with counters of the current process: `migrated` (entries rewritten from RSA or plaintext), `lostItems` (distinct keys whose entry is intact but does not decrypt), `decryptFailures` (distinct keys in an unknown format or failing after all retries), `migrationSkipped` (Android only, distinct keys whose readable older entry was kept because the self-test, the encryption, the decrypt check or the write-back failed) and `keyBackend` (`keystoreAes`, `keystoreRsaLegacy` or `none`). `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a` on Android.
 
 #### Never downgrade after the upgrade
 
