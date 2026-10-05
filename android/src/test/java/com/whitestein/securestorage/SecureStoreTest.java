@@ -8,6 +8,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.nio.charset.StandardCharsets;
+import java.security.KeyStoreException;
 import java.util.Arrays;
 import java.util.Base64;
 import javax.crypto.AEADBadTagException;
@@ -301,6 +302,42 @@ public class SecureStoreTest {
         backend.aesCreatable = true;
         assertEquals("1234", getString("pin"));
         assertTrue("migrated once the keystore works", store.map.get("pin").startsWith("v2:"));
+        assertEquals("migrated key no longer skipped", 1, secureStore.diagnostics().migrationSkipped);
+        assertEquals("abc", getString("plain"));
+        assertEquals(0, secureStore.diagnostics().migrationSkipped);
+    }
+
+    @Test
+    public void migrationSkippedForgetsKeysThatSetRemoveOrClearReplaced() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        store.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        store.map.put("c", Fakes.androidDefaultBase64(utf8("3")));
+        store.failWrites = true;
+        assertEquals("1", getString("a"));
+        assertEquals("2", getString("b"));
+        assertEquals("3", getString("c"));
+        assertEquals(3, secureStore.diagnostics().migrationSkipped);
+        store.failWrites = false;
+
+        secureStore.set("a", utf8("new"));
+        assertEquals("set rewrote a", 2, secureStore.diagnostics().migrationSkipped);
+        assertTrue(secureStore.remove("b"));
+        assertEquals("remove deleted b", 1, secureStore.diagnostics().migrationSkipped);
+        assertTrue(secureStore.clear());
+        assertEquals("clear deleted c", 0, secureStore.diagnostics().migrationSkipped);
+    }
+
+    @Test
+    public void failedSetKeepsTheKeyInMigrationSkipped() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        store.failWrites = true;
+        assertEquals("1", getString("a"));
+        try {
+            secureStore.set("a", utf8("new"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+
+        assertEquals("legacy entry still stored", 1, secureStore.diagnostics().migrationSkipped);
     }
 
     @Test
@@ -601,6 +638,51 @@ public class SecureStoreTest {
         assertEquals(Arrays.asList(50L), sleeper.sleeps);
     }
 
+    @Test
+    public void rsaIllegalBlockSizeOnCiphertextIsRetried() throws Exception {
+        backend.createRsaKey();
+        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+        assertTrue("migrated", store.map.get("pin").startsWith("v2:"));
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(1, diagnostics.migrated);
+        assertEquals(0, diagnostics.decryptFailures);
+        assertEquals(0, diagnostics.lostItems);
+    }
+
+    @Test
+    public void rsaIllegalBlockSizeOnCiphertextAfterAllRetriesIsUnreadableNotLost() throws Exception {
+        backend.createRsaKey();
+        String legacy = backend.upstreamRsaEncrypt(utf8("1234"));
+        store.map.put("pin", legacy);
+        for (int i = 0; i < 3; i++) {
+            backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
+        }
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
+        assertEquals(Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals("entry kept", legacy, store.map.get("pin"));
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(1, diagnostics.decryptFailures);
+        assertEquals(0, diagnostics.lostItems);
+        assertEquals("next read works", "1234", getString("pin"));
+    }
+
+    @Test
+    public void rsaBadPaddingOnCiphertextIsLostWithoutRetry() throws Exception {
+        backend.createRsaKey();
+        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        backend.rsaDecryptErrors.add(new BadPaddingException());
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
+        assertTrue("not retried", sleeper.sleeps.isEmpty());
+        assertEquals(1, secureStore.diagnostics().lostItems);
+        assertEquals(0, secureStore.diagnostics().decryptFailures);
+    }
+
     // Single attempt while the AES path is failing
 
     @Test
@@ -647,6 +729,60 @@ public class SecureStoreTest {
         assertTrue("no retry sleeps in the sweep", sleeper.sleeps.isEmpty());
         assertEquals(rsa, store.map.get("rsa"));
         assertEquals(plain, store.map.get("plain"));
+    }
+
+    private void failSetSoTheAesPathIsFailing() {
+        backend.aesCreatable = false;
+        try {
+            secureStore.set("x", utf8("3"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+        sleeper.sleeps.clear();
+    }
+
+    @Test
+    public void singleAttemptSweepDoesNotCountATransientRsaDecryptFailure() throws Exception {
+        backend.createRsaKey();
+        String rsa = backend.upstreamRsaEncrypt(utf8("one"));
+        store.map.put("rsa", rsa);
+        failSetSoTheAesPathIsFailing();
+
+        backend.rsaDecryptErrors.add(new KeyStoreException("Keystore busy"));
+        sweepExecutor.runAll();
+
+        assertTrue("no retry sleeps in the sweep", sleeper.sleeps.isEmpty());
+        assertEquals(rsa, store.map.get("rsa"));
+        assertEquals(0, secureStore.diagnostics().decryptFailures);
+        assertEquals("a later get reads the key", "one", getString("rsa"));
+        assertEquals(0, secureStore.diagnostics().decryptFailures);
+        assertEquals(0, secureStore.diagnostics().lostItems);
+    }
+
+    @Test
+    public void singleAttemptSweepDoesNotCountATransientRsaKeyLookupFailure() throws Exception {
+        backend.createRsaKey();
+        store.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
+        failSetSoTheAesPathIsFailing();
+
+        backend.transientFailures = 1;
+        sweepExecutor.runAll();
+
+        assertEquals(0, backend.transientFailures);
+        assertEquals(0, secureStore.diagnostics().decryptFailures);
+        assertEquals("a later get reads the key", "one", getString("rsa"));
+        assertEquals(0, secureStore.diagnostics().decryptFailures);
+    }
+
+    @Test
+    public void singleAttemptSweepStillCountsAPermanentRsaFailure() throws Exception {
+        backend.createRsaKey();
+        store.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
+        failSetSoTheAesPathIsFailing();
+
+        backend.rsaDecryptErrors.add(new BadPaddingException());
+        sweepExecutor.runAll();
+
+        assertEquals(1, secureStore.diagnostics().lostItems);
     }
 
     @Test

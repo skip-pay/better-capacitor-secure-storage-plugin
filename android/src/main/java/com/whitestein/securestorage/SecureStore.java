@@ -83,7 +83,11 @@ final class SecureStore {
         final int migrated;
         final int lostItems;
         final int decryptFailures;
-        /** Distinct keys whose readable legacy entry was kept because migrating it failed. */
+        /**
+         * Distinct keys whose legacy entry is still stored after its migration was skipped. A key
+         * is dropped once a migration or {@code set} rewrote it, or {@code remove}/{@code clear}
+         * deleted it.
+         */
         final int migrationSkipped;
         final String keyBackend;
 
@@ -189,6 +193,7 @@ final class SecureStore {
         if (!store.putString(key, encoded)) {
             throw new StorageException("Could not write value", null);
         }
+        migrationSkippedKeys.remove(key);
     }
 
     synchronized boolean contains(String key) {
@@ -198,13 +203,21 @@ final class SecureStore {
 
     synchronized boolean remove(String key) {
         startSweepOnce();
-        return store.remove(key);
+        boolean removed = store.remove(key);
+        if (removed) {
+            migrationSkippedKeys.remove(key);
+        }
+        return removed;
     }
 
     /** Clears the preferences file. Keystore keys are kept. */
     synchronized boolean clear() {
         startSweepOnce();
-        return store.clear();
+        boolean cleared = store.clear();
+        if (cleared) {
+            migrationSkippedKeys.clear();
+        }
+        return cleared;
     }
 
     synchronized String[] keys() {
@@ -329,27 +342,40 @@ final class SecureStore {
         if (bytes.length == 0 && !raw.isEmpty()) {
             return undecodable(key, null);
         }
+        // Undecryptable RSA output is random and practically never valid UTF-8, so only bytes that
+        // are valid UTF-8 can still be a plaintext entry when the RSA attempt fails.
+        boolean plaintextCandidate = isValidUtf8(bytes);
         Throwable rsaFailure = null;
         if (bytes.length > 0 && bytes.length % RSA_BLOCK_BYTES == 0) {
             boolean hasRsa;
             try {
                 hasRsa = withRetry(backend::hasRsaKey, this::isPermanentLegacy, retry);
             } catch (Exception e) {
-                return undecodable(key, e);
+                return keystoreReadFailed(key, e, retry);
+            }
+            if (hasRsa && !plaintextCandidate) {
+                // No plaintext fall-through can help, so IllegalBlockSizeException, which
+                // AndroidKeyStore uses for transient doFinal failures too, gets the retries.
+                try {
+                    return ReadResult.found(withRetry(() -> backend.rsaDecrypt(bytes), this::isPermanentRsa, retry));
+                } catch (PermanentFailure e) {
+                    return lost(key, e.getCause());
+                } catch (Exception e) {
+                    return keystoreReadFailed(key, e, retry);
+                }
             }
             if (hasRsa) {
                 try {
                     return ReadResult.found(withRetry(() -> backend.rsaDecrypt(bytes), this::isPermanentLegacy, retry));
                 } catch (PermanentFailure e) {
                     // Fall through: the bytes may still be a plaintext entry of 256 * n bytes.
-                    // Undecryptable RSA output is random and practically never valid UTF-8.
                     rsaFailure = e.getCause();
                 } catch (Exception e) {
-                    return undecodable(key, e);
+                    return keystoreReadFailed(key, e, retry);
                 }
             }
         }
-        if (isValidUtf8(bytes)) {
+        if (plaintextCandidate) {
             return ReadResult.found(bytes);
         }
         if (rsaFailure != null) {
@@ -359,8 +385,22 @@ final class SecureStore {
     }
 
     /**
+     * A keystore call of the legacy reader failed. After a single attempt without retries, made only
+     * by the sweep while {@link #aesFailing} is set, a failure that is not permanent may be
+     * transient, so the key is not counted in {@code decryptFailures}: a later {@code get} retries.
+     */
+    private ReadResult keystoreReadFailed(String key, Exception error, boolean retried) {
+        if (!retried && !(error instanceof PermanentFailure)) {
+            logger.warn("Legacy entry not read in a single attempt, a later read retries", error);
+            return ReadResult.UNREADABLE;
+        }
+        return undecodable(key, error);
+    }
+
+    /**
      * Rewrites a legacy entry in the v2 format. The new blob is written only when it decrypts back
-     * to the same bytes. Any failure leaves the legacy entry in place and counts the key as skipped.
+     * to the same bytes. Any failure leaves the legacy entry in place and counts the key as skipped
+     * until a later migration or write replaces the entry.
      */
     private void migrate(String key, byte[] value) {
         boolean retry = !aesFailing;
@@ -392,6 +432,7 @@ final class SecureStore {
         aesFailing = false;
         if (store.putString(key, encoded)) {
             migrated++;
+            migrationSkippedKeys.remove(key);
         } else {
             skipMigration(key, "Could not write migrated entry", null);
         }
@@ -495,11 +536,21 @@ final class SecureStore {
     }
 
     /**
-     * Legacy RSA path. BadPaddingException and IllegalBlockSizeException stay permanent, so a 256
-     * byte multiple that is really a plaintext entry falls through to the UTF-8 reader.
+     * Legacy RSA path for bytes that are valid UTF-8. BadPaddingException and
+     * IllegalBlockSizeException stay permanent, so a 256 byte multiple that is really a plaintext
+     * entry falls through to the UTF-8 reader without retry delays.
      */
     private boolean isPermanentLegacy(Throwable e) {
         return !backend.isTransientFailure(e) && isPermanentLegacyType(e);
+    }
+
+    /**
+     * Legacy RSA path for bytes that are not valid UTF-8, so they can only be RSA ciphertext. Only
+     * BadPaddingException and a missing key are permanent, IllegalBlockSizeException is retried
+     * like on the AES path and ends as an unreadable read, never as a lost item.
+     */
+    private boolean isPermanentRsa(Throwable e) {
+        return !backend.isTransientFailure(e) && isPermanentRsaType(e);
     }
 
     static boolean isPermanentAesType(Throwable e) {
@@ -510,6 +561,10 @@ final class SecureStore {
         return (
             e instanceof BadPaddingException || e instanceof IllegalBlockSizeException || e instanceof CipherBackend.KeyUnavailableException
         );
+    }
+
+    static boolean isPermanentRsaType(Throwable e) {
+        return e instanceof BadPaddingException || e instanceof CipherBackend.KeyUnavailableException;
     }
 
     static byte[] aad(String key) {
