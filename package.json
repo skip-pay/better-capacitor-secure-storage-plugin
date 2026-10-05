@@ -11,7 +11,7 @@
     "android/build.gradle",
     "dist/",
     "ios/Sources",
-    "ios/Tests",
+    "ios/Tests/SecureStoragePluginTests",
     "Package.swift",
     "BetterCapacitorSecureStoragePlugin.podspec"
   ],
@@ -47,7 +47,8 @@
     "build": "npm run clean && npm run docgen && tsc && rollup -c rollup.config.mjs",
     "clean": "rimraf ./dist",
     "watch": "tsc --watch",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "release:check": "npm run build && npm pack --dry-run"
   },
   "devDependencies": {
     "@capacitor/android": "^8.3.0",
