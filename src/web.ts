@@ -1,6 +1,6 @@
 import { WebPlugin } from '@capacitor/core';
 
-import type { SecureStoragePluginPlugin, SecureStorageSetOptions } from './definitions';
+import type { SecureStorageDiagnostics, SecureStoragePluginPlugin, SecureStorageSetOptions } from './definitions';
 
 export class SecureStoragePluginWeb extends WebPlugin implements SecureStoragePluginPlugin {
   PREFIX = 'cap_sec_';
@@ -42,6 +42,19 @@ export class SecureStoragePluginWeb extends WebPlugin implements SecureStoragePl
 
   getPlatform(): Promise<{ value: string }> {
     return Promise.resolve({ value: 'web' });
+  }
+
+  getDiagnostics(): Promise<SecureStorageDiagnostics> {
+    return Promise.resolve({
+      parked: 0,
+      migrated: 0,
+      duplicatesResolved: 0,
+      lostItems: 0,
+      decryptFailures: 0,
+      plaintextFallbacks: 0,
+      keyBackend: 'none',
+      accessGroupMode: 'default',
+    });
   }
 
   private addPrefix = (key: string) => this.PREFIX + key;

@@ -429,7 +429,8 @@ final class SecureStorageVault {
     let standard: SecureStorageItemStore
 
     private static let keyLock = NSLock()
-    private static var cachedKeys: [Data: SecKey] = [:]
+    private typealias CachedKey = (key: SecKey, secureEnclave: Bool)
+    private static var cachedKeys: [Data: CachedKey] = [:]
 
     private let keyTag: Data
     private let keyCandidates: [KeyCandidate]
@@ -1155,8 +1156,8 @@ final class SecureStorageVault {
         let group = mode?.explicitGroup
         SecureStorageVault.keyLock.lock()
         defer { SecureStorageVault.keyLock.unlock() }
-        if let key = SecureStorageVault.cachedKeys[keyTag] {
-            return .key(key)
+        if let cached = SecureStorageVault.cachedKeys[keyTag] {
+            return .key(cached.key)
         }
         // The explicit group first, then any group the app can access, so a key created before the group existed is reused.
         let lookups: [(candidate: KeyCandidate, group: String?)] = (group.map { group in keyCandidates.map { ($0, Optional(group)) } } ?? []) + keyCandidates.map { ($0, nil) }
@@ -1182,7 +1183,7 @@ final class SecureStorageVault {
                     return .failure
                 }
                 let key = reference as! SecKey
-                SecureStorageVault.cachedKeys[keyTag] = key
+                SecureStorageVault.cachedKeys[keyTag] = (key, lookup.candidate.secureEnclave)
                 return .key(key)
             case .notFound:
                 continue
@@ -1200,7 +1201,7 @@ final class SecureStorageVault {
         for candidate in keyCandidates {
             switch generatePrivateKey(candidate, accessGroup: group) {
             case .key(let key):
-                SecureStorageVault.cachedKeys[keyTag] = key
+                SecureStorageVault.cachedKeys[keyTag] = (key, candidate.secureEnclave)
                 return .key(key)
             case .locked:
                 return .locked
@@ -1217,11 +1218,47 @@ final class SecureStorageVault {
         return configuration.accessibility.requiresUnlock ? kSecAttrAccessibleWhenUnlockedThisDeviceOnly : kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
     }
 
-    private static func cachedKey(for tag: Data) -> SecKey? {
+    private static func cachedKey(for tag: Data) -> CachedKey? {
         keyLock.lock()
         defer { keyLock.unlock() }
         return cachedKeys[tag]
     }
+
+    /// `secureEnclave`, `software` (simulator fallback) or `none` when no key exists or it cannot be looked up right now.
+    /// Looks the key up but never creates one.
+    func keyBackend() -> String {
+        if SecureStorageVault.cachedKey(for: keyTag) == nil {
+            _ = acquirePrivateKey(creating: false)
+        }
+        guard let cached = SecureStorageVault.cachedKey(for: keyTag) else { return "none" }
+        return cached.secureEnclave ? "secureEnclave" : "software"
+    }
+
+    /// Counters since the process started plus the key and access group in use. Runs on `queue` and never parks.
+    func diagnostics() -> [String: Any] {
+        return [
+            "parked": counters.parked,
+            "migrated": counters.migrated,
+            "duplicatesResolved": counters.duplicatesResolved,
+            "lostItems": counters.lostItems,
+            "decryptFailures": counters.decryptFailures,
+            "plaintextFallbacks": counters.plaintextFallbacks,
+            "keyBackend": keyBackend(),
+            "accessGroupMode": resolveAccessGroup()?.isExplicit == true ? "explicit" : "default",
+        ]
+    }
+
+    /// What `getDiagnostics` resolves with when the plugin configuration is invalid and no vault exists.
+    static let emptyDiagnostics: [String: Any] = [
+        "parked": 0,
+        "migrated": 0,
+        "duplicatesResolved": 0,
+        "lostItems": 0,
+        "decryptFailures": 0,
+        "plaintextFallbacks": 0,
+        "keyBackend": "none",
+        "accessGroupMode": "default",
+    ]
 
     private func generatePrivateKey(_ candidate: KeyCandidate, accessGroup: String?) -> KeyResult {
         var error: Unmanaged<CFError>?

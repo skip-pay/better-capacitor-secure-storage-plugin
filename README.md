@@ -44,10 +44,10 @@ Set the options under `plugins.SecureStoragePlugin` in the Capacitor configurati
 
 Configuration of better-capacitor-secure-storage-plugin.
 
-| Prop                | Type                                                                    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Default                                   | Since |
-| ------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | ----- |
-| **`accessibility`** | <code><a href="#keychainaccessibility">KeychainAccessibility</a></code> | Default keychain accessibility class for items written by the plugin (iOS only). `afterFirstUnlock` is available as an explicit opt-out, for example when the app must read values while the device is locked. An unknown value makes every storage call reject with `Unsupported accessibility value in plugin configuration`, only `getPlatform` still resolves.                                                                                                                     | <code>'whenUnlockedThisDeviceOnly'</code> | 1.0.0 |
-| **`encryptValues`** | <code>boolean</code>                                                    | Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default, set `false` to opt out. Plaintext items in the plugin's `cap_sec` keychain service are encrypted when the plugin loads. Items in the app bundle id service move into `cap_sec` and are encrypted lazily when `get` reads them. A migrated item keeps its keychain class when that class is stricter than the configured default. Android always encrypts with AndroidKeyStore, web ignores the option. | <code>true</code>                         | 1.0.0 |
+| Prop                | Type                                                                    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Default                                   | Since |
+| ------------------- | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | ----- |
+| **`accessibility`** | <code><a href="#keychainaccessibility">KeychainAccessibility</a></code> | Default keychain accessibility class for items written by the plugin (iOS only). `afterFirstUnlock` is available as an explicit opt-out, for example when the app must read values while the device is locked. An unknown value makes every storage call reject with `Unsupported accessibility value in plugin configuration`, only `getPlatform` still resolves.                                                                                                                                                                                                                              | <code>'whenUnlockedThisDeviceOnly'</code> | 1.0.0 |
+| **`encryptValues`** | <code>boolean</code>                                                    | Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default, set `false` to opt out. Plaintext items in the plugin's `cap_sec` keychain service are encrypted by a sweep that runs once per app launch, in the foreground and after the app's first calls, and by the first `get` of the key. Items in the app bundle id service move into `cap_sec` and are encrypted lazily when `get` reads them. A migrated item keeps its keychain class when that class is stricter than the configured default. Android always encrypts with AndroidKeyStore, web ignores the option. | <code>true</code>                         | 1.0.0 |
 
 ### Examples
 
@@ -109,6 +109,7 @@ The class is applied on every write. A per-call `accessibility` on `set` wins ov
 * [`clear()`](#clear)
 * [`keys()`](#keys)
 * [`getPlatform()`](#getplatform)
+* [`getDiagnostics()`](#getdiagnostics)
 * [Interfaces](#interfaces)
 * [Type Aliases](#type-aliases)
 
@@ -209,6 +210,24 @@ Get the implementation in use.
 --------------------
 
 
+### getDiagnostics()
+
+```typescript
+getDiagnostics() => Promise<SecureStorageDiagnostics>
+```
+
+Read counters and the key and access group state of the native storage, for support and monitoring.
+Resolves right away, also while other calls wait for the device to unlock.
+Web resolves zeros with `keyBackend: 'none'` and `accessGroupMode: 'default'`. Android resolves zeros once its
+implementation is in, a build without it rejects as not implemented.
+
+**Returns:** <code>Promise&lt;<a href="#securestoragediagnostics">SecureStorageDiagnostics</a>&gt;</code>
+
+**Since:** 1.0.0
+
+--------------------
+
+
 ### Interfaces
 
 
@@ -219,6 +238,22 @@ Get the implementation in use.
 | **`key`**           | <code>string</code>                                                     | Key under which the value is stored.                                                                                                                                                                                  |       |
 | **`value`**         | <code>string</code>                                                     | Value to store.                                                                                                                                                                                                       |       |
 | **`accessibility`** | <code><a href="#keychainaccessibility">KeychainAccessibility</a></code> | Keychain accessibility class for this item (iOS only). Overrides the `accessibility` plugin configuration for this call. An unknown value rejects with `Unsupported accessibility value`. Ignored on Android and web. | 1.0.0 |
+
+
+#### SecureStorageDiagnostics
+
+State of the native storage for support and monitoring. Counters start at zero when the app process starts.
+
+| Prop                     | Type                                                 | Description                                                                                                                                                                                                   |
+| ------------------------ | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`parked`**             | <code>number</code>                                  | Calls that had to wait for protected data, for example because the device was locked.                                                                                                                         |
+| **`migrated`**           | <code>number</code>                                  | Keys rewritten by a migration: moved into the app-private access group, re-encrypted or given a stricter class.                                                                                               |
+| **`duplicatesResolved`** | <code>number</code>                                  | Extra copies of a key deleted after the surviving copy was written and verified.                                                                                                                              |
+| **`lostItems`**          | <code>number</code>                                  | Calls whose item kept reporting a locked keychain while the device was unlocked and that were completed as if the item were missing.                                                                          |
+| **`decryptFailures`**    | <code>number</code>                                  | Reads of an item that could not be decrypted or decoded.                                                                                                                                                      |
+| **`plaintextFallbacks`** | <code>number</code>                                  | Values stored as plaintext with the strict class because encryption was unavailable.                                                                                                                          |
+| **`keyBackend`**         | <code>'none' \| 'secureEnclave' \| 'software'</code> | Key that encrypts values. `software` is the simulator fallback, `none` means no key exists yet or it could not be looked up at this moment.                                                                   |
+| **`accessGroupMode`**    | <code>'default' \| 'explicit'</code>                 | `explicit` when items live in the app-private `&lt;team id&gt;.&lt;bundle id&gt;` keychain access group, `default` when the plugin fell back to the app's default access group or could not determine it yet. |
 
 
 ### Type Aliases

@@ -13,6 +13,7 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "remove", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "clear", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getPlatform", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getDiagnostics", returnType: CAPPluginReturnPromise),
     ]
     private var vault: SecureStorageVault?
     private let signals = SecureStorageSignals()
@@ -73,6 +74,17 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve([
             "value": "ios"
         ])
+    }
+
+    /// Resolves right away, also while calls are parked: it runs on the vault queue but outside the parked FIFO.
+    @objc func getDiagnostics(_ call: CAPPluginCall) {
+        guard let vault = vault else {
+            call.resolve(SecureStorageVault.emptyDiagnostics)
+            return
+        }
+        vault.queue.async {
+            call.resolve(vault.diagnostics())
+        }
     }
 
     private func readConfiguration() -> SecureStorageVault.Configuration? {

@@ -40,6 +40,69 @@ export interface SecureStorageSetOptions {
   accessibility?: KeychainAccessibility;
 }
 
+/**
+ * `code` of a rejected call on iOS. The rejection messages are the same as in upstream, the code only adds detail.
+ *
+ * | Code                        | Meaning                                                                                     |
+ * | --------------------------- | ------------------------------------------------------------------------------------------- |
+ * | `NOT_FOUND`                 | No item for the key.                                                                         |
+ * | `UNREADABLE`                | An item exists but cannot be decrypted or read. The message says the key does not exist.   |
+ * | `LOCKED`                    | Reserved. The plugin waits for unlock instead and does not emit it.                          |
+ * | `UNSUPPORTED_ACCESSIBILITY` | Unknown `accessibility` value in the call or in the plugin configuration.                    |
+ * | `STORAGE_ERROR`             | Any other keychain failure.                                                                  |
+ *
+ * @since 1.0.0
+ */
+export type SecureStorageErrorCode =
+  | 'NOT_FOUND'
+  | 'UNREADABLE'
+  | 'LOCKED'
+  | 'UNSUPPORTED_ACCESSIBILITY'
+  | 'STORAGE_ERROR';
+
+/**
+ * State of the native storage for support and monitoring. Counters start at zero when the app process starts.
+ *
+ * @since 1.0.0
+ */
+export interface SecureStorageDiagnostics {
+  /**
+   * Calls that had to wait for protected data, for example because the device was locked.
+   */
+  parked: number;
+  /**
+   * Keys rewritten by a migration: moved into the app-private access group, re-encrypted or given a stricter class.
+   */
+  migrated: number;
+  /**
+   * Extra copies of a key deleted after the surviving copy was written and verified.
+   */
+  duplicatesResolved: number;
+  /**
+   * Calls whose item kept reporting a locked keychain while the device was unlocked and that were completed as if the item
+   * were missing.
+   */
+  lostItems: number;
+  /**
+   * Reads of an item that could not be decrypted or decoded.
+   */
+  decryptFailures: number;
+  /**
+   * Values stored as plaintext with the strict class because encryption was unavailable.
+   */
+  plaintextFallbacks: number;
+  /**
+   * Key that encrypts values. `software` is the simulator fallback, `none` means no key exists yet or it could not be looked
+   * up at this moment.
+   */
+  keyBackend: 'secureEnclave' | 'software' | 'none';
+  /**
+   * `explicit` when items live in the app-private `<team id>.<bundle id>` keychain access group, `default` when the plugin
+   * fell back to the app's default access group or could not determine it yet.
+   */
+  accessGroupMode: 'explicit' | 'default';
+}
+
 declare module '@capacitor/cli' {
   export interface PluginsConfig {
     /**
@@ -59,7 +122,8 @@ declare module '@capacitor/cli' {
       accessibility?: KeychainAccessibility;
       /**
        * Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default, set `false` to opt out.
-       * Plaintext items in the plugin's `cap_sec` keychain service are encrypted when the plugin loads.
+       * Plaintext items in the plugin's `cap_sec` keychain service are encrypted by a sweep that runs once per app launch,
+       * in the foreground and after the app's first calls, and by the first `get` of the key.
        * Items in the app bundle id service move into `cap_sec` and are encrypted lazily when `get` reads them.
        * A migrated item keeps its keychain class when that class is stricter than the configured default.
        * Android always encrypts with AndroidKeyStore, web ignores the option.
@@ -79,7 +143,8 @@ export interface SecureStoragePluginPlugin {
    *
    * @param options The key to read.
    * @returns The stored value. Rejects with `Item with given key does not exist` when the key is missing.
-   * On iOS an encrypted item that cannot be decrypted rejects with `Item with given key could not be decrypted`.
+   * On iOS an item that cannot be decrypted rejects with the same message and the code `UNREADABLE`, a `set` overwrites it.
+   * While the device is locked the call waits for unlock instead of rejecting.
    */
   get(options: { key: string }): Promise<{ value: string }>;
   /**
@@ -116,4 +181,14 @@ export interface SecureStoragePluginPlugin {
    * @returns One of `web`, `ios` or `android`.
    */
   getPlatform(): Promise<{ value: string }>;
+  /**
+   * Read counters and the key and access group state of the native storage, for support and monitoring.
+   * Resolves right away, also while other calls wait for the device to unlock.
+   * Web resolves zeros with `keyBackend: 'none'` and `accessGroupMode: 'default'`. Android resolves zeros once its
+   * implementation is in, a build without it rejects as not implemented.
+   *
+   * @since 1.0.0
+   * @returns The diagnostics snapshot.
+   */
+  getDiagnostics(): Promise<SecureStorageDiagnostics>;
 }
