@@ -75,6 +75,17 @@ struct SecureStorageItemStore {
         return (read.status, read.data)
     }
 
+    /// Rewrites one copy in its group with new data and class and leaves its label alone, so an unmarked copy stays
+    /// unmarked and keeps ranking below the copies this version wrote.
+    func rewriteCopy(_ copy: Copy, of key: String, data: Data, accessibility: CFString) -> OSStatus {
+        guard let group = copy.accessGroup else { return errSecParam }
+        let attributes: [String: Any] = [
+            kSecAttrAccessible as String: accessibility,
+            kSecValueData as String: data,
+        ]
+        return SecItemUpdate(makeItemQuery(key, accessGroup: group) as CFDictionary, attributes as CFDictionary)
+    }
+
     /// Puts back what the copy in `accessGroup` held before a write that did not verify: data, class and label.
     func restoreItem(_ key: String, data: Data, accessibility: String?, label: String?, accessGroup: String) -> OSStatus {
         var attributes: [String: Any] = [
@@ -922,12 +933,57 @@ final class SecureStorageVault {
         case .invalid:
             counters.decryptFailures += 1
             logger.error("\(key, privacy: .public) cannot be decoded, reported as missing, other copies kept")
+            if migrate {
+                protectPlaintextCopies(of: key, in: sources)
+            }
             return .unreadable
         }
         if migrate {
             migrateCopies(of: key, value: value, data: read.data, sources: sources, mode: mode)
         }
         return .value(value)
+    }
+
+    /// The winner `sources.first` cannot be decoded, so no other copy may replace it or be promoted over it, that would bring
+    /// back a stale value. Older copies that are readable plaintext are encrypted and tightened in place instead, so their
+    /// value does not sit in the clear in a weaker group or class until the next `set`. Only copies that keep ranking below
+    /// the winner after the rewrite qualify: unmarked `cap_sec` copies (the rewrite leaves the label alone) and bundle id
+    /// copies. A rewrite that does not read back is put back as it was.
+    private func protectPlaintextCopies(of key: String, in sources: [Source]) {
+        for source in sources.dropFirst() where source.isLegacyService || !source.copy.isMarked {
+            guard let group = source.copy.accessGroup else { continue }
+            let read = source.store.readCopy(source.copy, of: key)
+            guard read.status == errSecSuccess, !isEncodedValue(read.data), let value = String(data: read.data, encoding: .utf8) else { continue }
+            let currentClass = source.copy.accessibility.flatMap(Accessibility.init(attribute:))
+            var targetClass = currentClass?.tightened(toAtLeast: configuration.accessibility) ?? configuration.accessibility
+            var targetData = read.data
+            var isFallback = false
+            if configuration.encryptsValues {
+                switch encodeValue(value) {
+                case .encoded(let encoded):
+                    targetData = encoded
+                case .locked:
+                    continue
+                case .failure:
+                    targetClass = targetClass.tightened(toAtLeast: SecureStorageVault.plaintextFallbackAccessibility)
+                    isFallback = true
+                }
+            }
+            guard targetData != read.data || currentClass != targetClass else { continue }
+            let status = source.store.rewriteCopy(source.copy, of: key, data: targetData, accessibility: targetClass.attribute)
+            guard case .ok = classifyStatus(status, context: "protect older copy of \(key)") else { continue }
+            let check = source.store.readCopy(source.copy, of: key)
+            guard check.status == errSecSuccess, decodes(check.data, to: value) else {
+                _ = classifyStatus(source.store.restoreItem(key, data: read.data, accessibility: source.copy.accessibility, label: source.copy.label, accessGroup: group), context: "restore older copy of \(key)")
+                logger.fault("older copy of \(key, privacy: .public) not verified, put back")
+                continue
+            }
+            counters.migrated += 1
+            if isFallback {
+                counters.plaintextFallbacks += 1
+            }
+            logger.notice("protected an older copy of \(key, privacy: .public) in place, the newest copy cannot be decoded")
+        }
     }
 
     func isEncodedValue(_ data: Data) -> Bool {
@@ -1296,7 +1352,11 @@ final class SecureStorageVault {
     private func verify(_ key: String, value: String, in group: String?) -> Bool {
         let read = dedicated.readItem(key, accessGroup: group)
         guard read.status == errSecSuccess else { return false }
-        switch decodeValue(read.data) {
+        return decodes(read.data, to: value)
+    }
+
+    private func decodes(_ data: Data, to value: String) -> Bool {
+        switch decodeValue(data) {
         case .plaintext(let decoded), .decrypted(let decoded):
             return decoded == value
         case .locked, .invalid:

@@ -845,20 +845,54 @@ check("25 seed older plaintext copy in the shared group", legacy.set("__secured_
 Thread.sleep(forTimeInterval: 0.05)
 check("25 seed newer undecryptable copy in the app-ID group, written by this version", addRaw("u1", magic + Data(repeating: 0x5A, count: 97), group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
 let before25 = diagnostics(badVault)
+let garbage25 = magic + Data(repeating: 0x5A, count: 97)
+func copy(_ account: String, in group: String) -> [String: Any]? {
+    return items(account: account).first { ($0[kSecAttrAccessGroup as String] as? String) == group }
+}
+func copyData(_ account: String, in group: String) -> Data? {
+    return copy(account, in: group)?[kSecValueData as String] as? Data
+}
+func copyClass(_ account: String, in group: String) -> String? {
+    return copy(account, in: group)?[kSecAttrAccessible as String] as? String
+}
+func copyMarked(_ account: String, in group: String) -> Bool {
+    return copy(account, in: group)?[kSecAttrLabel as String] as? String == marker
+}
 badVault.queue.sync {
     let read = badVault.loadValue(forKey: "u1")
     check("25 get reports missing with code UNREADABLE", describe(read) == "reject Item with given key does not exist" && code(read) == "UNREADABLE", "\(describe(read)) \(code(read))")
     check("25 nothing deleted, no stale value resurrected", groups("u1") == [appIdGroup, sharedGroup])
+    check("25 the older plaintext copy is encrypted and tightened in place: shared group, aku, still unmarked", copyData("u1", in: sharedGroup)?.starts(with: magic) == true && copyClass("u1", in: sharedGroup) == "aku" && !copyMarked("u1", in: sharedGroup), "\(copyClass("u1", in: sharedGroup) ?? "nil")")
+    check("25 the undecryptable copy is untouched", copyData("u1", in: appIdGroup) == garbage25 && copyMarked("u1", in: appIdGroup))
+    let again = badVault.loadValue(forKey: "u1")
+    check("25 the next get is still UNREADABLE, the rewritten older copy does not win", code(again) == "UNREADABLE", describe(again))
     check("25 sweep leaves both copies", describe(badVault.migrateLegacyValues()) == "resolve -" && groups("u1") == [appIdGroup, sharedGroup])
     check("25 set overwrites, one copy left", describe(badVault.storeValue("__secured_fresh", forKey: "u1")) == "resolve true" && describe(badVault.loadValue(forKey: "u1")) == "resolve __secured_fresh" && groups("u1") == [appIdGroup], "\(groups("u1"))")
 }
-check("25 decryptFailures counted", counter(diagnostics(badVault), "decryptFailures") - counter(before25, "decryptFailures") == 2, "\(diagnostics(badVault))")
+check("25 decryptFailures counted for two gets and the sweep", counter(diagnostics(badVault), "decryptFailures") - counter(before25, "decryptFailures") == 3, "\(diagnostics(badVault))")
 let noKeyTags = tags("harness.25.nokey")
 let noKeyVault = makeVault(keyTag: noKeyTags.name)
 noKeyVault.queue.sync {
     let read = noKeyVault.loadValue(forKey: "u1")
     check("25 ciphertext of a key that does not exist is UNREADABLE", describe(read) == "reject Item with given key does not exist" && code(read) == "UNREADABLE", describe(read))
     check("25 decrypting never creates a key", keyCount(noKeyTags.secureEnclave) + keyCount(noKeyTags.software) == 0)
+}
+check("25b seed older plaintext copy in the shared group", legacy.set("__secured_older_b", forKey: "u2", withAccessibility: .afterFirstUnlock))
+Thread.sleep(forTimeInterval: 0.05)
+check("25b seed an undecryptable copy without the label in the app-ID group", addRaw("u2", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly) == errSecSuccess)
+check("25b upstream 0.13.0 reads the undecryptable copy", legacy.data(forKey: "u2") == garbage25)
+badVault.queue.sync {
+    check("25b get is UNREADABLE", code(badVault.loadValue(forKey: "u2")) == "UNREADABLE")
+    check("25b the older unlabelled copy is encrypted and tightened in place", copyData("u2", in: sharedGroup)?.starts(with: magic) == true && copyClass("u2", in: sharedGroup) == "aku" && !copyMarked("u2", in: sharedGroup))
+    check("25b the next get still settles on the copy upstream read", code(badVault.loadValue(forKey: "u2")) == "UNREADABLE" && legacy.data(forKey: "u2") == garbage25)
+}
+check("25c seed an older copy that is not UTF-8 in the shared group", addRaw("u3", Data([0xFF, 0xFE, 0x00]), group: sharedGroup) == errSecSuccess)
+Thread.sleep(forTimeInterval: 0.05)
+check("25c seed a newer undecryptable copy written by this version", addRaw("u3", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
+badVault.queue.sync {
+    check("25c get is UNREADABLE", code(badVault.loadValue(forKey: "u3")) == "UNREADABLE")
+    check("25c an older copy that is not readable plaintext stays as it is", copyData("u3", in: sharedGroup) == Data([0xFF, 0xFE, 0x00]) && copyClass("u3", in: sharedGroup) == "ck")
+    check("25c the next set removes it", describe(badVault.storeValue("__secured_u3", forKey: "u3")) == "resolve true" && groups("u3") == [appIdGroup])
 }
 
 print("--- 26 clear and remove only touch cap_sec")
