@@ -548,3 +548,42 @@ cd android
 ### Web
 
 There is no secure storage in browser (not because it is not implemented by this plugin, but it does not exist at all). Values are stored in LocalStorage, but they are at least base64 encoded. Plugin adds 'cap_sec' prefix to keys to avoid conflicts with other data stored in LocalStorage.
+
+## Releasing
+
+Pushing a tag `vX.Y.Z` publishes the package to npm through `.github/workflows/release.yml`. The workflow first runs the CI checks (web build and lint, iOS unit tests and keychain harness, Android unit tests). Then it publishes with npm trusted publishing and a provenance attestation, and creates a GitHub release from the CHANGELOG section of the version.
+
+1. Set the version: `npm version X.Y.Z --no-git-tag-version` updates `package.json` and `package-lock.json`.
+2. In `CHANGELOG.md`, rename the `## X.Y.Z (unreleased)` heading to `## X.Y.Z`. The GitHub release notes are the lines under that heading.
+3. Run `npm run release:check` and read the tarball list it prints.
+4. Commit, tag and push the tag:
+
+```bash
+git commit -am "chore: release X.Y.Z"
+git tag vX.Y.Z
+git push origin master vX.Y.Z
+```
+
+The publish job fails when the tag is not `v` followed by the `package.json` version. Fix the version, move the tag and push it again.
+
+### First publish and trusted publisher setup
+
+npm can configure a trusted publisher only for a package that already exists. A maintainer therefore publishes the first version by hand. `prepublishOnly` builds `dist` first:
+
+```bash
+npm login
+npm publish --access public
+```
+
+If the tag of that version is pushed afterwards, its publish job fails because the version is already on npm. That failure is expected once.
+
+Then open the package on npmjs.com, go to Settings, Trusted publishing, and add GitHub Actions with these values:
+
+- Organization or user: `skip-pay`
+- Repository: `better-capacitor-secure-storage-plugin`
+- Workflow filename: `release.yml` (file name only, case-sensitive)
+- Environment: empty
+
+Configurations created after 3 September 2026 allow only `npm stage publish` by default. Allow direct publishing with `npm publish` as well, because the workflow runs `npm publish`. npm does not validate the configuration when you save it, so a typo shows up only as a failed publish.
+
+From then on every `v*` tag publishes on its own. The workflow uses no npm token. Trusted publishing needs a GitHub-hosted runner, npm 11.5.1 or later and Node 22.14.0 or later. The workflow installs the latest npm before it publishes. The `repository.url` in `package.json` has to point at this GitHub repository.
