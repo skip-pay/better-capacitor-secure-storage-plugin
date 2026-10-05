@@ -116,6 +116,15 @@ private func settle(_ vault: SecureStorageVault) {
     vault.queue.sync {}
 }
 
+private extension XCTestCase {
+    /// Waits until `delay` has passed on the vault queue, so vault timers due well before it have fired.
+    func pause(_ vault: SecureStorageVault, _ delay: DispatchTimeInterval) {
+        let passed = expectation(description: "pause")
+        vault.queue.asyncAfter(deadline: .now() + delay) { passed.fulfill() }
+        wait(for: [passed], timeout: 5)
+    }
+}
+
 private func describe(_ result: SecureStorageVault.DecodeResult) -> String {
     switch result {
     case .plaintext(let value): return "plaintext(\(value))"
@@ -691,12 +700,12 @@ final class SecureStorageDecryptTests: XCTestCase {
         XCTAssertEqual(vault.queue.sync { describe(vault.decodeValue(SecureStorageVault.magic + Data(repeating: 0x5A, count: 97))) }, "invalid")
     }
 
-    func testFailureNotKnownToBePermanentParksAndEndsThroughTheLostEscape() {
+    func testFailureNotKnownToBePermanentParksAndThenMakesTheKeyUnusable() {
         let ticker = ManualTicker()
         let vault = makeVault(ticker: ticker)
         let key = makeSoftwareKey()
         _ = stubKeyLookup(vault, key: key)
-        _ = stubDecryption(vault, failures: [errSecInternalError], repeatLast: true)
+        let calls = stubDecryption(vault, failures: [errSecInternalError], repeatLast: true)
         let log = EventLog()
         submitDecodingGet(vault, encrypt("1234", for: key), log: log)
         vault.queue.sync {}
@@ -704,8 +713,35 @@ final class SecureStorageDecryptTests: XCTestCase {
         XCTAssertTrue(log.events.isEmpty, "never UNREADABLE on the first attempts")
         ticker.fire()
         XCTAssertEqual(log.events, ["get reject Item with given key does not exist UNREADABLE"])
-        XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 1)
-        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 8, "two retries in each of four runs")
+        XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 0, "ended by the unusable key in the same tick as the lost escape")
+        XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "unusable")
+        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 2, "two retries in the first run, one attempt in each tick")
+        XCTAssertEqual(calls.read(), 3 + 3 + 1, "three runs on ticks and the check of the key with fresh ciphertext")
+    }
+
+    func testAParkedReRunMakesASingleDecryptionAttempt() {
+        let ticker = ManualTicker()
+        let vault = makeVault(ticker: ticker)
+        let key = makeSoftwareKey()
+        let lookups = stubKeyLookup(vault, key: key)
+        let calls = stubDecryption(vault, failures: [errSecInternalError], repeatLast: true)
+        vault.queue.sync { vault.decryptRetryDelays = [0.05, 0.2] }
+        let log = EventLog()
+        submitDecodingGet(vault, encrypt("1234", for: key), log: log)
+        vault.queue.sync {}
+        XCTAssertEqual(calls.read(), 3, "the first run retries")
+        XCTAssertEqual(lookups.read(), 3)
+        let started = Date()
+        ticker.fire()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 0.2, "no retry delays on the vault queue")
+        XCTAssertEqual(calls.read(), 4)
+        settle(vault)
+        XCTAssertEqual(calls.read(), 5, "a drain between ticks also makes one attempt")
+        ticker.fire()
+        XCTAssertEqual(calls.read(), 6)
+        XCTAssertEqual(lookups.read(), 3, "the re-runs use the key the last retry looked up")
+        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 2)
+        XCTAssertTrue(log.events.isEmpty)
     }
 
     func testFailureThatRecoversOnALaterTickResolvesWithTheValue() {
@@ -721,7 +757,23 @@ final class SecureStorageDecryptTests: XCTestCase {
         XCTAssertEqual(calls.read(), 3)
         ticker.fire()
         XCTAssertEqual(log.events, ["get resolve 1234"])
+        XCTAssertEqual(calls.read(), 4, "one attempt on the re-run")
         XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 0)
+    }
+
+    func testPermanentDecryptFailuresNeverCountTowardsAnUnusableKey() {
+        let vault = makeVault()
+        let key = makeSoftwareKey()
+        _ = stubKeyLookup(vault, key: key)
+        _ = stubDecryption(vault, failures: [errSecParam], repeatLast: true)
+        let data = encrypt("1234", for: key)
+        for _ in 0..<6 {
+            XCTAssertEqual(vault.queue.sync { () -> String in
+                vault.tick()
+                return describe(vault.decodeValue(data))
+            }, "invalid")
+        }
+        XCTAssertNotEqual(vault.queue.sync { vault.keyBackend() }, "unusable")
     }
 
     func testLockedDecryptionParksWithoutRetries() {
@@ -970,6 +1022,102 @@ final class SecureStorageUnusableKeyTests: XCTestCase {
         XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 0, "ended by the unusable key, not the lost escape")
         XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "unusable")
     }
+
+    func testDecryptionThatKeepsFailingWhileUnlockedMakesTheKeyUnusable() {
+        for code in [errSecInternalError, -25293] {
+            let ticker = ManualTicker()
+            let vault = makeVault(ticker: ticker)
+            let key = makeSoftwareKey()
+            _ = stubKeyLookup(vault, key: key)
+            let calls = stubDecryption(vault, failures: [code], repeatLast: true)
+            let log = EventLog()
+            submitDecodingGet(vault, encrypt("1234", for: key), log: log)
+            vault.queue.sync {}
+            ticker.fire(times: 2)
+            XCTAssertTrue(log.events.isEmpty, "\(code)")
+            XCTAssertNotEqual(vault.queue.sync { vault.keyBackend() }, "unusable", "\(code)")
+            ticker.fire()
+            XCTAssertEqual(log.events, ["get reject Item with given key does not exist UNREADABLE"], "\(code)")
+            XCTAssertEqual(vault.queue.sync { vault.diagnostics()["keyBackend"] as? String }, "unusable", "\(code)")
+            XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 0, "\(code)")
+            let callsWhenUnusable = calls.read()
+            submitDecodingGet(vault, encrypt("5678", for: key), log: log)
+            vault.queue.sync {}
+            XCTAssertEqual(log.events.last, "get reject Item with given key does not exist UNREADABLE", "the next get rejects at once, \(code)")
+            XCTAssertEqual(calls.read(), callsWhenUnusable, "without decrypting, \(code)")
+            submitEncodingSet(vault, log: log)
+            vault.queue.sync {}
+            XCTAssertEqual(log.events.last, "set resolve plaintext fallback", "\(code)")
+            XCTAssertFalse(ticker.isRunning, "\(code)")
+        }
+    }
+
+    func testTheFreshLookupsOfTheRetriesDoNotResetTheCount() {
+        let vault = makeVault()
+        let key = makeSoftwareKey()
+        let lookups = stubKeyLookup(vault, key: key)
+        _ = stubDecryption(vault, failures: [errSecInternalError], repeatLast: true)
+        let data = encrypt("1234", for: key)
+        let results = (0..<4).map { _ in
+            vault.queue.sync { () -> String in
+                vault.tick()
+                return describe(vault.decodeValue(data))
+            }
+        }
+        XCTAssertEqual(results, ["locked", "locked", "locked", "invalid"], "one count per tick although every read retried")
+        XCTAssertGreaterThan(lookups.read(), 4)
+        XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "unusable")
+    }
+
+    func testKeyLookupThatKeepsFailingDuringDecryptionMakesTheKeyUnusable() {
+        let ticker = ManualTicker()
+        let vault = makeVault(ticker: ticker)
+        _ = stubKeyLookup(vault, key: nil, status: { errSecMissingEntitlement })
+        let calls = stubDecryption(vault, failures: [])
+        let log = EventLog()
+        submitDecodingGet(vault, encrypt("1234", for: makeSoftwareKey()), log: log)
+        vault.queue.sync {}
+        ticker.fire(times: 2)
+        XCTAssertTrue(log.events.isEmpty)
+        ticker.fire()
+        XCTAssertEqual(log.events, ["get reject Item with given key does not exist UNREADABLE"])
+        XCTAssertEqual(vault.queue.sync { vault.keyBackend() }, "unusable")
+        XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 0)
+        XCTAssertEqual(calls.read(), 0)
+        submitDecodingGet(vault, encrypt("5678", for: makeSoftwareKey()), log: log)
+        vault.queue.sync {}
+        XCTAssertEqual(log.events.count, 2, "the next get rejects at once")
+    }
+
+    func testAFailureConfinedToOneItemEndsThroughItsLostEscapeAndKeepsTheKey() {
+        let ticker = ManualTicker()
+        let vault = makeVault(ticker: ticker)
+        let key = makeSoftwareKey()
+        _ = stubKeyLookup(vault, key: key)
+        let broken = encrypt("1234", for: key)
+        let brokenCiphertext = broken.dropFirst(SecureStorageVault.magic.count)
+        vault.queue.sync {
+            vault.decryptCiphertext = { key, algorithm, ciphertext, error in
+                guard (ciphertext as Data) != brokenCiphertext else {
+                    error?.pointee = osStatusError(errSecInternalError)
+                    return nil
+                }
+                return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
+            }
+        }
+        let log = EventLog()
+        submitDecodingGet(vault, broken, log: log)
+        vault.queue.sync {}
+        ticker.fire(times: 2)
+        XCTAssertTrue(log.events.isEmpty)
+        ticker.fire()
+        XCTAssertEqual(log.events, ["get reject Item with given key does not exist UNREADABLE"])
+        XCTAssertEqual(vault.queue.sync { vault.counters.lostItems }, 1, "the item's own lost escape")
+        XCTAssertNotEqual(vault.queue.sync { vault.keyBackend() }, "unusable", "the key opened fresh ciphertext")
+        submitDecodingGet(vault, encrypt("5678", for: key), log: log)
+        vault.queue.sync {}
+        XCTAssertEqual(log.events.last, "get resolve 5678", "other items still decrypt")
+    }
 }
 
 final class SecureStorageSweepTests: XCTestCase {
@@ -1007,13 +1155,14 @@ final class SecureStorageSweepTests: XCTestCase {
         let active = Flag(false)
         let vault = makeVault(protectedData: { available.read() }, active: { active.read() })
         let log = EventLog()
-        vault.requestSweep { _ in log.record("sweep"); return true }
+        vault.requestSweep(quietPeriod: .milliseconds(20)) { _ in log.record("sweep"); return true }
         vault.submitOperation(named: "get", key: "k", run: { log.record("run get"); return .resolve(["value": "v"]) }, completion: { log.record("get \(describe($0))") })
         settle(vault)
         XCTAssertTrue(log.events.isEmpty)
         available.write(nil)
         active.write(true)
         settle(vault)
+        pause(vault, .milliseconds(200))
         XCTAssertEqual(log.events, ["run get", "get resolve v"], "unknown protected data is not enough for the sweep")
         available.write(true)
         active.write(false)
@@ -1034,20 +1183,23 @@ final class SecureStorageSweepTests: XCTestCase {
         let log = EventLog()
         var locked = true
         vault.submitOperation(named: "get", key: "k", run: { locked ? .locked : .resolve(["value": "v"]) }, completion: { log.record("get \(describe($0))") })
-        vault.requestSweep { _ in log.record("sweep"); return true }
+        vault.requestSweep(quietPeriod: .milliseconds(20)) { _ in log.record("sweep"); return true }
         settle(vault)
         XCTAssertTrue(log.events.isEmpty)
         vault.queue.sync { locked = false }
         settle(vault)
+        pause(vault, .milliseconds(200))
         XCTAssertEqual(log.events, ["get resolve v", "sweep"])
     }
 
     func testIncompleteSweepRunsAgainOnLaterDrainsUpToTheLimit() {
         let vault = makeVault()
         let log = EventLog()
-        vault.requestSweep { _ in log.record("sweep"); return false }
-        // The sweep waits for the app's first completed call.
+        vault.requestSweep(quietPeriod: .milliseconds(20)) { _ in log.record("sweep"); return false }
+        // The sweep waits for a quiet period after the app's first completed call.
         vault.submitOperation(named: "get", key: "k", run: { .resolve(["value": "v"]) })
+        settle(vault)
+        pause(vault, .milliseconds(200))
         for _ in 0..<6 {
             settle(vault)
         }
@@ -1057,23 +1209,84 @@ final class SecureStorageSweepTests: XCTestCase {
     func testSweepWaitsForTheFirstCompletedAppCall() {
         let vault = makeVault()
         let log = EventLog()
-        vault.requestSweep(backstop: .seconds(60)) { _ in log.record("sweep"); return true }
+        let lastCompletion = Flag<DispatchTime?>(nil)
+        let sweptAt = Flag<DispatchTime?>(nil)
+        let swept = expectation(description: "the sweep runs once the app is quiet")
+        vault.requestSweep(backstop: .seconds(60), quietPeriod: .milliseconds(100)) { _ in
+            sweptAt.write(.now())
+            log.record("sweep")
+            swept.fulfill()
+            return true
+        }
         for _ in 0..<5 {
             settle(vault)
         }
         XCTAssertTrue(log.events.isEmpty, "empty queue, foreground and protected data are not enough on a cold start")
-        vault.submitOperation(named: "get", key: "k", run: { log.record("run get"); return .resolve(["value": "v"]) }, completion: { log.record("get \(describe($0))") })
+        // Two startup calls back to back: the second is already queued when the first completes.
+        for key in ["a", "b"] {
+            vault.submitOperation(named: "get", key: key, run: { log.record("run get \(key)"); return .resolve(["value": key]) }, completion: {
+                lastCompletion.write(.now())
+                log.record("get \(key) \(describe($0))")
+            })
+        }
+        wait(for: [swept], timeout: 5)
+        XCTAssertEqual(log.events, ["run get a", "get a resolve a", "run get b", "get b resolve b", "sweep"], "the second call does not wait behind the sweep")
+        XCTAssertTrue(sweptAt.read()! >= lastCompletion.read()! + .milliseconds(80), "about one quiet period after the last call")
+    }
+
+    func testAnAppCallWithinTheQuietPeriodDefersTheSweep() {
+        let vault = makeVault()
+        let log = EventLog()
+        let lastCompletion = Flag<DispatchTime?>(nil)
+        let sweptAt = Flag<DispatchTime?>(nil)
+        let swept = expectation(description: "the sweep runs once the app is quiet")
+        vault.requestSweep(backstop: .seconds(60), quietPeriod: .milliseconds(300)) { _ in
+            sweptAt.write(.now())
+            log.record("sweep")
+            swept.fulfill()
+            return true
+        }
+        let submitGet = { (key: String) in
+            vault.submitOperation(named: "get", key: key, run: { .resolve(["value": key]) }, completion: {
+                lastCompletion.write(.now())
+                log.record("get \(key) \(describe($0))")
+            })
+        }
+        submitGet("a")
         settle(vault)
-        XCTAssertEqual(log.events, ["run get", "get resolve v", "sweep"])
+        pause(vault, .milliseconds(100))
+        submitGet("b")
+        settle(vault)
+        wait(for: [swept], timeout: 5)
+        XCTAssertEqual(log.events, ["get a resolve a", "get b resolve b", "sweep"])
+        XCTAssertTrue(sweptAt.read()! >= lastCompletion.read()! + .milliseconds(280), "the quiet check of the first call did not open the gate")
     }
 
     func testARejectedAppCallAlsoOpensTheSweep() {
         let vault = makeVault()
         let log = EventLog()
-        vault.requestSweep(backstop: .seconds(60)) { _ in log.record("sweep"); return true }
+        vault.requestSweep(backstop: .seconds(60), quietPeriod: .milliseconds(20)) { _ in log.record("sweep"); return true }
         vault.submitOperation(named: "get", key: "k", run: { .reject(SecureStorageVault.missingItemMessage, code: .notFound) }, completion: { log.record("get \(describe($0))") })
         settle(vault)
+        pause(vault, .milliseconds(200))
         XCTAssertEqual(log.events, ["get reject Item with given key does not exist NOT_FOUND", "sweep"])
+    }
+
+    func testBackstopWaitsForAQuietPeriodAfterAnAppCall() {
+        let vault = makeVault()
+        let completedAt = Flag<DispatchTime?>(nil)
+        let sweptAt = Flag<DispatchTime?>(nil)
+        // Completes before the request, so only the backstop can open the gate.
+        vault.submitOperation(named: "get", key: "k", run: { .resolve(["value": "v"]) }, completion: { _ in completedAt.write(.now()) })
+        settle(vault)
+        let swept = expectation(description: "the re-armed backstop opens the sweep")
+        vault.requestSweep(backstop: .milliseconds(20), quietPeriod: .milliseconds(300)) { _ in
+            sweptAt.write(.now())
+            swept.fulfill()
+            return true
+        }
+        wait(for: [swept], timeout: 5)
+        XCTAssertTrue(sweptAt.read()! >= completedAt.read()! + .milliseconds(280), "the backstop at 20 ms re-armed until the quiet period passed")
     }
 
     func testBackstopRunsTheSweepWhenTheAppMakesNoCall() {

@@ -371,7 +371,8 @@ final class SecureStorageVault {
     }
 
     /// `.invalid` is final: the bytes cannot be decoded with any key this app has. `.locked` parks the call, also for a
-    /// failure that is not known to be permanent, so the tick-bounded lost escape decides instead of the first attempt.
+    /// failure that is not known to be permanent, so the tick-bounded key count (`noteKeyRefusal`) or the lost escape decides
+    /// instead of the first attempt.
     enum DecodeResult {
         case plaintext(String)
         case decrypted(String)
@@ -420,7 +421,8 @@ final class SecureStorageVault {
         case missing
         case locked
         case failure
-        /// The key keeps refusing with -25308 on a device confirmed to be unlocked, see `noteKeyRefusal`.
+        /// The key keeps refusing with -25308, or failing for a reason not known to be permanent, on a device confirmed to be
+        /// unlocked, see `noteKeyRefusal`.
         case unusable
     }
 
@@ -517,16 +519,25 @@ final class SecureStorageVault {
     private var sweepRequested = false
     private var sweepQueued = false
     private var sweepRuns = 0
-    /// The sweep waits until an app call has completed, or until the backstop after the first request fired, so on a cold
-    /// start it never runs ahead of the app's first call.
+    /// The sweep waits until `sweepQuietPeriod` passed after a completed app call without another one, or until the backstop
+    /// after a request fired, so on a cold start it never runs ahead of the app's first call or between two of its calls.
+    /// Every app call closes it again.
     private var sweepGateOpen = false
     private var sweepBackstopScheduled = false
+    private var sweepQuietPeriod: DispatchTimeInterval = .milliseconds(1500)
+    /// Bumped when an app call is queued and when it completes. A quiet check opens the gate only when it is unchanged.
+    private var appCallGeneration = 0
+    private var lastAppCall: DispatchTime?
     private var sweepBody: (SecureStorageVault) -> Bool = { $0.runSweep() }
-    /// -25308 results of the key while the device was confirmed unlocked, at most one per tick, reset by a working key.
+    /// -25308 results of the key, and its lookups or decryptions that failed for a reason not known to be permanent, while
+    /// the device was confirmed unlocked, at most one per tick, reset by a working key.
     private var keyRefusals = 0
     private var lastKeyRefusalTick: Int?
-    /// Set once the key kept refusing, for the rest of the process. The key itself is never deleted.
+    /// Set once the key kept refusing or failing, for the rest of the process. The key itself is never deleted.
     private var keyUnusable = false
+    /// Set while a call runs again after one of its runs counted towards the lost escape: decryption makes a single attempt
+    /// without `decryptRetryDelays`, so the retries on timer ticks do not hold the queue.
+    private var singleDecryptAttempt = false
     /// Only read or written on `queue`.
     private(set) var counters = Counters()
     /// Test hook for the plaintext fallback: encryption reports a non-lock failure. Set on `queue` only.
@@ -586,6 +597,7 @@ final class SecureStorageVault {
     func submitOperation(named name: String, key: String, run: @escaping () -> Outcome, lost: (() -> Outcome)? = nil, completion: ((Outcome) -> Void)? = nil) {
         let operation = PendingOperation(name: name, key: key, run: run, lost: lost, complete: completion)
         queue.async {
+            self.noteAppCall()
             self.parkedOperations.append(operation)
             self.runParkedOperations()
         }
@@ -597,24 +609,56 @@ final class SecureStorageVault {
         }
     }
 
-    /// Asks for the per-launch sweep. It is queued behind the app's calls once an app call has completed and the queue has
-    /// drained, the app is in the foreground and protected data is known to be available. When the app makes no call, the
-    /// first request opens that gate after `backstop` instead. `body` replaces the keychain sweep in tests and returns
-    /// `false` when keys were skipped and the sweep should run again later.
-    func requestSweep(backstop: DispatchTimeInterval = .seconds(5), _ body: ((SecureStorageVault) -> Bool)? = nil) {
+    /// Asks for the per-launch sweep. It is queued behind the app's calls once `quietPeriod` passed after a completed app call
+    /// without another app call, the queue has drained, the app is in the foreground and protected data is known to be
+    /// available. When the app makes no call, the request opens that gate after `backstop` instead, later while an app call
+    /// came within the last `quietPeriod`. `body` replaces the keychain sweep in tests and returns `false` when keys were
+    /// skipped and the sweep should run again later.
+    func requestSweep(backstop: DispatchTimeInterval = .seconds(5), quietPeriod: DispatchTimeInterval = .milliseconds(1500), _ body: ((SecureStorageVault) -> Bool)? = nil) {
         queue.async {
             if let body = body {
                 self.sweepBody = body
             }
+            self.sweepQuietPeriod = quietPeriod
             self.sweepRequested = true
-            if !self.sweepBackstopScheduled {
+            if !self.sweepGateOpen, !self.sweepBackstopScheduled {
                 self.sweepBackstopScheduled = true
                 self.queue.asyncAfter(deadline: .now() + backstop) { [weak self] in
-                    guard let self = self, !self.sweepGateOpen else { return }
-                    self.sweepGateOpen = true
-                    self.runParkedOperations()
+                    self?.fireSweepBackstop()
                 }
             }
+            self.runParkedOperations()
+        }
+    }
+
+    /// Opens the gate unless an app call came within the last quiet period, then it checks again once that has passed.
+    private func fireSweepBackstop() {
+        if !sweepGateOpen, let last = lastAppCall, DispatchTime.now() < last + sweepQuietPeriod {
+            queue.asyncAfter(deadline: last + sweepQuietPeriod) { [weak self] in
+                self?.fireSweepBackstop()
+            }
+            return
+        }
+        sweepBackstopScheduled = false
+        guard !sweepGateOpen else { return }
+        sweepGateOpen = true
+        runParkedOperations()
+    }
+
+    /// An app call was queued or completed. The sweep gate stays closed until the next quiet period.
+    private func noteAppCall() {
+        appCallGeneration += 1
+        lastAppCall = .now()
+        sweepGateOpen = false
+    }
+
+    /// After a completed app call: opens the gate once `sweepQuietPeriod` passed without another app call, then drains.
+    private func scheduleQuietCheck() {
+        guard sweepRequested else { return }
+        let generation = appCallGeneration
+        queue.asyncAfter(deadline: .now() + sweepQuietPeriod) { [weak self] in
+            guard let self = self, self.appCallGeneration == generation else { return }
+            self.sweepGateOpen = true
             self.runParkedOperations()
         }
     }
@@ -1042,8 +1086,9 @@ final class SecureStorageVault {
         case .failed(.missingKey), .unusable:
             return .invalid
         case .failed(.code(let code)):
-            // Only a wrong key or corrupt ciphertext is final. Anything else parks and the tick-bounded lost escape decides.
-            guard code == Int(errSecParam) || code == Int(errSecDecode) else {
+            // Only a wrong key or corrupt ciphertext is final. Anything else parks and the tick-bounded key count or the lost
+            // escape decides.
+            guard SecureStorageVault.isPermanentDecryptFailure(code) else {
                 logger.error("decrypt failure \(code, privacy: .public) is not known to be permanent, parked")
                 return .locked
             }
@@ -1051,20 +1096,32 @@ final class SecureStorageVault {
         }
     }
 
+    /// `errSecParam` or `errSecDecode` after the retries: a wrong key or corrupt ciphertext, final for that ciphertext.
+    private static func isPermanentDecryptFailure(_ code: Int) -> Bool {
+        return code == Int(errSecParam) || code == Int(errSecDecode)
+    }
+
     /// Decrypts with the key under the tag and never creates one, a new key cannot open old ciphertext. A decryption that
     /// fails while the device is known to be unlocked drops the cached key, looks the key up again and retries after each of
-    /// `decryptRetryDelays`. `.failed` is what still fails afterwards while the unlock probe confirms an unlocked device,
-    /// or a key lookup that failed. A -25308 counts towards `noteKeyRefusal` like one from the key lookup.
+    /// `decryptRetryDelays`, only a call that runs again after counting towards the lost escape makes a single attempt.
+    /// `.failed` is what still fails afterwards while the unlock probe confirms an unlocked device, or a key lookup that
+    /// failed. A -25308 counts towards `noteKeyRefusal` like one from the key lookup, and so do a failed key lookup and a
+    /// failure that is not known to be permanent, so a key that keeps failing ends as unusable for the process instead of
+    /// parking every call for its own lost escape. Such a failure only makes the key unusable when the key cannot open
+    /// fresh ciphertext either.
     private func decrypt(_ ciphertext: Data, context: String) -> DecryptResult {
+        let delays = singleDecryptAttempt ? [] : decryptRetryDelays
         var failure = DecryptFailure.missingKey
-        for attempt in 0...decryptRetryDelays.count {
+        var lastKey: SecKey?
+        for attempt in 0...delays.count {
             if attempt > 0 {
                 counters.decryptRetries += 1
-                Thread.sleep(forTimeInterval: decryptRetryDelays[attempt - 1])
+                Thread.sleep(forTimeInterval: delays[attempt - 1])
                 forgetCachedKey()
             }
             let key: SecKey
-            switch acquirePrivateKey(creating: false) {
+            // A key found by the fresh lookup of a retry does not show that it decrypts, so that lookup keeps the count.
+            switch acquirePrivateKey(creating: false, resettingRefusals: attempt == 0) {
             case .key(let acquired):
                 key = acquired
             case .missing where attempt == 0:
@@ -1076,10 +1133,11 @@ final class SecureStorageVault {
             case .locked:
                 return .locked
             case .failure:
-                return .failed(.lookupFailed)
+                return noteKeyRefusal() ? .unusable : .failed(.lookupFailed)
             case .unusable:
                 return .unusable
             }
+            lastKey = key
             var error: Unmanaged<CFError>?
             if let plaintext = decryptCiphertext(key, algorithm, ciphertext as CFData, &error) as Data? {
                 if attempt > 0 {
@@ -1109,7 +1167,13 @@ final class SecureStorageVault {
         case .code(let failed):
             code = failed
         }
-        return isLockedFailure(code: code, context: context) ? .locked : .failed(failure)
+        if isLockedFailure(code: code, context: context) {
+            return .locked
+        }
+        if case .code(let failed) = failure, !SecureStorageVault.isPermanentDecryptFailure(failed), noteKeyRefusal(unlessDecryptedBy: lastKey) {
+            return .unusable
+        }
+        return .failed(failure)
     }
 
     /// Writes and deletes a throwaway item with an unlock-bound class. Only an explicit `errSecInteractionNotAllowed` counts as
@@ -1421,6 +1485,8 @@ final class SecureStorageVault {
 
     private func executeOperation(_ operation: PendingOperation) -> Bool {
         let gated = configuration.accessibility.requiresUnlock && isProtectedDataAvailable() == false
+        singleDecryptAttempt = operation.confirmedLockedAttempts > 0
+        defer { singleDecryptAttempt = false }
         var outcome = gated ? .locked : operation.run()
         if !gated, case .locked = outcome, isProtectedDataAvailable() == true, countLockedWhileUnlocked(operation) {
             counters.lostItems += 1
@@ -1444,7 +1510,9 @@ final class SecureStorageVault {
             break
         }
         if !operation.isSweep {
-            sweepGateOpen = true
+            // Not in this pass: the app's next call is often already on its way.
+            noteAppCall()
+            scheduleQuietCheck()
         }
         operation.complete?(outcome)
         return true
@@ -1463,34 +1531,59 @@ final class SecureStorageVault {
     }
 
     /// Looks the key up by tag, the explicit group first. `creating` adds a new key when none exists, only encryption asks for that.
-    /// A lookup refused with -25308 counts towards `noteKeyRefusal`, a key found by a lookup resets the count.
-    private func acquirePrivateKey(creating: Bool) -> KeyResult {
+    /// A lookup refused with -25308 counts towards `noteKeyRefusal`, a key found by a lookup resets the count unless
+    /// `resettingRefusals` is false.
+    private func acquirePrivateKey(creating: Bool, resettingRefusals: Bool = true) -> KeyResult {
         guard !keyUnusable else { return .unusable }
         let found = lookUpOrCreateKey(creating: creating)
         if found.refused {
             return noteKeyRefusal() ? .unusable : .locked
         }
-        if case .key = found.result, found.lookedUp {
+        if case .key = found.result, found.lookedUp, resettingRefusals {
             keyRefusals = 0
         }
         return found.result
     }
 
-    /// Counts a -25308 of the key lookup or of a decryption while protected data is available and the unlock probe agrees,
+    /// Counts a -25308 of the key lookup or of a decryption, a failed key lookup during a decryption, or a decryption failure
+    /// that is not known to be permanent, while protected data is available and the unlock probe agrees,
     /// at most once per timer tick, the way `countLockedWhileUnlocked` counts a call. After the first one and
     /// `lockedRetriesBeforeLost` more the key is unusable for the rest of the process, as after a Quick Start that carried
     /// the key item but not a working Secure Enclave key: encryption reports a failure, so `set` stores plaintext with the
     /// strict class, and ciphertext reads as invalid. The key is never deleted, a misjudged transient would destroy every
     /// ciphertext, and the next launch tries it again. True once the key is unusable.
-    private func noteKeyRefusal() -> Bool {
+    /// With `unlessDecryptedBy` the key first has to fail to open ciphertext made for it just now: a failure that belongs to
+    /// one item must not make every other item unreadable, that call ends through its own lost escape instead.
+    private func noteKeyRefusal(unlessDecryptedBy key: SecKey? = nil) -> Bool {
         guard !keyUnusable else { return true }
         guard lastKeyRefusalTick != tickCount, isProtectedDataAvailable() == true, confirmUnlocked() else { return false }
         lastKeyRefusalTick = tickCount
         keyRefusals += 1
         guard keyRefusals > SecureStorageVault.lockedRetriesBeforeLost else { return false }
+        if let key = key, decryptsFreshCiphertext(key) {
+            logger.error("key opens fresh ciphertext, the failure belongs to the item")
+            keyRefusals = 0
+            return false
+        }
         keyUnusable = true
         logger.fault("key refused \(self.keyRefusals, privacy: .public) times while unlocked, unusable for this process")
         return true
+    }
+
+    /// Encrypts a few bytes for `key` and decrypts them once, without retries.
+    private func decryptsFreshCiphertext(_ key: SecKey) -> Bool {
+        let probe = Data("capacitor-secure-storage-plugin.probe".utf8)
+        var encryptError: Unmanaged<CFError>?
+        guard let publicKey = SecKeyCopyPublicKey(key), let ciphertext = SecKeyCreateEncryptedData(publicKey, algorithm, probe as CFData, &encryptError) else {
+            logger.error("key check encryption failed \(self.extractCode(from: encryptError), privacy: .public)")
+            return false
+        }
+        var decryptError: Unmanaged<CFError>?
+        guard let plaintext = decryptCiphertext(key, algorithm, ciphertext, &decryptError) as Data? else {
+            logger.error("key check decryption failed \(self.extractCode(from: decryptError), privacy: .public)")
+            return false
+        }
+        return plaintext == probe
     }
 
     /// `refused` is a lookup that returned -25308, `lookedUp` a key that came from the keychain and not from the cache.
