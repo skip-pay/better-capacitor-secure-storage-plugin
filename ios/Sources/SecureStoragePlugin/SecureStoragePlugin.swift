@@ -37,7 +37,7 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         let key = call.getString("key") ?? ""
         let value = call.getString("value") ?? ""
         guard let accessibility = vault.resolveAccessibility(call.getString("accessibility")) else {
-            call.reject(SecureStorageVault.unsupportedAccessibilityMessage)
+            call.reject(SecureStorageVault.unsupportedAccessibilityMessage, SecureStorageVault.ErrorCode.unsupportedAccessibility.rawValue)
             return
         }
         submitCall(call, to: vault, named: "set", key: key, run: { vault in
@@ -85,7 +85,7 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func requireVault(for call: CAPPluginCall) -> SecureStorageVault? {
         guard let vault = vault else {
-            call.reject(SecureStorageVault.unsupportedConfigurationMessage)
+            call.reject(SecureStorageVault.unsupportedConfigurationMessage, SecureStorageVault.ErrorCode.unsupportedAccessibility.rawValue)
             return nil
         }
         return vault
@@ -104,7 +104,7 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
             case .resolve(let data):
                 call.resolve(data)
             case .reject(let message, let code):
-                call.reject(message, code)
+                call.reject(message, code.rawValue)
             case .locked:
                 break
             }

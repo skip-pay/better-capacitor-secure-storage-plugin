@@ -334,9 +334,19 @@ final class SecureStorageVault {
         case failure
     }
 
+    /// Rejection codes, additive to the unchanged messages.
+    enum ErrorCode: String {
+        case notFound = "NOT_FOUND"
+        case unreadable = "UNREADABLE"
+        /// Reserved for a future fail-fast option. The default path parks locked calls and never emits it.
+        case locked = "LOCKED"
+        case unsupportedAccessibility = "UNSUPPORTED_ACCESSIBILITY"
+        case storageError = "STORAGE_ERROR"
+    }
+
     enum Outcome {
         case resolve([String: Any])
-        case reject(String, code: String? = nil)
+        case reject(String, code: ErrorCode)
         case locked
     }
 
@@ -354,10 +364,13 @@ final class SecureStorageVault {
         var migrated = 0
         var duplicatesResolved = 0
         var lostItems = 0
+        var decryptFailures = 0
+        var plaintextFallbacks = 0
     }
 
     private enum KeyResult {
         case key(SecKey)
+        case missing
         case locked
         case failure
     }
@@ -399,10 +412,12 @@ final class SecureStorageVault {
 
     static let magic = Data([0x00, 0x53, 0x4B, 0x01])
     static let missingItemMessage = "Item with given key does not exist"
-    static let undecryptableItemMessage = "Item with given key could not be decrypted"
     static let unsupportedAccessibilityMessage = "Unsupported accessibility value"
     static let unsupportedConfigurationMessage = "Unsupported accessibility value in plugin configuration"
-    static let unreadableCode = "UNREADABLE"
+    static let storageErrorMessage = "error"
+    static let removeFailedMessage = "Remove failed"
+    /// Class of a plaintext value written because encryption failed.
+    static let plaintextFallbackAccessibility = Accessibility.whenUnlockedThisDeviceOnly
     /// Retries after the first locked result seen while protected data is available, at most one per timer tick.
     static let lockedRetriesBeforeLost = 3
     /// Runs of the load sweep per process when keys had to be skipped.
@@ -590,6 +605,8 @@ final class SecureStorageVault {
 
     func storeValue(_ value: String, forKey key: String, accessibility: Accessibility? = nil) -> Outcome {
         guard let mode = resolveAccessGroup() else { return .locked }
+        var itemClass = accessibility ?? configuration.accessibility
+        var isFallback = false
         let data: Data
         switch encodeValue(value) {
         case .encoded(let encoded):
@@ -597,18 +614,24 @@ final class SecureStorageVault {
         case .locked:
             return .locked
         case .failure:
-            return .reject("error")
+            // Rejecting would read as a missing key in the app. Store plaintext with the strict class instead.
+            data = Data(value.utf8)
+            itemClass = itemClass.tightened(toAtLeast: SecureStorageVault.plaintextFallbackAccessibility)
+            isFallback = true
         }
-        let attribute = (accessibility ?? configuration.accessibility).attribute
-        let write = writeToTarget(key, data: data, accessibility: attribute, mode: mode)
+        let write = writeToTarget(key, data: data, accessibility: itemClass.attribute, mode: mode)
         switch classifyStatus(write.status, context: "write \(key)") {
         case .ok:
+            if isFallback {
+                counters.plaintextFallbacks += 1
+                logger.fault("stored \(key, privacy: .public) as plaintext \(itemClass.rawValue, privacy: .public), encryption unavailable")
+            }
             removeStaleCopies(of: key, keeping: write.group)
             return .resolve(["value": true])
         case .locked:
             return .locked
         case .notFound, .failed:
-            return .reject("error")
+            return .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
         }
     }
 
@@ -624,19 +647,20 @@ final class SecureStorageVault {
         case .value(let value):
             return .resolve(["value": value])
         case .missing:
-            return .reject(SecureStorageVault.missingItemMessage)
+            return .reject(SecureStorageVault.missingItemMessage, code: .notFound)
         case .locked:
             return .locked
         case .unreadable:
-            return .reject(SecureStorageVault.undecryptableItemMessage)
+            // The item stays in place and a `set` overwrites it.
+            return .reject(SecureStorageVault.missingItemMessage, code: .unreadable)
         case .failure:
-            return .reject("error")
+            return .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
         }
     }
 
     /// `get` for an item the keychain keeps refusing while unlocked.
     func lostValue(forKey key: String) -> Outcome {
-        return .reject(SecureStorageVault.missingItemMessage, code: SecureStorageVault.unreadableCode)
+        return .reject(SecureStorageVault.missingItemMessage, code: .unreadable)
     }
 
     func listStoredKeys() -> Outcome {
@@ -647,7 +671,7 @@ final class SecureStorageVault {
         case .locked:
             return .locked
         case .failed:
-            return .reject("error")
+            return .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
         }
     }
 
@@ -669,7 +693,7 @@ final class SecureStorageVault {
                 return .locked
             }
         }
-        guard existed else { return .reject(SecureStorageVault.missingItemMessage) }
+        guard existed else { return .reject(SecureStorageVault.missingItemMessage, code: .notFound) }
         var removed = true
         for store in [dedicated, standard] {
             switch classifyStatus(store.deleteItem(key), context: "delete \(key) in \(store.service)") {
@@ -681,7 +705,7 @@ final class SecureStorageVault {
                 removed = false
             }
         }
-        return removed ? .resolve(["value": true]) : .reject("Remove failed")
+        return removed ? .resolve(["value": true]) : .reject(SecureStorageVault.removeFailedMessage, code: .storageError)
     }
 
     /// `remove` for an item the keychain keeps refusing while unlocked. The app cannot read it any more, so it counts as removed.
@@ -708,7 +732,7 @@ final class SecureStorageVault {
                 cleared = false
             }
         }
-        return cleared ? .resolve(["value": true]) : .reject("error")
+        return cleared ? .resolve(["value": true]) : .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
     }
 
     /// `clear` while the keychain keeps refusing it although the device is unlocked.
@@ -732,7 +756,7 @@ final class SecureStorageVault {
                 case .locked:
                     return .locked
                 case .failure:
-                    return .reject("error")
+                    return .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
                 case .value, .missing, .unreadable:
                     return .resolve([:])
                 }
@@ -741,7 +765,7 @@ final class SecureStorageVault {
             logger.notice("sweep skipped while locked")
             return .resolve(["skipped": 1])
         case .failed:
-            return .reject("error")
+            return .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
         }
     }
 
@@ -803,6 +827,8 @@ final class SecureStorageVault {
         case .locked:
             return .locked
         case .invalid:
+            counters.decryptFailures += 1
+            logger.error("\(key, privacy: .public) cannot be decoded, reported as missing, other copies kept")
             return .unreadable
         case .failure:
             return .failure
@@ -821,12 +847,12 @@ final class SecureStorageVault {
         let plaintext = Data(value.utf8)
         guard configuration.encryptsValues else { return .encoded(plaintext) }
         let key: SecKey
-        switch acquirePrivateKey() {
+        switch acquirePrivateKey(creating: true) {
         case .key(let acquired):
             key = acquired
         case .locked:
             return .locked
-        case .failure:
+        case .missing, .failure:
             return .failure
         }
         guard let publicKey = SecKeyCopyPublicKey(key) else {
@@ -846,9 +872,12 @@ final class SecureStorageVault {
             return .plaintext(value)
         }
         let key: SecKey
-        switch acquirePrivateKey() {
+        // Never create a key to decrypt, a new key cannot open old ciphertext.
+        switch acquirePrivateKey(creating: false) {
         case .key(let acquired):
             key = acquired
+        case .missing:
+            return isLockedFailure(code: Int(errSecItemNotFound), context: "decrypt without key") ? .locked : .invalid
         case .locked:
             return .locked
         case .failure:
@@ -959,15 +988,20 @@ final class SecureStorageVault {
         let currentClass = chosen.copy.accessibility.flatMap(Accessibility.init(attribute:))
         // A class chosen by a `set` of this version stays, legacy items are tightened to at least the configured class.
         let keepsClass = chosen.copy.isMarked && !chosen.isLegacyService
-        let targetClass = (keepsClass ? currentClass : currentClass?.tightened(toAtLeast: configuration.accessibility)) ?? configuration.accessibility
+        var targetClass = (keepsClass ? currentClass : currentClass?.tightened(toAtLeast: configuration.accessibility)) ?? configuration.accessibility
         var targetData = data
+        var isFallback = false
         if configuration.encryptsValues && !isEncodedValue(data) {
             switch encodeValue(value) {
             case .encoded(let encoded):
                 targetData = encoded
-            case .locked, .failure:
-                logger.notice("migration of \(key, privacy: .public) postponed, encryption unavailable")
+            case .locked:
+                logger.notice("migration of \(key, privacy: .public) postponed, encryption locked")
                 return
+            case .failure:
+                // Same rule as `set`: plaintext stays, but with the strict class.
+                targetClass = targetClass.tightened(toAtLeast: SecureStorageVault.plaintextFallbackAccessibility)
+                isFallback = true
             }
         }
         let others = sources.filter { !isTargetCopy($0) }
@@ -994,6 +1028,10 @@ final class SecureStorageVault {
                 return
             }
             counters.migrated += 1
+            if isFallback {
+                counters.plaintextFallbacks += 1
+                logger.fault("migrated \(key, privacy: .public) as plaintext \(targetClass.rawValue, privacy: .public), encryption unavailable")
+            }
         }
         var deleted = 0
         for source in sources where !isTargetCopy(source) {
@@ -1077,9 +1115,9 @@ final class SecureStorageVault {
         if !gated, case .locked = outcome, isProtectedDataAvailable() == true, countLockedWhileUnlocked(operation) {
             counters.lostItems += 1
             logger.fault("lost \(operation.name, privacy: .public) \(operation.key, privacy: .public) after \(operation.confirmedLockedAttempts, privacy: .public) locked results while unlocked")
-            outcome = operation.lost?() ?? .reject(SecureStorageVault.missingItemMessage, code: SecureStorageVault.unreadableCode)
+            outcome = operation.lost?() ?? .reject(SecureStorageVault.missingItemMessage, code: .unreadable)
             if case .locked = outcome {
-                outcome = .reject("error")
+                outcome = .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
             }
         }
         switch outcome {
@@ -1111,7 +1149,8 @@ final class SecureStorageVault {
         return operation.confirmedLockedAttempts > SecureStorageVault.lockedRetriesBeforeLost
     }
 
-    private func acquirePrivateKey() -> KeyResult {
+    /// Looks the key up by tag, the explicit group first. `creating` adds a new key when none exists, only encryption asks for that.
+    private func acquirePrivateKey(creating: Bool) -> KeyResult {
         let mode = SecureStorageVault.cachedKey(for: keyTag) == nil ? resolveAccessGroup() : nil
         let group = mode?.explicitGroup
         SecureStorageVault.keyLock.lock()
@@ -1153,6 +1192,7 @@ final class SecureStorageVault {
                 return .failure
             }
         }
+        guard creating else { return .missing }
         guard mode != nil else {
             // Without a resolved group the key would land in the wrong place, the access group probe was locked.
             return .locked
@@ -1164,11 +1204,17 @@ final class SecureStorageVault {
                 return .key(key)
             case .locked:
                 return .locked
-            case .failure:
+            case .missing, .failure:
                 continue
             }
         }
         return .failure
+    }
+
+    /// The key follows the configured item class: `whenUnlockedThisDeviceOnly` unless the configuration asks for an
+    /// after-first-unlock class, then `afterFirstUnlockThisDeviceOnly`.
+    var keyAccessibility: CFString {
+        return configuration.accessibility.requiresUnlock ? kSecAttrAccessibleWhenUnlockedThisDeviceOnly : kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
     }
 
     private static func cachedKey(for tag: Data) -> SecKey? {
@@ -1179,7 +1225,7 @@ final class SecureStorageVault {
 
     private func generatePrivateKey(_ candidate: KeyCandidate, accessGroup: String?) -> KeyResult {
         var error: Unmanaged<CFError>?
-        guard let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly, .privateKeyUsage, &error) else {
+        guard let access = SecAccessControlCreateWithFlags(nil, keyAccessibility, .privateKeyUsage, &error) else {
             logger.fault("access control creation failed \(self.extractCode(from: error), privacy: .public)")
             return .failure
         }
@@ -1228,8 +1274,10 @@ final class SecureStorageVault {
         return isLockedFailure(code: extractCode(from: error), context: context)
     }
 
+    /// A crypto or key failure only counts as permanent when protected data is known to be available and the unlock probe
+    /// agrees. Everything else parks, because a wrong "permanent" here would surface as a missing key in the app.
     private func isLockedFailure(code: Int, context: String) -> Bool {
-        if code == Int(errSecInteractionNotAllowed) || isProtectedDataAvailable() == false {
+        if code == Int(errSecInteractionNotAllowed) || isProtectedDataAvailable() != true || !confirmUnlocked() {
             logger.notice("\(context, privacy: .public) locked \(code, privacy: .public)")
             return true
         }

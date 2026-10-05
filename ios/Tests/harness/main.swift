@@ -98,6 +98,11 @@ func describe(_ outcome: SecureStorageVault.Outcome) -> String {
     }
 }
 
+func code(_ outcome: SecureStorageVault.Outcome) -> String {
+    if case .reject(_, let code) = outcome { return code.rawValue }
+    return "-"
+}
+
 func describe(_ result: SecureStorageVault.DecodeResult) -> String {
     switch result {
     case .plaintext(let s): return "plaintext(\(s))"
@@ -273,14 +278,17 @@ vault.queue.sync {
     let garbage = magic + Data((0..<80).map { UInt8(truncatingIfNeeded: $0 &* 37) })
     check("5 write garbage", write(vault, "bad", garbage) == errSecSuccess)
     check("5 decodeValue invalid (not locked)", describe(vault.decodeValue(garbage)) == "invalid")
-    check("5 loadValue rejects undecryptable, not missing", describe(vault.loadValue(forKey: "bad")) == "reject Item with given key could not be decrypted", describe(vault.loadValue(forKey: "bad")))
+    let badRead = vault.loadValue(forKey: "bad")
+    check("5 loadValue reports undecryptable as missing with code UNREADABLE", describe(badRead) == "reject Item with given key does not exist" && code(badRead) == "UNREADABLE", "\(describe(badRead)) \(code(badRead))")
     check("5 item still exists", items(account: "bad").count == 1)
+    check("5 missing key has code NOT_FOUND", code(vault.loadValue(forKey: "never-written")) == "NOT_FOUND")
     let lockedVault = makeVault(available: { false })
     check("5 garbage decrypt while protected data unavailable is locked", describe(lockedVault.decodeValue(garbage)) == "locked")
     check("5 garbage decrypt while available is invalid", describe(vault.decodeValue(garbage)) == "invalid")
     check("5 short MAGIC-only data invalid", describe(vault.decodeValue(magic)) == "invalid")
-    check("5 non-UTF-8 legacy standard value rejects undecryptable", KeychainWrapper.standard.set(Data([0xFF, 0xFE, 0x00]), forKey: "badStd") && describe(vault.loadValue(forKey: "badStd")) == "reject Item with given key could not be decrypted")
-    check("5 non-UTF-8 plaintext in cap_sec rejects undecryptable", write(vault, "badPlain", Data([0xFF, 0xFE, 0x00])) == errSecSuccess && describe(vault.loadValue(forKey: "badPlain")) == "reject Item with given key could not be decrypted")
+    check("5 non-UTF-8 legacy standard value is missing + UNREADABLE", KeychainWrapper.standard.set(Data([0xFF, 0xFE, 0x00]), forKey: "badStd") && describe(vault.loadValue(forKey: "badStd")) == "reject Item with given key does not exist" && code(vault.loadValue(forKey: "badStd")) == "UNREADABLE")
+    check("5 non-UTF-8 plaintext in cap_sec is missing + UNREADABLE", write(vault, "badPlain", Data([0xFF, 0xFE, 0x00])) == errSecSuccess && describe(vault.loadValue(forKey: "badPlain")) == "reject Item with given key does not exist" && code(vault.loadValue(forKey: "badPlain")) == "UNREADABLE")
+    check("5 set overwrites the undecryptable item", describe(vault.storeValue("__secured_fixed", forKey: "bad")) == "resolve true" && describe(vault.loadValue(forKey: "bad")) == "resolve __secured_fixed" && items(account: "bad").count == 1)
     _ = KeychainWrapper.standard.removeObject(forKey: "badStd")
     _ = vault.dedicated.deleteItem("bad")
     _ = vault.dedicated.deleteItem("badPlain")

@@ -73,9 +73,37 @@ final class SecureStorageConfigurationTests: XCTestCase {
 
     func testRejectMessagesMatchOtherPlatforms() {
         XCTAssertEqual(SecureStorageVault.missingItemMessage, "Item with given key does not exist")
-        XCTAssertEqual(SecureStorageVault.undecryptableItemMessage, "Item with given key could not be decrypted")
+        XCTAssertEqual(SecureStorageVault.storageErrorMessage, "error")
+        XCTAssertEqual(SecureStorageVault.removeFailedMessage, "Remove failed")
         XCTAssertEqual(SecureStorageVault.unsupportedAccessibilityMessage, "Unsupported accessibility value")
         XCTAssertEqual(SecureStorageVault.unsupportedConfigurationMessage, "Unsupported accessibility value in plugin configuration")
+    }
+
+    func testRejectCodes() {
+        let codes: [(SecureStorageVault.ErrorCode, String)] = [
+            (.notFound, "NOT_FOUND"),
+            (.unreadable, "UNREADABLE"),
+            (.locked, "LOCKED"),
+            (.unsupportedAccessibility, "UNSUPPORTED_ACCESSIBILITY"),
+            (.storageError, "STORAGE_ERROR"),
+        ]
+        for (code, rawValue) in codes {
+            XCTAssertEqual(code.rawValue, rawValue)
+        }
+    }
+
+    func testSecureEnclaveKeyFollowsTheConfiguredClass() {
+        let expected: [(SecureStorageVault.Accessibility, CFString)] = [
+            (.whenUnlocked, kSecAttrAccessibleWhenUnlockedThisDeviceOnly),
+            (.whenUnlockedThisDeviceOnly, kSecAttrAccessibleWhenUnlockedThisDeviceOnly),
+            (.whenPasscodeSetThisDeviceOnly, kSecAttrAccessibleWhenUnlockedThisDeviceOnly),
+            (.afterFirstUnlock, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly),
+            (.afterFirstUnlockThisDeviceOnly, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly),
+        ]
+        for (accessibility, keyClass) in expected {
+            let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: accessibility))
+            XCTAssertEqual(vault.keyAccessibility, keyClass, accessibility.rawValue)
+        }
     }
 
     func testResolveAccessibilityFallsBackToConfiguredDefault() {
@@ -217,7 +245,7 @@ final class SecureStorageGateTests: XCTestCase {
             let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: accessibility), isProtectedDataAvailable: { available.read() })
             let log = EventLog()
             vault.submitOperation(named: "A", key: "a", run: { .resolve(["value": "a"]) }, completion: { log.record("A \(self.describe($0))") })
-            vault.submitOperation(named: "B", key: "b", run: { .reject("nope") }, completion: { log.record("B \(self.describe($0))") })
+            vault.submitOperation(named: "B", key: "b", run: { .reject("nope", code: .storageError) }, completion: { log.record("B \(self.describe($0))") })
             vault.queue.sync {}
             XCTAssertEqual(log.events, ["A resolve a", "B reject nope"], accessibility.rawValue)
             XCTAssertEqual(available.reads, 0, accessibility.rawValue)
@@ -293,17 +321,19 @@ final class SecureStorageSweepTests: XCTestCase {
 }
 
 final class SecureStoragePluginTests: XCTestCase {
-    private func invoke(_ method: (SecureStoragePlugin) -> (CAPPluginCall) -> Void, options: [String: Any] = [:]) -> (resolved: PluginCallResultData?, rejected: String?) {
+    private func invoke(_ method: (SecureStoragePlugin) -> (CAPPluginCall) -> Void, options: [String: Any] = [:]) -> (resolved: PluginCallResultData?, rejected: String?, code: String?) {
         let plugin = SecureStoragePlugin()
         var resolved: PluginCallResultData?
         var rejected: String?
+        var code: String?
         let call = CAPPluginCall(callbackId: "test", methodName: "test", options: options, success: { result, _ in
             resolved = result?.data ?? [:]
         }, error: { error in
             rejected = error?.message
+            code = error?.code
         })
         method(plugin)(call!)
-        return (resolved, rejected)
+        return (resolved, rejected, code)
     }
 
     func testStorageCallsRejectWithoutConfiguredVault() {
@@ -319,6 +349,7 @@ final class SecureStoragePluginTests: XCTestCase {
             let result = invoke(method, options: options)
             XCTAssertNil(result.resolved, name)
             XCTAssertEqual(result.rejected, SecureStorageVault.unsupportedConfigurationMessage, name)
+            XCTAssertEqual(result.code, "UNSUPPORTED_ACCESSIBILITY", name)
         }
     }
 
