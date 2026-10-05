@@ -41,7 +41,7 @@ export interface SecureStorageSetOptions {
 }
 
 /**
- * `code` of a rejected call on iOS. The rejection messages are the same as in upstream, the code only adds detail.
+ * `code` of a rejected call on iOS. The rejection messages are the same as in upstream. The code only adds detail.
  *
  * | Code                        | Meaning                                                                                     |
  * | --------------------------- | ------------------------------------------------------------------------------------------- |
@@ -141,7 +141,7 @@ declare module '@capacitor/cli' {
        * Default keychain accessibility class for items written by the plugin (iOS only).
        * `afterFirstUnlock` is available as an explicit opt-out, for example when the app must read values while the device is locked.
        * An unknown value makes every storage call reject with
-       * `Unsupported accessibility value in plugin configuration`, only `getPlatform` still resolves.
+       * `Unsupported accessibility value in plugin configuration`. Only `getPlatform` still resolves.
        *
        * @since 1.0.0
        * @default 'whenUnlockedThisDeviceOnly'
@@ -149,10 +149,11 @@ declare module '@capacitor/cli' {
        */
       accessibility?: KeychainAccessibility;
       /**
-       * Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default, set `false` to opt out.
-       * Plaintext items in the plugin's `cap_sec` keychain service are encrypted by a sweep that runs once per app launch,
-       * in the foreground, after about 1.5 s without app calls once the first call has completed (or about five seconds after load when the app makes no call), and by the first `get` of the key.
-       * Items in the app bundle id service move into `cap_sec` and are encrypted lazily when `get` reads them.
+       * Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default. Set `false` to opt out.
+       * A sweep encrypts plaintext items in the plugin's `cap_sec` keychain service once per app launch, in the foreground,
+       * after about 1.5 s without app calls once the first call has completed (or about five seconds after load when the app makes no call).
+       * The first `get` of a key also encrypts it.
+       * Items in the app bundle id service move into `cap_sec`, and `get` encrypts them lazily when it reads them.
        * A migrated item keeps its keychain class when that class is stricter than the configured default.
        * Android always encrypts with AndroidKeyStore, web ignores the option.
        *
@@ -171,7 +172,7 @@ export interface SecureStoragePluginPlugin {
    *
    * @param options The key to read.
    * @returns The stored value. Rejects with `Item with given key does not exist` when the key is missing.
-   * On iOS an item that cannot be decrypted rejects with the same message and the code `UNREADABLE`, a `set` overwrites it.
+   * On iOS an item that cannot be decrypted rejects with the same message and the code `UNREADABLE`. A `set` overwrites it.
    * While the device is locked the call waits for unlock instead of rejecting.
    */
   get(options: { key: string }): Promise<{ value: string }>;

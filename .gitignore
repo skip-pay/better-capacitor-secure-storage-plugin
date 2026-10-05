@@ -47,9 +47,6 @@ Podfile.lock
 Package.resolved
 Build
 /.build
-# local worktrees
-.claude/worktrees/
-
 # Build caches
 android/.gradle/
 android/build/

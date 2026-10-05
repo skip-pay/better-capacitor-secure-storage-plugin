@@ -90,7 +90,7 @@ struct SecureStorageItemStore {
     func restoreItem(_ key: String, data: Data, accessibility: String?, label: String?, accessGroup: String) -> OSStatus {
         var attributes: [String: Any] = [
             kSecValueData as String: data,
-            // There is no way to drop an attribute, an empty label is not the marker either.
+            // There is no way to drop an attribute. An empty label is not the marker either.
             kSecAttrLabel as String: label ?? "",
         ]
         if let accessibility = accessibility {
@@ -533,7 +533,7 @@ final class SecureStorageVault {
     /// the device was confirmed unlocked, at most one per tick, reset by a working key.
     private var keyRefusals = 0
     private var lastKeyRefusalTick: Int?
-    /// Set once the key kept refusing or failing, for the rest of the process. The key itself is never deleted.
+    /// Set once the key kept refusing or failing, for the rest of the process. The vault never deletes the key itself.
     private var keyUnusable = false
     /// Set while a call runs again after one of its runs counted towards the lost escape: decryption makes a single attempt
     /// without `decryptRetryDelays`, so the retries on timer ticks do not hold the queue.
@@ -924,9 +924,10 @@ final class SecureStorageVault {
         return .resolve(["skipped": skipped])
     }
 
-    /// Reads a key across all of its copies, the `cap_sec` copy `rank` puts first wins, the bundle id service only counts when
-    /// `cap_sec` has none (or for cleanup with `includeLegacyService`). With `migrate` the winner is written into the target
-    /// group with the target class and encoding, read back and verified, and only then every other copy is deleted.
+    /// Reads a key across all of its copies. The `cap_sec` copy that `rank` puts first wins. The bundle id service only
+    /// counts when `cap_sec` has none (or for cleanup with `includeLegacyService`). With `migrate` it writes the winner into
+    /// the target group with the target class and encoding, reads it back and verifies it, and only then deletes every
+    /// other copy.
     func settleKey(_ key: String, includeLegacyService: Bool, migrate: Bool) -> SettleResult {
         guard let mode = resolveAccessGroup() else { return .locked }
         let found = dedicated.copies(of: key)
@@ -988,7 +989,7 @@ final class SecureStorageVault {
         return .value(value)
     }
 
-    /// The winner `sources.first` cannot be decoded, so no other copy may replace it or be promoted over it, that would bring
+    /// The winner `sources.first` cannot be decoded, so no other copy may replace it or be promoted over it. That would bring
     /// back a stale value. Older copies that are readable plaintext are encrypted and tightened in place instead, so their
     /// value does not sit in the clear in a weaker group or class until the next `set`. Only copies that keep ranking below
     /// the winner after the rewrite qualify: unmarked `cap_sec` copies (the rewrite leaves the label alone) and bundle id
@@ -1101,14 +1102,14 @@ final class SecureStorageVault {
         return code == Int(errSecParam) || code == Int(errSecDecode)
     }
 
-    /// Decrypts with the key under the tag and never creates one, a new key cannot open old ciphertext. A decryption that
-    /// fails while the device is known to be unlocked drops the cached key, looks the key up again and retries after each of
-    /// `decryptRetryDelays`, only a call that runs again after counting towards the lost escape makes a single attempt.
-    /// `.failed` is what still fails afterwards while the unlock probe confirms an unlocked device, or a key lookup that
-    /// failed. A -25308 counts towards `noteKeyRefusal` like one from the key lookup, and so do a failed key lookup and a
-    /// failure that is not known to be permanent, so a key that keeps failing ends as unusable for the process instead of
-    /// parking every call for its own lost escape. Such a failure only makes the key unusable when the key cannot open
-    /// fresh ciphertext either.
+    /// Decrypts with the key under the tag and never creates one, because a new key cannot open old ciphertext. When a
+    /// decryption fails while the device is known to be unlocked, it drops the cached key, looks the key up again and
+    /// retries after each of `decryptRetryDelays`. Only a call that runs again after counting towards the lost escape makes
+    /// a single attempt. `.failed` is what still fails afterwards while the unlock probe confirms an unlocked device, or a
+    /// key lookup that failed. A -25308 counts towards `noteKeyRefusal` like one from the key lookup. So do a failed key
+    /// lookup and a failure that is not known to be permanent, so a key that keeps failing ends as unusable for the process
+    /// instead of parking every call for its own lost escape. Such a failure only makes the key unusable when the key
+    /// cannot open fresh ciphertext either.
     private func decrypt(_ ciphertext: Data, context: String) -> DecryptResult {
         let delays = singleDecryptAttempt ? [] : decryptRetryDelays
         var failure = DecryptFailure.missingKey
@@ -1127,7 +1128,7 @@ final class SecureStorageVault {
             case .missing where attempt == 0:
                 return isLockedFailure(code: Int(errSecItemNotFound), context: "\(context) without key") ? .locked : .failed(.missingKey)
             case .missing:
-                // The key was there a moment ago, give the lookup the remaining attempts.
+                // The key was there a moment ago. Give the lookup the remaining attempts.
                 failure = .missingKey
                 continue
             case .locked:
@@ -1550,10 +1551,10 @@ final class SecureStorageVault {
     /// at most once per timer tick, the way `countLockedWhileUnlocked` counts a call. After the first one and
     /// `lockedRetriesBeforeLost` more the key is unusable for the rest of the process, as after a Quick Start that carried
     /// the key item but not a working Secure Enclave key: encryption reports a failure, so `set` stores plaintext with the
-    /// strict class, and ciphertext reads as invalid. The key is never deleted, a misjudged transient would destroy every
-    /// ciphertext, and the next launch tries it again. True once the key is unusable.
-    /// With `unlessDecryptedBy` the key first has to fail to open ciphertext made for it just now: a failure that belongs to
-    /// one item must not make every other item unreadable, that call ends through its own lost escape instead.
+    /// strict class, and ciphertext reads as invalid. The vault never deletes the key, because a misjudged transient would
+    /// destroy every ciphertext. The next launch tries it again. True once the key is unusable.
+    /// With `unlessDecryptedBy` the key first has to fail to open ciphertext made for it just now. A failure that belongs to
+    /// one item must not make every other item unreadable. That call ends through its own lost escape instead.
     private func noteKeyRefusal(unlessDecryptedBy key: SecKey? = nil) -> Bool {
         guard !keyUnusable else { return true }
         guard lastKeyRefusalTick != tickCount, isProtectedDataAvailable() == true, confirmUnlocked() else { return false }
@@ -1631,7 +1632,7 @@ final class SecureStorageVault {
         }
         guard creating else { return (.missing, false, false) }
         guard mode != nil else {
-            // Without a resolved group the key would land in the wrong place, the access group probe was locked.
+            // The access group probe was locked. Without a resolved group the key would land in the wrong place.
             return (.locked, false, false)
         }
         for candidate in keyCandidates {

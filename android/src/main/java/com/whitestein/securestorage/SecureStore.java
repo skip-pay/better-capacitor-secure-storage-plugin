@@ -244,7 +244,7 @@ final class SecureStore {
 
     /**
      * Migrates every legacy entry. Runs on the sweep executor, takes the lock once per entry. Stops
-     * when the self-test fails, the remaining entries are migrated on read.
+     * when the self-test fails. Reads migrate the remaining entries.
      */
     void sweepLegacyEntries() {
         Set<String> keys;
@@ -495,7 +495,7 @@ final class SecureStore {
 
     /**
      * Runs a keystore call up to {@code RETRY_DELAYS_MS.length + 1} times. A failure {@code
-     * permanent} accepts is thrown as {@link PermanentFailure} right away, the last transient
+     * permanent} accepts is thrown as {@link PermanentFailure} right away. The last transient
      * failure is rethrown as is.
      */
     private <T> T withRetry(KeystoreCall<T> call, Predicate<Throwable> permanent) throws Exception {
@@ -546,7 +546,7 @@ final class SecureStore {
 
     /**
      * Legacy RSA path for bytes that are not valid UTF-8, so they can only be RSA ciphertext. Only
-     * BadPaddingException and a missing key are permanent, IllegalBlockSizeException is retried
+     * BadPaddingException and a missing key are permanent. IllegalBlockSizeException is retried
      * like on the AES path and ends as an unreadable read, never as a lost item.
      */
     private boolean isPermanentRsa(Throwable e) {

@@ -3,7 +3,7 @@ name: Release
 # npm trusted publishing: the trusted publisher on npmjs.com must name this
 # file exactly (release.yml, case-sensitive) and allow `npm publish`, not
 # only staging. It needs a GitHub-hosted runner, npm >= 11.5.1,
-# Node >= 22.14.0 and id-token: write. No npm token is used.
+# Node >= 22.14.0 and id-token: write. The job uses no npm token.
 # https://docs.npmjs.com/trusted-publishers
 
 on:

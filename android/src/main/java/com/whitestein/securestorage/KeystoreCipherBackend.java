@@ -148,8 +148,8 @@ final class KeystoreCipherBackend implements CipherBackend {
             return (SecretKey) existing;
         }
         if (keyStore.containsAlias(aesAlias)) {
-            // Never replace an alias that exists but could not be loaded right now, that would make
-            // every stored value unreadable. Fail this write, the next one tries again.
+            // Never replace an alias that exists but could not be loaded right now. That would make
+            // every stored value unreadable. Fail this write. The next one tries again.
             throw new KeyStoreException("AES key exists but could not be loaded");
         }
         KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE);

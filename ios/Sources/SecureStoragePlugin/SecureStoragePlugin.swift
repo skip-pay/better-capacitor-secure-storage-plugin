@@ -76,7 +76,7 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         ])
     }
 
-    /// Resolves right away, also while calls are parked: it runs on the vault queue but outside the parked FIFO.
+    /// Resolves right away, also while calls are parked. It runs on the vault queue but outside the parked FIFO.
     @objc func getDiagnostics(_ call: CAPPluginCall) {
         guard let vault = vault else {
             call.resolve(SecureStorageVault.emptyDiagnostics)
