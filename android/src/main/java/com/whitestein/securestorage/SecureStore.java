@@ -4,6 +4,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.Executor;
@@ -27,6 +28,10 @@ import javax.crypto.IllegalBlockSizeException;
  * Reads fail open: a legacy value is returned even when it cannot be migrated. Writes fail
  * closed: only the v2 format is ever written, and a write that cannot be encrypted throws.
  *
+ * <p>A migration replaces a readable legacy entry only after the new v2 blob was decrypted again
+ * and gave back the same bytes, and only once an AES round-trip self-test passed in this process.
+ * Otherwise the legacy entry stays as it is and keeps being served.
+ *
  * <p>All public operations hold one lock, so the background sweep and calls from JavaScript never
  * interleave on the same entry.
  */
@@ -39,6 +44,12 @@ final class SecureStore {
 
     /** Delays before the 2nd and 3rd attempt of a keystore operation that failed transiently. */
     static final long[] RETRY_DELAYS_MS = { 50, 200 };
+
+    /** Constant encrypted and decrypted by the self-test before the first migration write. */
+    static final byte[] SELF_TEST_PLAINTEXT = "cap_sec AES self-test".getBytes(StandardCharsets.UTF_8);
+
+    /** AAD of the self-test. It does not start with {@code "v2:"}, so it never equals {@link #aad}. */
+    static final byte[] SELF_TEST_AAD = "self-test:v2".getBytes(StandardCharsets.UTF_8);
 
     enum Status {
         FOUND,
@@ -70,12 +81,15 @@ final class SecureStore {
         final int migrated;
         final int lostItems;
         final int decryptFailures;
+        /** Distinct keys whose readable legacy entry was kept because migrating it failed. */
+        final int migrationSkipped;
         final String keyBackend;
 
-        Diagnostics(int migrated, int lostItems, int decryptFailures, String keyBackend) {
+        Diagnostics(int migrated, int lostItems, int decryptFailures, int migrationSkipped, String keyBackend) {
             this.migrated = migrated;
             this.lostItems = lostItems;
             this.decryptFailures = decryptFailures;
+            this.migrationSkipped = migrationSkipped;
             this.keyBackend = keyBackend;
         }
     }
@@ -112,7 +126,18 @@ final class SecureStore {
     private final AtomicBoolean sweepStarted = new AtomicBoolean(false);
     private final Set<String> lostKeys = new HashSet<>();
     private final Set<String> undecodableKeys = new HashSet<>();
+    private final Set<String> migrationSkippedKeys = new HashSet<>();
     private int migrated = 0;
+
+    /**
+     * Set once the AES round-trip self-test passed. There is one store per process in production,
+     * so the test passes at most once per process. A failed test is not latched: the next migration
+     * runs it again, so a keystore that recovers is used for migration again.
+     */
+    private boolean selfTestPassed = false;
+
+    /** The last self-test run failed. */
+    private boolean selfTestFailed = false;
 
     SecureStore(KeyValueStore store, CipherBackend backend, Base64Codec base64, Executor sweepExecutor, Sleeper sleeper, Logger logger) {
         this.store = store;
@@ -177,10 +202,13 @@ final class SecureStore {
         } catch (Exception e) {
             keyBackend = "none";
         }
-        return new Diagnostics(migrated, lostKeys.size(), undecodableKeys.size(), keyBackend);
+        return new Diagnostics(migrated, lostKeys.size(), undecodableKeys.size(), migrationSkippedKeys.size(), keyBackend);
     }
 
-    /** Migrates every legacy entry. Runs on the sweep executor, takes the lock once per entry. */
+    /**
+     * Migrates every legacy entry. Runs on the sweep executor, takes the lock once per entry. Stops
+     * when the self-test fails, the remaining entries are migrated on read.
+     */
     void sweepLegacyEntries() {
         Set<String> keys;
         synchronized (this) {
@@ -191,6 +219,10 @@ final class SecureStore {
                 String raw = readRaw(key);
                 if (raw != null && !raw.startsWith(V2_PREFIX)) {
                     readAndMigrate(key);
+                    if (selfTestFailed) {
+                        logger.warn("Legacy sweep stopped, AES self-test did not pass", null);
+                        return;
+                    }
                 }
             }
         }
@@ -290,18 +322,68 @@ final class SecureStore {
         return undecodable(key, null);
     }
 
-    /** Rewrites a legacy entry in the v2 format. A failure leaves the legacy entry in place. */
+    /**
+     * Rewrites a legacy entry in the v2 format. The new blob is written only when it decrypts back
+     * to the same bytes. Any failure leaves the legacy entry in place and counts the key as skipped.
+     */
     private void migrate(String key, byte[] value) {
+        if (!selfTest()) {
+            skipMigration(key, "AES self-test did not pass, keeping legacy entry", null);
+            return;
+        }
+        String encoded;
         try {
-            String encoded = encryptV2(key, value);
-            if (store.putString(key, encoded)) {
-                migrated++;
-            } else {
-                logger.warn("Could not write migrated entry", null);
+            encoded = encryptV2(key, value);
+        } catch (Exception e) {
+            skipMigration(key, "Could not migrate legacy entry, keeping it", e);
+            return;
+        }
+        try {
+            // Decode the string that would be stored, so the check covers the base64 step too.
+            byte[] storedBlob = base64.decode(encoded.substring(V2_PREFIX.length()));
+            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(storedBlob, aad(key)));
+            if (!Arrays.equals(roundTrip, value)) {
+                skipMigration(key, "Migrated entry decrypts to a different value, keeping legacy entry", null);
+                return;
             }
         } catch (Exception e) {
-            logger.warn("Could not migrate legacy entry, keeping it", e);
+            skipMigration(key, "Migrated entry does not decrypt, keeping legacy entry", e);
+            return;
         }
+        if (store.putString(key, encoded)) {
+            migrated++;
+        } else {
+            skipMigration(key, "Could not write migrated entry", null);
+        }
+    }
+
+    /**
+     * Encrypts and decrypts a constant with a fixed AAD. Runs before the first migration write of
+     * the process and again before later migrations until it passes once.
+     */
+    private boolean selfTest() {
+        if (selfTestPassed) {
+            return true;
+        }
+        try {
+            byte[] blob = withRetry(() -> backend.aesEncrypt(SELF_TEST_PLAINTEXT, SELF_TEST_AAD));
+            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(blob, SELF_TEST_AAD));
+            if (Arrays.equals(roundTrip, SELF_TEST_PLAINTEXT)) {
+                selfTestPassed = true;
+                selfTestFailed = false;
+                return true;
+            }
+            logger.warn("AES self-test decrypted to a different value", null);
+        } catch (Exception e) {
+            logger.warn("AES self-test failed", e);
+        }
+        selfTestFailed = true;
+        return false;
+    }
+
+    private void skipMigration(String key, String message, Throwable error) {
+        logger.warn(message, error);
+        migrationSkippedKeys.add(key);
     }
 
     private String encryptV2(String key, byte[] value) throws Exception {

@@ -8,14 +8,18 @@ import java.security.KeyPairGenerator;
 import java.security.KeyStoreException;
 import java.security.ProviderException;
 import java.security.SecureRandom;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import javax.crypto.AEADBadTagException;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -100,6 +104,18 @@ final class Fakes {
         int transientFailures = 0;
         int aesEncryptCalls = 0;
         int aesKeysCreated = 0;
+        /** AAD of every aesEncrypt call that got past the failure hooks, in order. */
+        final List<String> aesEncryptAads = new ArrayList<>();
+        /** Thrown by upcoming aesEncrypt calls, one per call, before anything else happens. */
+        final Deque<GeneralSecurityException> aesEncryptErrors = new ArrayDeque<>();
+        /** Thrown by upcoming aesDecrypt calls, one per call, before anything else happens. */
+        final Deque<GeneralSecurityException> aesDecryptErrors = new ArrayDeque<>();
+        /** When set, every aesDecrypt call throws it. */
+        GeneralSecurityException aesDecryptAlwaysThrows = null;
+        /** When set, aesDecrypt with exactly this AAD throws AEADBadTagException. */
+        byte[] aesDecryptBadTagForAad = null;
+        /** When set, aesDecrypt with exactly this AAD returns its result with the first byte changed. */
+        byte[] aesDecryptCorruptsForAad = null;
 
         private final SecureRandom random = new SecureRandom();
 
@@ -137,7 +153,11 @@ final class Fakes {
         @Override
         public byte[] aesEncrypt(byte[] plaintext, byte[] aad) throws GeneralSecurityException {
             maybeFail();
+            if (!aesEncryptErrors.isEmpty()) {
+                throw aesEncryptErrors.poll();
+            }
             aesEncryptCalls++;
+            aesEncryptAads.add(new String(aad, StandardCharsets.UTF_8));
             if (aesKey == null) {
                 if (!aesCreatable) {
                     throw new KeyStoreException("Could not generate key");
@@ -162,13 +182,26 @@ final class Fakes {
         @Override
         public byte[] aesDecrypt(byte[] blob, byte[] aad) throws GeneralSecurityException {
             maybeFail();
+            if (!aesDecryptErrors.isEmpty()) {
+                throw aesDecryptErrors.poll();
+            }
+            if (aesDecryptAlwaysThrows != null) {
+                throw aesDecryptAlwaysThrows;
+            }
+            if (aesDecryptBadTagForAad != null && Arrays.equals(aesDecryptBadTagForAad, aad)) {
+                throw new AEADBadTagException("Tag mismatch");
+            }
             if (aesKey == null) {
                 throw new KeyUnavailableException("AES key does not exist");
             }
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
             cipher.init(Cipher.DECRYPT_MODE, aesKey, new GCMParameterSpec(128, blob, 0, 12));
             cipher.updateAAD(aad);
-            return cipher.doFinal(blob, 12, blob.length - 12);
+            byte[] plaintext = cipher.doFinal(blob, 12, blob.length - 12);
+            if (aesDecryptCorruptsForAad != null && Arrays.equals(aesDecryptCorruptsForAad, aad) && plaintext.length > 0) {
+                plaintext[0] ^= 1;
+            }
+            return plaintext;
         }
 
         @Override
