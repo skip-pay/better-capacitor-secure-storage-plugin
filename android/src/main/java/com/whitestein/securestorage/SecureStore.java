@@ -338,7 +338,7 @@ final class SecureStore {
             try {
                 hasRsa = withRetry(backend::hasRsaKey, this::isPermanentLegacy, retry);
             } catch (Exception e) {
-                return undecodable(key, e);
+                return keystoreReadFailed(key, e, retry);
             }
             if (hasRsa && !plaintextCandidate) {
                 // No plaintext fall-through can help, so IllegalBlockSizeException, which
@@ -348,7 +348,7 @@ final class SecureStore {
                 } catch (PermanentFailure e) {
                     return lost(key, e.getCause());
                 } catch (Exception e) {
-                    return undecodable(key, e);
+                    return keystoreReadFailed(key, e, retry);
                 }
             }
             if (hasRsa) {
@@ -358,7 +358,7 @@ final class SecureStore {
                     // Fall through: the bytes may still be a plaintext entry of 256 * n bytes.
                     rsaFailure = e.getCause();
                 } catch (Exception e) {
-                    return undecodable(key, e);
+                    return keystoreReadFailed(key, e, retry);
                 }
             }
         }
@@ -369,6 +369,19 @@ final class SecureStore {
             return lost(key, rsaFailure);
         }
         return undecodable(key, null);
+    }
+
+    /**
+     * A keystore call of the legacy reader failed. After a single attempt without retries, made only
+     * by the sweep while {@link #aesFailing} is set, a failure that is not permanent may be
+     * transient, so the key is not counted in {@code decryptFailures}: a later {@code get} retries.
+     */
+    private ReadResult keystoreReadFailed(String key, Exception error, boolean retried) {
+        if (!retried && !(error instanceof PermanentFailure)) {
+            logger.warn("Legacy entry not read in a single attempt, a later read retries", error);
+            return ReadResult.UNREADABLE;
+        }
+        return undecodable(key, error);
     }
 
     /**
