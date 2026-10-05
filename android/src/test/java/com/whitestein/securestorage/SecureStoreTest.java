@@ -601,6 +601,51 @@ public class SecureStoreTest {
         assertEquals(Arrays.asList(50L), sleeper.sleeps);
     }
 
+    @Test
+    public void rsaIllegalBlockSizeOnCiphertextIsRetried() throws Exception {
+        backend.createRsaKey();
+        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+        assertTrue("migrated", store.map.get("pin").startsWith("v2:"));
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(1, diagnostics.migrated);
+        assertEquals(0, diagnostics.decryptFailures);
+        assertEquals(0, diagnostics.lostItems);
+    }
+
+    @Test
+    public void rsaIllegalBlockSizeOnCiphertextAfterAllRetriesIsUnreadableNotLost() throws Exception {
+        backend.createRsaKey();
+        String legacy = backend.upstreamRsaEncrypt(utf8("1234"));
+        store.map.put("pin", legacy);
+        for (int i = 0; i < 3; i++) {
+            backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
+        }
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
+        assertEquals(Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals("entry kept", legacy, store.map.get("pin"));
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(1, diagnostics.decryptFailures);
+        assertEquals(0, diagnostics.lostItems);
+        assertEquals("next read works", "1234", getString("pin"));
+    }
+
+    @Test
+    public void rsaBadPaddingOnCiphertextIsLostWithoutRetry() throws Exception {
+        backend.createRsaKey();
+        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        backend.rsaDecryptErrors.add(new BadPaddingException());
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
+        assertTrue("not retried", sleeper.sleeps.isEmpty());
+        assertEquals(1, secureStore.diagnostics().lostItems);
+        assertEquals(0, secureStore.diagnostics().decryptFailures);
+    }
+
     // Single attempt while the AES path is failing
 
     @Test

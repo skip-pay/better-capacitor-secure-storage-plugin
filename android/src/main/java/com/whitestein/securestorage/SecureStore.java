@@ -329,6 +329,9 @@ final class SecureStore {
         if (bytes.length == 0 && !raw.isEmpty()) {
             return undecodable(key, null);
         }
+        // Undecryptable RSA output is random and practically never valid UTF-8, so only bytes that
+        // are valid UTF-8 can still be a plaintext entry when the RSA attempt fails.
+        boolean plaintextCandidate = isValidUtf8(bytes);
         Throwable rsaFailure = null;
         if (bytes.length > 0 && bytes.length % RSA_BLOCK_BYTES == 0) {
             boolean hasRsa;
@@ -337,19 +340,29 @@ final class SecureStore {
             } catch (Exception e) {
                 return undecodable(key, e);
             }
+            if (hasRsa && !plaintextCandidate) {
+                // No plaintext fall-through can help, so IllegalBlockSizeException, which
+                // AndroidKeyStore uses for transient doFinal failures too, gets the retries.
+                try {
+                    return ReadResult.found(withRetry(() -> backend.rsaDecrypt(bytes), this::isPermanentRsa, retry));
+                } catch (PermanentFailure e) {
+                    return lost(key, e.getCause());
+                } catch (Exception e) {
+                    return undecodable(key, e);
+                }
+            }
             if (hasRsa) {
                 try {
                     return ReadResult.found(withRetry(() -> backend.rsaDecrypt(bytes), this::isPermanentLegacy, retry));
                 } catch (PermanentFailure e) {
                     // Fall through: the bytes may still be a plaintext entry of 256 * n bytes.
-                    // Undecryptable RSA output is random and practically never valid UTF-8.
                     rsaFailure = e.getCause();
                 } catch (Exception e) {
                     return undecodable(key, e);
                 }
             }
         }
-        if (isValidUtf8(bytes)) {
+        if (plaintextCandidate) {
             return ReadResult.found(bytes);
         }
         if (rsaFailure != null) {
@@ -495,11 +508,21 @@ final class SecureStore {
     }
 
     /**
-     * Legacy RSA path. BadPaddingException and IllegalBlockSizeException stay permanent, so a 256
-     * byte multiple that is really a plaintext entry falls through to the UTF-8 reader.
+     * Legacy RSA path for bytes that are valid UTF-8. BadPaddingException and
+     * IllegalBlockSizeException stay permanent, so a 256 byte multiple that is really a plaintext
+     * entry falls through to the UTF-8 reader without retry delays.
      */
     private boolean isPermanentLegacy(Throwable e) {
         return !backend.isTransientFailure(e) && isPermanentLegacyType(e);
+    }
+
+    /**
+     * Legacy RSA path for bytes that are not valid UTF-8, so they can only be RSA ciphertext. Only
+     * BadPaddingException and a missing key are permanent, IllegalBlockSizeException is retried
+     * like on the AES path and ends as an unreadable read, never as a lost item.
+     */
+    private boolean isPermanentRsa(Throwable e) {
+        return !backend.isTransientFailure(e) && isPermanentRsaType(e);
     }
 
     static boolean isPermanentAesType(Throwable e) {
@@ -510,6 +533,10 @@ final class SecureStore {
         return (
             e instanceof BadPaddingException || e instanceof IllegalBlockSizeException || e instanceof CipherBackend.KeyUnavailableException
         );
+    }
+
+    static boolean isPermanentRsaType(Throwable e) {
+        return e instanceof BadPaddingException || e instanceof CipherBackend.KeyUnavailableException;
     }
 
     static byte[] aad(String key) {

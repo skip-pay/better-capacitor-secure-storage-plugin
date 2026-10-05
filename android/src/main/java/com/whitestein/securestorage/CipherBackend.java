@@ -11,9 +11,10 @@ import java.security.GeneralSecurityException;
  * decrypted with the current key. AndroidKeyStore reports most other {@code doFinal} failures as
  * {@link javax.crypto.IllegalBlockSizeException}, so that and a plain {@link
  * javax.crypto.BadPaddingException} are retried there. On the legacy RSA path {@link
- * javax.crypto.BadPaddingException}, {@link javax.crypto.IllegalBlockSizeException} and {@link
- * KeyUnavailableException} are permanent. Anything else counts as transient and is retried, and so
- * does any exception for which {@link #isTransientFailure} returns true.
+ * javax.crypto.BadPaddingException} and {@link KeyUnavailableException} are permanent, and {@link
+ * javax.crypto.IllegalBlockSizeException} is permanent only when the stored bytes are valid UTF-8
+ * and can still be read as a plaintext entry. Anything else counts as transient and is retried, and
+ * so does any exception for which {@link #isTransientFailure} returns true.
  */
 interface CipherBackend {
     /**
