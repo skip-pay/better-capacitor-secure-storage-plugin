@@ -530,6 +530,72 @@ public class SecureStoreTest {
         assertEquals(Arrays.asList(50L), sleeper.sleeps);
     }
 
+    // Single attempt while the AES path is failing
+
+    @Test
+    public void brokenKeystoreAddsRetrySleepsToOneLegacyGetOnly() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        store.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        backend.aesCreatable = false;
+
+        assertEquals("1", getString("a"));
+        assertEquals("first migration retries", Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals("2", getString("b"));
+        assertEquals("1", getString("a"));
+        assertEquals("later migrations make one attempt", Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals(2, secureStore.diagnostics().migrationSkipped);
+
+        try {
+            secureStore.set("c", utf8("3"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+        assertEquals("set still retries", Arrays.asList(50L, 200L, 50L, 200L), sleeper.sleeps);
+
+        backend.aesCreatable = true;
+        assertEquals("1", getString("a"));
+        assertTrue("one attempt still migrates once the keystore works", store.map.get("a").startsWith("v2:"));
+    }
+
+    @Test
+    public void sweepMakesSingleAttemptsAfterAFailedEncrypt() throws Exception {
+        backend.createRsaKey();
+        String rsa = backend.upstreamRsaEncrypt(utf8("one"));
+        String plain = Fakes.androidDefaultBase64(utf8("two"));
+        store.map.put("rsa", rsa);
+        store.map.put("plain", plain);
+        backend.aesCreatable = false;
+        try {
+            secureStore.set("x", utf8("3"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+        sleeper.sleeps.clear();
+
+        backend.transientFailures = 1;
+        sweepExecutor.runAll();
+
+        assertTrue("no retry sleeps in the sweep", sleeper.sleeps.isEmpty());
+        assertEquals(rsa, store.map.get("rsa"));
+        assertEquals(plain, store.map.get("plain"));
+    }
+
+    @Test
+    public void successfulSetRestoresRetriesForMigration() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        backend.aesCreatable = false;
+        try {
+            secureStore.set("x", utf8("3"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+        backend.aesCreatable = true;
+        secureStore.set("y", utf8("4"));
+        sleeper.sleeps.clear();
+
+        backend.aesEncryptErrors.add(new IllegalBlockSizeException());
+        assertEquals("1", getString("a"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+        assertTrue(store.map.get("a").startsWith("v2:"));
+    }
+
     // Sweep
 
     @Test

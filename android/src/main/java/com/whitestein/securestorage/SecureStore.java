@@ -141,6 +141,14 @@ final class SecureStore {
     /** The last self-test run failed. */
     private boolean selfTestFailed = false;
 
+    /**
+     * An AES encrypt, the self-test or the check of a migrated blob failed after all its attempts,
+     * and none of them succeeded since. While set, migrations and the sweep make a single attempt
+     * per keystore operation without retry sleeps, so a broken keystore does not slow down every
+     * legacy read. {@code set} always retries.
+     */
+    private boolean aesFailing = false;
+
     SecureStore(KeyValueStore store, CipherBackend backend, Base64Codec base64, Executor sweepExecutor, Sleeper sleeper, Logger logger) {
         this.store = store;
         this.backend = backend;
@@ -152,7 +160,7 @@ final class SecureStore {
 
     synchronized ReadResult get(String key) {
         startSweepOnce();
-        return readAndMigrate(key);
+        return readAndMigrate(key, true);
     }
 
     /** Encrypts and stores a value. Throws without touching the stored entry when that fails. */
@@ -160,10 +168,11 @@ final class SecureStore {
         startSweepOnce();
         String encoded;
         try {
-            encoded = encryptV2(key, value);
+            encoded = encryptV2(key, value, true);
         } catch (Exception e) {
             throw new StorageException("Could not encrypt value", e);
         }
+        aesFailing = false;
         if (!store.putString(key, encoded)) {
             throw new StorageException("Could not write value", null);
         }
@@ -220,7 +229,7 @@ final class SecureStore {
             synchronized (this) {
                 String raw = readRaw(key);
                 if (raw != null && !raw.startsWith(V2_PREFIX)) {
-                    readAndMigrate(key);
+                    readAndMigrate(key, !aesFailing);
                     if (selfTestFailed) {
                         logger.warn("Legacy sweep stopped, AES self-test did not pass", null);
                         return;
@@ -249,7 +258,11 @@ final class SecureStore {
         }
     }
 
-    private ReadResult readAndMigrate(String key) {
+    /**
+     * Reads an entry and migrates it when it is in a legacy format. {@code retryReads} is false
+     * only for the sweep while {@link #aesFailing} is set.
+     */
+    private ReadResult readAndMigrate(String key, boolean retryReads) {
         String raw;
         try {
             raw = store.getString(key);
@@ -262,7 +275,7 @@ final class SecureStore {
         if (raw.startsWith(V2_PREFIX)) {
             return readV2(key, raw);
         }
-        ReadResult legacy = readLegacy(key, raw);
+        ReadResult legacy = readLegacy(key, raw, retryReads);
         if (legacy.status == Status.FOUND) {
             migrate(key, legacy.value);
         }
@@ -288,7 +301,7 @@ final class SecureStore {
         }
     }
 
-    private ReadResult readLegacy(String key, String raw) {
+    private ReadResult readLegacy(String key, String raw, boolean retry) {
         byte[] bytes;
         try {
             bytes = base64.decode(raw);
@@ -299,13 +312,13 @@ final class SecureStore {
         if (bytes.length > 0 && bytes.length % RSA_BLOCK_BYTES == 0) {
             boolean hasRsa;
             try {
-                hasRsa = withRetry(backend::hasRsaKey, this::isPermanentLegacy);
+                hasRsa = withRetry(backend::hasRsaKey, this::isPermanentLegacy, retry);
             } catch (Exception e) {
                 return undecodable(key, e);
             }
             if (hasRsa) {
                 try {
-                    return ReadResult.found(withRetry(() -> backend.rsaDecrypt(bytes), this::isPermanentLegacy));
+                    return ReadResult.found(withRetry(() -> backend.rsaDecrypt(bytes), this::isPermanentLegacy, retry));
                 } catch (PermanentFailure e) {
                     // Fall through: the bytes may still be a plaintext entry of 256 * n bytes.
                     // Undecryptable RSA output is random and practically never valid UTF-8.
@@ -329,13 +342,14 @@ final class SecureStore {
      * to the same bytes. Any failure leaves the legacy entry in place and counts the key as skipped.
      */
     private void migrate(String key, byte[] value) {
-        if (!selfTest()) {
+        boolean retry = !aesFailing;
+        if (!selfTest(retry)) {
             skipMigration(key, "AES self-test did not pass, keeping legacy entry", null);
             return;
         }
         String encoded;
         try {
-            encoded = encryptV2(key, value);
+            encoded = encryptV2(key, value, retry);
         } catch (Exception e) {
             skipMigration(key, "Could not migrate legacy entry, keeping it", e);
             return;
@@ -343,15 +357,18 @@ final class SecureStore {
         try {
             // Decode the string that would be stored, so the check covers the base64 step too.
             byte[] storedBlob = base64.decode(encoded.substring(V2_PREFIX.length()));
-            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(storedBlob, aad(key)), this::isPermanentAes);
+            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(storedBlob, aad(key)), this::isPermanentAes, retry);
             if (!Arrays.equals(roundTrip, value)) {
+                aesFailing = true;
                 skipMigration(key, "Migrated entry decrypts to a different value, keeping legacy entry", null);
                 return;
             }
         } catch (Exception e) {
+            aesFailing = true;
             skipMigration(key, "Migrated entry does not decrypt, keeping legacy entry", e);
             return;
         }
+        aesFailing = false;
         if (store.putString(key, encoded)) {
             migrated++;
         } else {
@@ -363,16 +380,17 @@ final class SecureStore {
      * Encrypts and decrypts a constant with a fixed AAD. Runs before the first migration write of
      * the process and again before later migrations until it passes once.
      */
-    private boolean selfTest() {
+    private boolean selfTest(boolean retry) {
         if (selfTestPassed) {
             return true;
         }
         try {
-            byte[] blob = withRetry(() -> backend.aesEncrypt(SELF_TEST_PLAINTEXT, SELF_TEST_AAD), this::isPermanentAes);
-            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(blob, SELF_TEST_AAD), this::isPermanentAes);
+            byte[] blob = withRetry(() -> backend.aesEncrypt(SELF_TEST_PLAINTEXT, SELF_TEST_AAD), this::isPermanentAes, retry);
+            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(blob, SELF_TEST_AAD), this::isPermanentAes, retry);
             if (Arrays.equals(roundTrip, SELF_TEST_PLAINTEXT)) {
                 selfTestPassed = true;
                 selfTestFailed = false;
+                aesFailing = false;
                 return true;
             }
             logger.warn("AES self-test decrypted to a different value", null);
@@ -380,6 +398,7 @@ final class SecureStore {
             logger.warn("AES self-test failed", e);
         }
         selfTestFailed = true;
+        aesFailing = true;
         return false;
     }
 
@@ -388,8 +407,15 @@ final class SecureStore {
         migrationSkippedKeys.add(key);
     }
 
-    private String encryptV2(String key, byte[] value) throws Exception {
-        byte[] blob = withRetry(() -> backend.aesEncrypt(value, aad(key)), this::isPermanentAes);
+    /** Encrypts in the v2 format. A failure sets {@link #aesFailing}, callers clear it on success. */
+    private String encryptV2(String key, byte[] value, boolean retry) throws Exception {
+        byte[] blob;
+        try {
+            blob = withRetry(() -> backend.aesEncrypt(value, aad(key)), this::isPermanentAes, retry);
+        } catch (Exception e) {
+            aesFailing = true;
+            throw e;
+        }
         return V2_PREFIX + base64.encode(blob);
     }
 
@@ -411,6 +437,12 @@ final class SecureStore {
      * failure is rethrown as is.
      */
     private <T> T withRetry(KeystoreCall<T> call, Predicate<Throwable> permanent) throws Exception {
+        return withRetry(call, permanent, true);
+    }
+
+    /** Like {@link #withRetry(KeystoreCall, Predicate)}, but makes a single attempt when {@code retry} is false. */
+    private <T> T withRetry(KeystoreCall<T> call, Predicate<Throwable> permanent, boolean retry) throws Exception {
+        int retries = retry ? RETRY_DELAYS_MS.length : 0;
         for (int attempt = 0; ; attempt++) {
             try {
                 return call.run();
@@ -418,7 +450,7 @@ final class SecureStore {
                 if (permanent.test(e)) {
                     throw new PermanentFailure(e);
                 }
-                if (attempt >= RETRY_DELAYS_MS.length) {
+                if (attempt >= retries) {
                     throw e;
                 }
                 logger.warn("Keystore operation failed, retrying", e);

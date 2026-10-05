@@ -19,6 +19,7 @@
 - Android - values are encrypted with an AES-256-GCM AndroidKeyStore key (alias `<packageName>_cap_sec_aes_v2`) and stored as `v2:` + base64(IV, ciphertext, tag), with the storage key as additional authenticated data
 - Android - upstream RSA entries and plaintext base64 entries are still read and are rewritten in the new format on read and in a background pass on first use. The RSA key is kept for that, no new RSA key is ever generated
 - Android - `set` rejects with `error` / code `STORAGE_ERROR` when the value cannot be encrypted, instead of silently storing nothing or falling back to plaintext. Keystore errors are retried and never latched for the process
+- Android - after an AES encrypt failed on all attempts, migrations and the background pass make a single keystore attempt without retry delays until the next AES operation succeeds, so a broken keystore does not add about 250 ms to every read of an older entry. `set` keeps its retries
 - Android - `get` rejects with code `NOT_FOUND` for a missing key and `UNREADABLE` for an entry that cannot be decrypted, the message stays `Item with given key does not exist`. `remove` deletes an unreadable entry instead of reporting it missing
 - Android - `getDiagnostics()` with migration and failure counters
 - Android - no keystore work in `load()`, storage calls run in order on a plugin thread. The API < 23 code and the SDK16/SDK18 split are removed
@@ -28,6 +29,7 @@
 - CI runs the Android unit tests, the Java prettier check and the iOS keychain harness on a simulator. A `v*` tag publishes to npm with trusted publishing and provenance, see Releasing in the README
 
 - Behaviour change versus upstream on iOS: with the defaults, values are not readable while the device is locked and calls wait until unlock. Apps that must read values in that state set `accessibility` to `afterFirstUnlock`
+- Accepted exception on Android to the no-user-visible-change rule, by product owner decision: writes stay fail-closed. Only on devices whose AndroidKeyStore cannot create or use the AES key, `set` rejects with `error` / code `STORAGE_ERROR` where upstream stored the value as plaintext base64. Reads of existing entries are not affected
 
 ## Upstream history (capacitor-secure-storage-plugin)
 
