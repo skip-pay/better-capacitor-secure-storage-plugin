@@ -224,6 +224,37 @@ final class SecureStorageGateTests: XCTestCase {
         }
     }
 
+    func testSweepWaitsForForegroundAndProtectedDataAndRunsBehindQueuedCalls() {
+        let available = Flag(false)
+        let active = Flag(false)
+        let vault = SecureStorageVault(isProtectedDataAvailable: { available.read() }, isApplicationActive: { active.read() }, unlockProbe: { true })
+        let log = EventLog()
+        vault.requestSweep { _ in log.record("sweep"); return true }
+        vault.submitOperation(named: "get", key: "k", run: { log.record("run get"); return .resolve(["value": "v"]) }, completion: { log.record("get \(self.describe($0))") })
+        settle(vault)
+        XCTAssertTrue(log.events.isEmpty)
+        available.write(true)
+        settle(vault)
+        XCTAssertEqual(log.events, ["run get", "get resolve v"], "sweep waits for the foreground")
+        active.write(true)
+        settle(vault)
+        XCTAssertEqual(log.events, ["run get", "get resolve v", "sweep"])
+        settle(vault)
+        vault.requestSweep()
+        settle(vault)
+        XCTAssertEqual(log.events.filter { $0 == "sweep" }.count, 2, "an explicit request runs the sweep again")
+    }
+
+    func testIncompleteSweepRunsAgainOnLaterDrainsUpToTheLimit() {
+        let vault = SecureStorageVault(unlockProbe: { true })
+        let log = EventLog()
+        vault.requestSweep { _ in log.record("sweep"); return false }
+        for _ in 0..<6 {
+            settle(vault)
+        }
+        XCTAssertEqual(log.events.count, SecureStorageVault.sweepAttempts)
+    }
+
     func testLockedOutcomeStillParksWhenGateIsBypassed() {
         let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: .afterFirstUnlock), isProtectedDataAvailable: { false })
         let log = EventLog()
@@ -252,12 +283,12 @@ final class SecureStorageSweepTests: XCTestCase {
         }
     }
 
-    func testSweepWithoutEncryptionDoesNotTouchTheKeychain() {
-        let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: .whenUnlockedThisDeviceOnly, encryptsValues: false))
-        guard case .resolve(let data) = vault.queue.sync(execute: { vault.migrateLegacyValues() }) else {
+    func testSweepReportsSkippedKeys() {
+        let vault = SecureStorageVault()
+        guard case .resolve(let data) = vault.migrateKeys(["a", "b", "c", "d"], using: { $0 == "a" || $0 == "c" ? .locked : .resolve([:]) }) else {
             return XCTFail("sweep did not resolve")
         }
-        XCTAssertTrue(data.isEmpty)
+        XCTAssertEqual(data["skipped"] as? Int, 2)
     }
 }
 

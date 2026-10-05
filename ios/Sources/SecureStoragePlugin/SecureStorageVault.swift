@@ -3,10 +3,24 @@ import Security
 import os
 
 struct SecureStorageItemStore {
+    /// One keychain item for a key. A key can have several, one per access group.
+    struct Copy {
+        let accessGroup: String?
+        let accessibility: String?
+        let modified: Date?
+        let persistentRef: Data?
+        /// Written by this plugin version, so its class was chosen by a `set` and a migration keeps it.
+        let isMarked: Bool
+    }
+
+    /// Label on every item this version writes. Not part of any query, so the 0.13.0 query shape still finds the items.
+    static let marker = "better-capacitor-secure-storage-plugin"
+
     let service: String
 
-    func readItem(_ key: String) -> (status: OSStatus, data: Data, accessibility: String?) {
-        var query = makeItemQuery(key)
+    /// Reads one item. Without a group the keychain searches every group the app can access and returns any match.
+    func readItem(_ key: String, accessGroup: String? = nil) -> (status: OSStatus, data: Data, accessibility: String?) {
+        var query = makeItemQuery(key, accessGroup: accessGroup)
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecReturnData as String] = true
         query[kSecReturnAttributes as String] = true
@@ -19,20 +33,67 @@ struct SecureStorageItemStore {
         return (status, data, attributes[kSecAttrAccessible as String] as? String)
     }
 
-    func writeItem(_ key: String, data: Data, accessibility: CFString) -> OSStatus {
-        let query = makeItemQuery(key)
+    /// Every copy of a key across all accessible groups, attributes and persistent references only.
+    func copies(of key: String) -> (status: OSStatus, copies: [Copy]) {
+        var query = makeItemQuery(key)
+        query[kSecMatchLimit as String] = kSecMatchLimitAll
+        query[kSecReturnAttributes as String] = true
+        query[kSecReturnPersistentRef as String] = true
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return (errSecSuccess, []) }
+        guard status == errSecSuccess else { return (status, []) }
+        let copies = (result as? [[String: Any]] ?? []).map { attributes in
+            Copy(
+                accessGroup: attributes[kSecAttrAccessGroup as String] as? String,
+                accessibility: attributes[kSecAttrAccessible as String] as? String,
+                modified: attributes[kSecAttrModificationDate as String] as? Date,
+                persistentRef: attributes[kSecValuePersistentRef as String] as? Data,
+                isMarked: attributes[kSecAttrLabel as String] as? String == SecureStorageItemStore.marker
+            )
+        }
+        return (status, copies)
+    }
+
+    /// Updates the item in `accessGroup` (every copy when `nil`) and adds it there when it does not exist yet.
+    func writeItem(_ key: String, data: Data, accessibility: CFString, accessGroup: String? = nil) -> OSStatus {
+        let updateStatus = updateItem(key, data: data, accessibility: accessibility, accessGroup: accessGroup)
+        guard updateStatus == errSecItemNotFound else { return updateStatus }
+        return addItem(key, data: data, accessibility: accessibility, accessGroup: accessGroup)
+    }
+
+    func addItem(_ key: String, data: Data, accessibility: CFString, accessGroup: String?) -> OSStatus {
+        var query = makeItemQuery(key, accessGroup: accessGroup)
+        query[kSecAttrAccessible as String] = accessibility
+        query[kSecValueData as String] = data
+        query[kSecAttrLabel as String] = SecureStorageItemStore.marker
+        return SecItemAdd(query as CFDictionary, nil)
+    }
+
+    func updateItem(_ key: String, data: Data, accessibility: CFString, accessGroup: String?) -> OSStatus {
         let attributes: [String: Any] = [
             kSecAttrAccessible as String: accessibility,
             kSecValueData as String: data,
+            kSecAttrLabel as String: SecureStorageItemStore.marker,
         ]
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        guard updateStatus == errSecItemNotFound else { return updateStatus }
-        let addQuery = query.merging(attributes) { _, new in new }
-        return SecItemAdd(addQuery as CFDictionary, nil)
+        return SecItemUpdate(makeItemQuery(key, accessGroup: accessGroup) as CFDictionary, attributes as CFDictionary)
     }
 
+    /// Deletes the key in every accessible group.
     func deleteItem(_ key: String) -> OSStatus {
         return SecItemDelete(makeItemQuery(key) as CFDictionary)
+    }
+
+    func deleteCopy(_ copy: Copy, of key: String) -> OSStatus {
+        guard let reference = copy.persistentRef else {
+            guard let group = copy.accessGroup else { return errSecParam }
+            return SecItemDelete(makeItemQuery(key, accessGroup: group) as CFDictionary)
+        }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecValuePersistentRef as String: reference,
+        ]
+        return SecItemDelete(query as CFDictionary)
     }
 
     func listKeys() -> (status: OSStatus, keys: [String]) {
@@ -54,6 +115,7 @@ struct SecureStorageItemStore {
         return (status, keys)
     }
 
+    /// Deletes every item of the service in every accessible group. Items of other services and items without a service stay.
     func deleteAll() -> OSStatus {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -69,16 +131,20 @@ struct SecureStorageItemStore {
         return account as? String
     }
 
-    private func makeItemQuery(_ key: String) -> [String: Any] {
-        // SwiftKeychainWrapper item shape: account and generic as Data, no access group because legacy items live in two groups.
+    private func makeItemQuery(_ key: String, accessGroup: String? = nil) -> [String: Any] {
+        // SwiftKeychainWrapper item shape (account and generic as Data, not synchronizable), so the 0.13.0 query still finds items.
         let account = Data(key.utf8)
-        return [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrGeneric as String: account,
             kSecAttrAccount as String: account,
             kSecAttrSynchronizable as String: false,
         ]
+        if let accessGroup = accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+        return query
     }
 }
 
@@ -239,6 +305,21 @@ final class SecureStorageVault {
         }
     }
 
+    /// Where writes go. `explicitGroup` is the app-private `<TEAM>.<bundle id>` group, `nil` after a fallback.
+    /// `defaultGroup` is the group the keychain picks without an explicit one, as reported for a throwaway item.
+    struct AccessGroupMode: Equatable {
+        let explicitGroup: String?
+        let defaultGroup: String?
+
+        var targetGroup: String? {
+            return explicitGroup ?? defaultGroup
+        }
+
+        var isExplicit: Bool {
+            return explicitGroup != nil
+        }
+    }
+
     enum EncodeResult {
         case encoded(Data)
         case locked
@@ -259,8 +340,19 @@ final class SecureStorageVault {
         case locked
     }
 
+    /// Result of reading one key across all of its copies.
+    enum SettleResult {
+        case value(String)
+        case missing
+        case locked
+        case unreadable
+        case failure
+    }
+
     struct Counters {
         var parked = 0
+        var migrated = 0
+        var duplicatesResolved = 0
         var lostItems = 0
     }
 
@@ -296,6 +388,13 @@ final class SecureStorageVault {
         }
     }
 
+    /// One copy of a key together with the service it lives in. Bundle id service copies always rank below `cap_sec` copies.
+    private struct Source {
+        let store: SecureStorageItemStore
+        let copy: SecureStorageItemStore.Copy
+        let isLegacyService: Bool
+    }
+
     private typealias KeyCandidate = (tag: Data, secureEnclave: Bool)
 
     static let magic = Data([0x00, 0x53, 0x4B, 0x01])
@@ -306,6 +405,8 @@ final class SecureStorageVault {
     static let unreadableCode = "UNREADABLE"
     /// Retries after the first locked result seen while protected data is available, at most one per timer tick.
     static let lockedRetriesBeforeLost = 3
+    /// Runs of the load sweep per process when keys had to be skipped.
+    static let sweepAttempts = 3
 
     let queue = DispatchQueue(label: "capacitor-secure-storage-plugin.vault")
     let configuration: Configuration
@@ -317,7 +418,9 @@ final class SecureStorageVault {
 
     private let keyTag: Data
     private let keyCandidates: [KeyCandidate]
+    private let bundleIdentifier: String?
     private let isProtectedDataAvailable: () -> Bool?
+    private let isApplicationActive: () -> Bool
     private let refreshSignals: () -> Void
     private let unlockProbe: (() -> Bool)?
     private let ticker: SecureStorageTicker
@@ -326,12 +429,19 @@ final class SecureStorageVault {
     private var parkedOperations: [PendingOperation] = []
     private var tickerRunning = false
     private var tickCount = 0
+    private var accessGroupMode: AccessGroupMode?
+    private var sweepRequested = false
+    private var sweepQueued = false
+    private var sweepRuns = 0
+    private var sweepBody: (SecureStorageVault) -> Bool = { $0.runSweep() }
     /// Only read or written on `queue`.
     private(set) var counters = Counters()
 
     /// - Parameters:
+    ///   - bundleIdentifier: builds the app-private access group `<TEAM>.<bundle id>`. `nil` keeps the default group.
     ///   - isProtectedDataAvailable: cheap pre-check, `nil` while not known yet. Unknown counts as available and the keychain's
     ///     own `errSecInteractionNotAllowed` decides.
+    ///   - isApplicationActive: the load sweep waits for the app to be in the foreground.
     ///   - refreshSignals: asks the owner to re-read the protected-data state. Called on timer ticks while calls are parked and
     ///     the state is not known to be available, so a missed notification cannot strand the queue.
     ///   - unlockProbe: confirms that the keychain accepts an unlock-bound write before a stuck item is classified as lost.
@@ -342,7 +452,9 @@ final class SecureStorageVault {
         dedicatedService: String = "cap_sec",
         standardService: String = Bundle.main.bundleIdentifier ?? "SwiftKeychainWrapper",
         keyTag: String = "capacitor-secure-storage-plugin.v1",
+        bundleIdentifier: String? = Bundle.main.bundleIdentifier,
         isProtectedDataAvailable: @escaping () -> Bool? = { true },
+        isApplicationActive: @escaping () -> Bool = { true },
         refreshSignals: @escaping () -> Void = {},
         unlockProbe: (() -> Bool)? = nil,
         ticker: SecureStorageTicker = SecureStorageDispatchTicker()
@@ -356,7 +468,9 @@ final class SecureStorageVault {
         #else
         keyCandidates = [(tag: Data(keyTag.utf8), secureEnclave: true)]
         #endif
+        self.bundleIdentifier = bundleIdentifier
         self.isProtectedDataAvailable = isProtectedDataAvailable
+        self.isApplicationActive = isApplicationActive
         self.refreshSignals = refreshSignals
         self.unlockProbe = unlockProbe
         self.ticker = ticker
@@ -379,6 +493,19 @@ final class SecureStorageVault {
 
     func drainParkedOperations() {
         queue.async {
+            self.runParkedOperations()
+        }
+    }
+
+    /// Asks for the per-launch sweep. It is queued behind the app's calls once the queue has drained, the app is in the
+    /// foreground and protected data is known to be available. `body` replaces the keychain sweep in tests and returns
+    /// `false` when keys were skipped and the sweep should run again later.
+    func requestSweep(_ body: ((SecureStorageVault) -> Bool)? = nil) {
+        queue.async {
+            if let body = body {
+                self.sweepBody = body
+            }
+            self.sweepRequested = true
             self.runParkedOperations()
         }
     }
@@ -407,7 +534,62 @@ final class SecureStorageVault {
         return Accessibility(rawValue: requested)
     }
 
+    /// Resolves and caches the app-private access group. `nil` means the keychain is locked and the caller should park.
+    func resolveAccessGroup() -> AccessGroupMode? {
+        if let mode = accessGroupMode {
+            return mode
+        }
+        let probeService = dedicated.service + ".probe"
+        SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: probeService] as CFDictionary)
+        func probe(_ group: String?) -> (status: OSStatus, group: String?) {
+            var query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: probeService,
+                kSecAttrAccount as String: Data("group.\(UUID().uuidString)".utf8),
+                kSecAttrSynchronizable as String: false,
+            ]
+            if let group = group {
+                query[kSecAttrAccessGroup as String] = group
+            }
+            var add = query
+            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            add[kSecValueData as String] = Data()
+            add[kSecReturnAttributes as String] = true
+            var result: CFTypeRef?
+            let status = SecItemAdd(add as CFDictionary, &result)
+            if status == errSecSuccess {
+                SecItemDelete(query as CFDictionary)
+            }
+            return (status, (result as? [String: Any])?[kSecAttrAccessGroup as String] as? String)
+        }
+        let throwaway = probe(nil)
+        if throwaway.status == errSecInteractionNotAllowed {
+            return nil
+        }
+        guard throwaway.status == errSecSuccess, let defaultGroup = throwaway.group else {
+            return fallBackToDefaultGroup(nil, reason: "throwaway item \(throwaway.status)")
+        }
+        guard let dot = defaultGroup.firstIndex(of: "."), dot != defaultGroup.startIndex, let bundle = bundleIdentifier, !bundle.isEmpty else {
+            return fallBackToDefaultGroup(defaultGroup, reason: "no team prefix or bundle id")
+        }
+        let explicitGroup = "\(defaultGroup[..<dot]).\(bundle)"
+        if explicitGroup != defaultGroup {
+            let check = probe(explicitGroup)
+            if check.status == errSecInteractionNotAllowed {
+                return nil
+            }
+            guard check.status == errSecSuccess else {
+                return fallBackToDefaultGroup(defaultGroup, reason: "explicit group \(check.status)")
+            }
+        }
+        let mode = AccessGroupMode(explicitGroup: explicitGroup, defaultGroup: defaultGroup)
+        accessGroupMode = mode
+        logger.notice("access group explicit")
+        return mode
+    }
+
     func storeValue(_ value: String, forKey key: String, accessibility: Accessibility? = nil) -> Outcome {
+        guard let mode = resolveAccessGroup() else { return .locked }
         let data: Data
         switch encodeValue(value) {
         case .encoded(let encoded):
@@ -418,8 +600,10 @@ final class SecureStorageVault {
             return .reject("error")
         }
         let attribute = (accessibility ?? configuration.accessibility).attribute
-        switch classifyStatus(dedicated.writeItem(key, data: data, accessibility: attribute), context: "write \(key)") {
+        let write = writeToTarget(key, data: data, accessibility: attribute, mode: mode)
+        switch classifyStatus(write.status, context: "write \(key)") {
         case .ok:
+            removeStaleCopies(of: key, keeping: write.group)
             return .resolve(["value": true])
         case .locked:
             return .locked
@@ -436,15 +620,16 @@ final class SecureStorageVault {
     }
 
     func loadValue(forKey key: String) -> Outcome {
-        let read = dedicated.readItem(key)
-        switch classifyStatus(read.status, context: "read \(key)") {
-        case .ok:
-            return resolveStoredValue(read.data, forKey: key)
-        case .notFound:
-            return migrateStandardValue(forKey: key)
+        switch settleKey(key, includeLegacyService: false, migrate: isProtectedDataAvailable() != false) {
+        case .value(let value):
+            return .resolve(["value": value])
+        case .missing:
+            return .reject(SecureStorageVault.missingItemMessage)
         case .locked:
             return .locked
-        case .failed:
+        case .unreadable:
+            return .reject(SecureStorageVault.undecryptableItemMessage)
+        case .failure:
             return .reject("error")
         }
     }
@@ -474,11 +659,12 @@ final class SecureStorageVault {
     func removeValue(forKey key: String) -> Outcome {
         var existed = false
         for store in [dedicated, standard] {
-            switch classifyStatus(store.readItem(key).status, context: "read \(key) in \(store.service) before remove") {
-            case .ok, .failed:
+            let found = store.copies(of: key)
+            switch classifyStatus(found.status, context: "find \(key) in \(store.service) before remove") {
+            case .ok, .notFound:
+                existed = existed || !found.copies.isEmpty
+            case .failed:
                 existed = true
-            case .notFound:
-                break
             case .locked:
                 return .locked
             }
@@ -531,70 +717,100 @@ final class SecureStorageVault {
         return .resolve(["value": true])
     }
 
+    /// The load sweep: settles every `cap_sec` key (group, class, encoding, duplicates, bundle id copy). Resolves with
+    /// `skipped`, the number of keys that were locked and need another run. Never runs while protected data is unavailable.
     func migrateLegacyValues() -> Outcome {
-        guard configuration.encryptsValues else { return .resolve([:]) }
+        guard isProtectedDataAvailable() != false else {
+            logger.notice("sweep skipped while protected data is unavailable")
+            return .resolve(["skipped": 1])
+        }
         let list = dedicated.listKeys()
         switch classifyStatus(list.status, context: "list for sweep") {
         case .ok, .notFound:
-            return migrateKeys(list.keys, using: migrateLegacyValue(forKey:))
+            return migrateKeys(list.keys) { key in
+                switch self.settleKey(key, includeLegacyService: true, migrate: true) {
+                case .locked:
+                    return .locked
+                case .failure:
+                    return .reject("error")
+                case .value, .missing, .unreadable:
+                    return .resolve([:])
+                }
+            }
         case .locked:
             logger.notice("sweep skipped while locked")
-            return .resolve([:])
+            return .resolve(["skipped": 1])
         case .failed:
             return .reject("error")
         }
     }
 
     func migrateKeys(_ keys: [String], using migrate: (String) -> Outcome) -> Outcome {
+        var skipped = 0
         for key in keys {
             if case .locked = migrate(key) {
+                skipped += 1
                 logger.notice("sweep skipped \(key, privacy: .public) while locked")
             }
         }
-        return .resolve([:])
+        return .resolve(["skipped": skipped])
     }
 
-    func migrateLegacyValue(forKey key: String) -> Outcome {
-        let read = dedicated.readItem(key)
-        switch classifyStatus(read.status, context: "read \(key) for migration") {
-        case .ok:
+    /// Reads a key across all of its copies, the newest `cap_sec` copy wins, the bundle id service only counts when
+    /// `cap_sec` has none (or for cleanup with `includeLegacyService`). With `migrate` the winner is written into the target
+    /// group with the target class and encoding, read back and verified, and only then every other copy is deleted.
+    func settleKey(_ key: String, includeLegacyService: Bool, migrate: Bool) -> SettleResult {
+        guard let mode = resolveAccessGroup() else { return .locked }
+        let found = dedicated.copies(of: key)
+        switch classifyStatus(found.status, context: "find \(key)") {
+        case .ok, .notFound:
             break
-        case .notFound:
-            return .resolve([:])
         case .locked:
             return .locked
         case .failed:
-            return .reject("error")
+            return .failure
         }
-        guard !isEncodedValue(read.data) else { return .resolve([:]) }
-        guard let value = String(data: read.data, encoding: .utf8) else { return .reject("error") }
-        let outcome = storeValue(value, forKey: key, accessibility: resolveMigrationAccessibility(read.accessibility))
-        if case .resolve = outcome {
-            logger.notice("migrated \(key, privacy: .public)")
+        var sources = rank(found.copies, in: dedicated, legacy: false, target: mode.targetGroup)
+        if sources.isEmpty || includeLegacyService {
+            let legacy = standard.copies(of: key)
+            switch classifyStatus(legacy.status, context: "find standard \(key)") {
+            case .ok, .notFound:
+                sources += rank(legacy.copies, in: standard, legacy: true, target: nil)
+            case .locked where sources.isEmpty:
+                return .locked
+            case .failed where sources.isEmpty:
+                return .failure
+            case .locked, .failed:
+                break
+            }
         }
-        return outcome
-    }
-
-    func migrateStandardValue(forKey key: String) -> Outcome {
-        let read = standard.readItem(key)
-        switch classifyStatus(read.status, context: "read standard \(key)") {
+        guard let chosen = sources.first else { return .missing }
+        let read = chosen.store.readItem(key, accessGroup: chosen.copy.accessGroup)
+        switch classifyStatus(read.status, context: "read \(key)") {
         case .ok:
             break
         case .notFound:
-            return .reject(SecureStorageVault.missingItemMessage)
+            return .missing
         case .locked:
             return .locked
         case .failed:
-            return .reject("error")
+            return .failure
         }
-        guard let value = String(data: read.data, encoding: .utf8) else {
-            return .reject(SecureStorageVault.undecryptableItemMessage)
+        let value: String
+        switch decodeValue(read.data) {
+        case .plaintext(let decoded), .decrypted(let decoded):
+            value = decoded
+        case .locked:
+            return .locked
+        case .invalid:
+            return .unreadable
+        case .failure:
+            return .failure
         }
-        let outcome = storeValue(value, forKey: key, accessibility: resolveMigrationAccessibility(read.accessibility))
-        guard case .resolve = outcome else { return outcome }
-        _ = classifyStatus(standard.deleteItem(key), context: "delete standard \(key) after migration")
-        logger.notice("migrated standard \(key, privacy: .public)")
-        return .resolve(["value": value])
+        if migrate {
+            migrateCopies(of: key, value: value, data: read.data, sources: sources, mode: mode)
+        }
+        return .value(value)
     }
 
     func isEncodedValue(_ data: Data) -> Bool {
@@ -674,12 +890,146 @@ final class SecureStorageVault {
         return true
     }
 
-    private func resolveMigrationAccessibility(_ existing: String?) -> Accessibility {
-        guard let current = existing.flatMap(Accessibility.init(attribute:)) else { return configuration.accessibility }
-        return current.tightened(toAtLeast: configuration.accessibility)
+    private func fallBackToDefaultGroup(_ defaultGroup: String?, reason: String) -> AccessGroupMode {
+        let mode = AccessGroupMode(explicitGroup: nil, defaultGroup: defaultGroup)
+        if accessGroupMode?.isExplicit != false {
+            logger.error("access group fallback to the default group: \(reason, privacy: .public)")
+        }
+        accessGroupMode = mode
+        return mode
+    }
+
+    /// Writes into the target group. A missing entitlement for the explicit group switches to the default group for good.
+    private func writeToTarget(_ key: String, data: Data, accessibility: CFString, mode: AccessGroupMode) -> (status: OSStatus, group: String?) {
+        let status = dedicated.writeItem(key, data: data, accessibility: accessibility, accessGroup: mode.targetGroup)
+        guard mode.isExplicit, status == errSecMissingEntitlement || status == errSecParam else {
+            return (status, mode.targetGroup)
+        }
+        let fallback = fallBackToDefaultGroup(mode.defaultGroup, reason: "write \(status)")
+        return (dedicated.writeItem(key, data: data, accessibility: accessibility, accessGroup: fallback.targetGroup), fallback.targetGroup)
+    }
+
+    /// After a successful `set` into `group`, other copies of the key hold an older value.
+    private func removeStaleCopies(of key: String, keeping group: String?) {
+        guard let group = group else { return }
+        var removed = 0
+        let found = dedicated.copies(of: key)
+        if found.status == errSecSuccess {
+            for copy in found.copies where copy.accessGroup != group {
+                if case .ok = classifyStatus(dedicated.deleteCopy(copy, of: key), context: "delete stale \(key)") {
+                    removed += 1
+                }
+            }
+        }
+        let legacy = standard.copies(of: key)
+        if legacy.status == errSecSuccess {
+            for copy in legacy.copies {
+                if case .ok = classifyStatus(standard.deleteCopy(copy, of: key), context: "delete stale standard \(key)") {
+                    removed += 1
+                }
+            }
+        }
+        counters.duplicatesResolved += removed
+    }
+
+    private func rank(_ copies: [SecureStorageItemStore.Copy], in store: SecureStorageItemStore, legacy: Bool, target: String?) -> [Source] {
+        let sorted = copies.enumerated().sorted { lhs, rhs in
+            let left = lhs.element.modified ?? .distantPast
+            let right = rhs.element.modified ?? .distantPast
+            if left != right {
+                return left > right
+            }
+            let leftInTarget = target != nil && lhs.element.accessGroup == target
+            let rightInTarget = target != nil && rhs.element.accessGroup == target
+            if leftInTarget != rightInTarget {
+                return leftInTarget
+            }
+            return lhs.offset < rhs.offset
+        }
+        return sorted.map { Source(store: store, copy: $0.element, isLegacyService: legacy) }
+    }
+
+    /// The migration unit for one key. `sources` are ranked, the first one holds `value` as `data`.
+    private func migrateCopies(of key: String, value: String, data: Data, sources: [Source], mode: AccessGroupMode) {
+        guard let chosen = sources.first else { return }
+        let targetGroup = mode.targetGroup ?? (chosen.isLegacyService ? nil : chosen.copy.accessGroup)
+        let isTargetCopy: (Source) -> Bool = { source in
+            !source.isLegacyService && (targetGroup == nil ? source.copy.persistentRef == chosen.copy.persistentRef : source.copy.accessGroup == targetGroup)
+        }
+        let currentClass = chosen.copy.accessibility.flatMap(Accessibility.init(attribute:))
+        // A class chosen by a `set` of this version stays, legacy items are tightened to at least the configured class.
+        let keepsClass = chosen.copy.isMarked && !chosen.isLegacyService
+        let targetClass = (keepsClass ? currentClass : currentClass?.tightened(toAtLeast: configuration.accessibility)) ?? configuration.accessibility
+        var targetData = data
+        if configuration.encryptsValues && !isEncodedValue(data) {
+            switch encodeValue(value) {
+            case .encoded(let encoded):
+                targetData = encoded
+            case .locked, .failure:
+                logger.notice("migration of \(key, privacy: .public) postponed, encryption unavailable")
+                return
+            }
+        }
+        let others = sources.filter { !isTargetCopy($0) }
+        let needsWrite = !isTargetCopy(chosen) || targetData != data || currentClass != targetClass
+        guard needsWrite || !others.isEmpty else { return }
+        var added = 0
+        if needsWrite {
+            let hasTargetCopy = sources.contains(where: isTargetCopy)
+            var status = hasTargetCopy
+                ? dedicated.updateItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: targetGroup)
+                : dedicated.addItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: targetGroup)
+            if status == errSecDuplicateItem {
+                status = dedicated.updateItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: targetGroup)
+            } else if status == errSecSuccess && !hasTargetCopy {
+                added = 1
+            }
+            if mode.isExplicit, status == errSecMissingEntitlement || status == errSecParam {
+                _ = fallBackToDefaultGroup(mode.defaultGroup, reason: "migration write \(status)")
+                return
+            }
+            guard case .ok = classifyStatus(status, context: "migration write \(key)") else { return }
+            guard verify(key, value: value, in: targetGroup) else {
+                logger.fault("migration of \(key, privacy: .public) not verified, other copies kept")
+                return
+            }
+            counters.migrated += 1
+        }
+        var deleted = 0
+        for source in sources where !isTargetCopy(source) {
+            if case .ok = classifyStatus(source.store.deleteCopy(source.copy, of: key), context: "delete migrated copy of \(key)") {
+                deleted += 1
+            }
+        }
+        counters.duplicatesResolved += max(0, deleted - added)
+        logger.notice("settled \(key, privacy: .public) wrote \(needsWrite, privacy: .public) removed \(deleted, privacy: .public)")
+    }
+
+    private func verify(_ key: String, value: String, in group: String?) -> Bool {
+        let read = dedicated.readItem(key, accessGroup: group)
+        guard read.status == errSecSuccess else { return false }
+        switch decodeValue(read.data) {
+        case .plaintext(let decoded), .decrypted(let decoded):
+            return decoded == value
+        case .locked, .invalid, .failure:
+            return false
+        }
+    }
+
+    private func runSweep() -> Bool {
+        guard case .resolve(let data) = migrateLegacyValues() else { return false }
+        return (data["skipped"] as? Int ?? 0) == 0
     }
 
     private func runParkedOperations() {
+        runQueue()
+        if parkedOperations.isEmpty, enqueueSweepIfDue() {
+            runQueue()
+        }
+        updateTicker()
+    }
+
+    private func runQueue() {
         let operations = parkedOperations
         var remaining: [PendingOperation] = []
         for (index, operation) in operations.enumerated() {
@@ -689,7 +1039,24 @@ final class SecureStorageVault {
             }
         }
         parkedOperations = remaining
-        updateTicker()
+    }
+
+    private func enqueueSweepIfDue() -> Bool {
+        guard sweepRequested, !sweepQueued, sweepRuns < SecureStorageVault.sweepAttempts else { return false }
+        guard isApplicationActive(), isProtectedDataAvailable() == true else { return false }
+        sweepRequested = false
+        sweepQueued = true
+        sweepRuns += 1
+        let body = sweepBody
+        parkedOperations.append(PendingOperation(name: "sweep", key: "*", run: { [unowned self] in
+            let completed = body(self)
+            self.sweepQueued = false
+            if !completed {
+                self.sweepRequested = true
+            }
+            return .resolve([:])
+        }, lost: { .resolve([:]) }, complete: nil))
+        return true
     }
 
     private func updateTicker() {
@@ -744,40 +1111,29 @@ final class SecureStorageVault {
         return operation.confirmedLockedAttempts > SecureStorageVault.lockedRetriesBeforeLost
     }
 
-    private func resolveStoredValue(_ data: Data, forKey key: String) -> Outcome {
-        switch decodeValue(data) {
-        case .decrypted(let value):
-            return .resolve(["value": value])
-        case .plaintext(let value):
-            if configuration.encryptsValues {
-                submitOperation(named: "migrate", key: key, run: { self.migrateLegacyValue(forKey: key) })
-            }
-            return .resolve(["value": value])
-        case .locked:
-            return .locked
-        case .invalid:
-            return .reject(SecureStorageVault.undecryptableItemMessage)
-        case .failure:
-            return .reject("error")
-        }
-    }
-
     private func acquirePrivateKey() -> KeyResult {
+        let mode = SecureStorageVault.cachedKey(for: keyTag) == nil ? resolveAccessGroup() : nil
+        let group = mode?.explicitGroup
         SecureStorageVault.keyLock.lock()
         defer { SecureStorageVault.keyLock.unlock() }
         if let key = SecureStorageVault.cachedKeys[keyTag] {
             return .key(key)
         }
-        for candidate in keyCandidates {
+        // The explicit group first, then any group the app can access, so a key created before the group existed is reused.
+        let lookups: [(candidate: KeyCandidate, group: String?)] = (group.map { group in keyCandidates.map { ($0, Optional(group)) } } ?? []) + keyCandidates.map { ($0, nil) }
+        for lookup in lookups {
             var query: [String: Any] = [
                 kSecClass as String: kSecClassKey,
-                kSecAttrApplicationTag as String: candidate.tag,
+                kSecAttrApplicationTag as String: lookup.candidate.tag,
                 kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
                 kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
                 kSecReturnRef as String: true,
             ]
-            if candidate.secureEnclave {
+            if lookup.candidate.secureEnclave {
                 query[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
+            }
+            if let group = lookup.group {
+                query[kSecAttrAccessGroup as String] = group
             }
             var result: CFTypeRef?
             switch classifyStatus(SecItemCopyMatching(query as CFDictionary, &result), context: "key lookup") {
@@ -797,8 +1153,12 @@ final class SecureStorageVault {
                 return .failure
             }
         }
+        guard mode != nil else {
+            // Without a resolved group the key would land in the wrong place, the access group probe was locked.
+            return .locked
+        }
         for candidate in keyCandidates {
-            switch generatePrivateKey(candidate) {
+            switch generatePrivateKey(candidate, accessGroup: group) {
             case .key(let key):
                 SecureStorageVault.cachedKeys[keyTag] = key
                 return .key(key)
@@ -811,7 +1171,13 @@ final class SecureStorageVault {
         return .failure
     }
 
-    private func generatePrivateKey(_ candidate: KeyCandidate) -> KeyResult {
+    private static func cachedKey(for tag: Data) -> SecKey? {
+        keyLock.lock()
+        defer { keyLock.unlock() }
+        return cachedKeys[tag]
+    }
+
+    private func generatePrivateKey(_ candidate: KeyCandidate, accessGroup: String?) -> KeyResult {
         var error: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly, .privateKeyUsage, &error) else {
             logger.fault("access control creation failed \(self.extractCode(from: error), privacy: .public)")
@@ -829,8 +1195,16 @@ final class SecureStorageVault {
         if candidate.secureEnclave {
             attributes[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
         }
+        if let accessGroup = accessGroup {
+            attributes[kSecAttrAccessGroup as String] = accessGroup
+        }
         guard let key = SecKeyCreateRandomKey(attributes as CFDictionary, &error) else {
-            return isLockedFailure(error, context: "key creation secureEnclave \(candidate.secureEnclave)") ? .locked : .failure
+            let code = extractCode(from: error)
+            if accessGroup != nil, code == Int(errSecMissingEntitlement) || code == Int(errSecParam) {
+                logger.error("key creation in the explicit group failed \(code, privacy: .public), using the default group")
+                return generatePrivateKey(candidate, accessGroup: nil)
+            }
+            return isLockedFailure(code: code, context: "key creation secureEnclave \(candidate.secureEnclave)") ? .locked : .failure
         }
         logger.notice("created key secureEnclave \(candidate.secureEnclave, privacy: .public)")
         return .key(key)
@@ -851,7 +1225,10 @@ final class SecureStorageVault {
     }
 
     private func isLockedFailure(_ error: Unmanaged<CFError>?, context: String) -> Bool {
-        let code = extractCode(from: error)
+        return isLockedFailure(code: extractCode(from: error), context: context)
+    }
+
+    private func isLockedFailure(code: Int, context: String) -> Bool {
         if code == Int(errSecInteractionNotAllowed) || isProtectedDataAvailable() == false {
             logger.notice("\(context, privacy: .public) locked \(code, privacy: .public)")
             return true

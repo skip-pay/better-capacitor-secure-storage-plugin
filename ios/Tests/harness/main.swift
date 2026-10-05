@@ -21,6 +21,7 @@ func makeVault(
     dedicatedService: String = service,
     standardService: String = KeychainWrapper.standard.serviceName,
     keyTag: String = "capacitor-secure-storage-plugin.v1",
+    bundleIdentifier: String? = ProcessInfo.processInfo.environment["HARNESS_BUNDLE_ID"],
     available: @escaping () -> Bool = { true }
 ) -> SecureStorageVault {
     return SecureStorageVault(
@@ -28,6 +29,7 @@ func makeVault(
         dedicatedService: dedicatedService,
         standardService: standardService,
         keyTag: keyTag,
+        bundleIdentifier: bundleIdentifier,
         isProtectedDataAvailable: available
     )
 }
@@ -186,7 +188,7 @@ vault.queue.sync {
 
     check("2b seed legacy pin2", legacy.set("__secured_5678", forKey: "pin2", withAccessibility: .afterFirstUnlock))
     check("2b loadValue resolves legacy plaintext", describe(vault.loadValue(forKey: "pin2")) == "resolve __secured_5678")
-    check("2b write-back not yet run synchronously", accessible("pin2") == ["ck"])
+    check("2b migration ran inside the get", accessible("pin2") == ["aku"] && storedData("pin2").first?.starts(with: magic) == true, "\(accessible("pin2"))")
 
     check("2c seed legacy pin3", legacy.set("__secured_old", forKey: "pin3", withAccessibility: .afterFirstUnlock))
     check("2c storeValue over legacy class", describe(vault.storeValue("__secured_new", forKey: "pin3")) == "resolve true")
@@ -198,14 +200,14 @@ vault.queue.sync {
     check("2b loadValue after write-back", describe(vault.loadValue(forKey: "pin2")) == "resolve __secured_5678")
 }
 
-print("--- 2d get does not rewrite when not encrypting")
+print("--- 2d get without encryption re-classes but keeps plaintext")
 let plainStrictVault = makeVault(.whenUnlockedThisDeviceOnly, encrypts: false)
 check("2d seed legacy pin4", legacy.set("__secured_p4", forKey: "pin4", withAccessibility: .afterFirstUnlock))
 plainStrictVault.queue.sync {
     check("2d loadValue resolves", describe(plainStrictVault.loadValue(forKey: "pin4")) == "resolve __secured_p4")
 }
 settle(plainStrictVault)
-check("2d item untouched: ck plaintext", accessible("pin4") == ["ck"] && storedData("pin4") == [Data("__secured_p4".utf8)], "\(accessible("pin4"))")
+check("2d item tightened to aku, still plaintext", accessible("pin4") == ["aku"] && storedData("pin4") == [Data("__secured_p4".utf8)], "\(accessible("pin4"))")
 
 vault.queue.sync {
     print("--- 3 two access groups")
@@ -229,15 +231,15 @@ vault.queue.sync {
     check("3b seed default group sweep item", legacy.set("__secured_dev", forKey: "dev", withAccessibility: .afterFirstUnlock))
     check("3b sweep resolves", describe(vault.migrateLegacyValues()) == "resolve -")
     let swept = items(account: "dev")
-    check("3b sweep migrated both copies", swept.count == 2 && swept.allSatisfy { ($0[kSecAttrAccessible as String] as? String) == "aku" && ($0[kSecValueData as String] as? Data)?.starts(with: magic) == true })
-    check("3b removeValue both groups", describe(vault.removeValue(forKey: "dev")) == "resolve true" && items(account: "dev").isEmpty)
+    check("3b sweep collapsed both copies into one encrypted aku item", swept.count == 1 && swept.allSatisfy { ($0[kSecAttrAccessible as String] as? String) == "aku" && ($0[kSecValueData as String] as? Data)?.starts(with: magic) == true })
+    check("3b removeValue", describe(vault.removeValue(forKey: "dev")) == "resolve true" && items(account: "dev").isEmpty)
 }
 plainStrictVault.queue.sync {
     check("3c seed app-ID group plaintext item", legacyAppGroup.set("__secured_grp", forKey: "grp", withAccessibility: .afterFirstUnlock))
     check("3c seed default group plaintext item", legacy.set("__secured_grp", forKey: "grp", withAccessibility: .afterFirstUnlock))
     check("3c sweep resolves", describe(plainStrictVault.migrateLegacyValues()) == "resolve -")
     let swept = items(account: "grp")
-    check("3c sweep without encryption leaves both copies untouched", swept.count == 2 && swept.allSatisfy { ($0[kSecAttrAccessible as String] as? String) == "ck" && ($0[kSecValueData as String] as? Data) == Data("__secured_grp".utf8) }, "\(swept.map { "\($0[kSecAttrAccessible as String] ?? "?")" })")
+    check("3c sweep without encryption collapses the copies, tightens, keeps plaintext", swept.count == 1 && swept.allSatisfy { ($0[kSecAttrAccessible as String] as? String) == "aku" && ($0[kSecValueData as String] as? Data) == Data("__secured_grp".utf8) }, "\(swept.map { "\($0[kSecAttrAccessible as String] ?? "?")" })")
     _ = plainStrictVault.dedicated.deleteItem("grp")
 }
 
@@ -497,9 +499,9 @@ vault.queue.sync {
     s2Before = storedData("s2")
     check("17a sweep resolves", describe(vault.migrateLegacyValues()) == "resolve -")
     check("17a legacy s1 encrypted with the default class", accessible("s1") == ["aku"] && storedData("s1").first?.starts(with: magic) == true && describe(vault.loadValue(forKey: "s1")) == "resolve __secured_s1", "\(accessible("s1"))")
-    check("17a encrypted s2 left alone", storedData("s2") == s2Before && accessible("s2") == ["ck"])
+    check("17a encrypted s2 with a per-call ck class left alone", storedData("s2") == s2Before && accessible("s2") == ["ck"], "\(accessible("s2"))")
     check("17a standard-only s3 not swept", items(account: "s3").isEmpty && KeychainWrapper.standard.string(forKey: "s3") == "__secured_s3")
-    check("17a standard duplicate of s1 untouched", KeychainWrapper.standard.string(forKey: "s1") == "__secured_stale")
+    check("17a standard duplicate of s1 removed after the verified write", !KeychainWrapper.standard.hasValue(forKey: "s1"))
     let snapshot = items().map { $0[kSecValueData as String] as? Data }
     check("17b second sweep resolves", describe(vault.migrateLegacyValues()) == "resolve -")
     check("17b second sweep rewrites nothing", items().map { $0[kSecValueData as String] as? Data } == snapshot && snapshot.count == 2, "\(snapshot.count)")
@@ -521,11 +523,12 @@ let u1Seeded = modified("u1", in: upstreamService)
 Thread.sleep(forTimeInterval: 1.2)
 plainStrictVault.queue.sync {
     check("17c sweep without encryption resolves", describe(plainStrictVault.migrateLegacyValues()) == "resolve -")
-    check("17c plaintext r1 not reclassed or rewritten", accessible("r1") == ["ck"] && storedData("r1") == [Data("__secured_r1".utf8)] && modified("r1") == r1Seeded && !r1Seeded.isEmpty, "\(accessible("r1"))")
-    check("17c r2 not rewritten", accessible("r2") == ["aku"] && modified("r2") == r2Seeded && !r2Seeded.isEmpty)
-    check("17c encrypted r3 left alone", accessible("r3") == ["ck"] && storedData("r3") == r3Before)
+    check("17c legacy plaintext r1 tightened to aku, still plaintext", accessible("r1") == ["aku"] && storedData("r1") == [Data("__secured_r1".utf8)] && modified("r1") != r1Seeded && !r1Seeded.isEmpty, "\(accessible("r1"))")
+    check("17c r2 already aku, not rewritten", accessible("r2") == ["aku"] && modified("r2") == r2Seeded && !r2Seeded.isEmpty)
+    check("17c encrypted ck r3 written by this version keeps its class and bytes", accessible("r3") == ["ck"] && storedData("r3") == r3Before)
+    let r1Swept = modified("r1")
     check("17c new write gets the configured default class", describe(plainStrictVault.storeValue("__secured_r1b", forKey: "r1")) == "resolve true" && accessible("r1") == ["aku"] && storedData("r1") == [Data("__secured_r1b".utf8)])
-    check("17c modification date detects the rewrite", modified("r1") != r1Seeded)
+    check("17c modification date detects the rewrite", modified("r1") != r1Swept)
 }
 let upstreamVault = makeVault(.afterFirstUnlock, encrypts: false, dedicatedService: upstreamService, standardService: upstreamStandardService)
 upstreamVault.queue.sync {

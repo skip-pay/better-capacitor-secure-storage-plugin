@@ -23,12 +23,13 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         let vault = SecureStorageVault(
             configuration: configuration,
             isProtectedDataAvailable: { signals.isProtectedDataAvailable },
+            isApplicationActive: { signals.isApplicationActive },
             refreshSignals: { [weak self] in self?.refreshSignals() }
         )
         self.vault = vault
         observeSignals()
         refreshSignals()
-        vault.submitOperation(named: "sweep", key: "*", run: { vault.migrateLegacyValues() })
+        vault.requestSweep()
     }
 
     @objc func set(_ call: CAPPluginCall) {
