@@ -11,6 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
 import javax.crypto.AEADBadTagException;
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -447,6 +449,85 @@ public class SecureStoreTest {
         } catch (StorageException expected) {}
         secureStore.set("pin", utf8("5678"));
         assertEquals("5678", getString("pin"));
+    }
+
+    // Retry classes per path
+
+    @Test
+    public void aesDecryptIllegalBlockSizeIsRetried() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        backend.aesDecryptErrors.add(new IllegalBlockSizeException());
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+        assertEquals(0, secureStore.diagnostics().decryptFailures);
+    }
+
+    @Test
+    public void aesEncryptIllegalBlockSizeIsRetried() throws Exception {
+        backend.aesEncryptErrors.add(new IllegalBlockSizeException());
+        backend.aesEncryptErrors.add(new IllegalBlockSizeException());
+
+        secureStore.set("pin", utf8("1234"));
+        assertEquals(Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals("1234", getString("pin"));
+    }
+
+    @Test
+    public void aesDecryptPlainBadPaddingIsRetried() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        backend.aesDecryptErrors.add(new BadPaddingException());
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+    }
+
+    @Test
+    public void aesDecryptIllegalBlockSizeAfterAllRetriesIsUnreadableNotLost() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        String stored = store.map.get("pin");
+        for (int i = 0; i < 3; i++) {
+            backend.aesDecryptErrors.add(new IllegalBlockSizeException());
+        }
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
+        assertEquals(Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals(stored, store.map.get("pin"));
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(1, diagnostics.decryptFailures);
+        assertEquals(0, diagnostics.lostItems);
+        assertEquals("next read works", "1234", getString("pin"));
+    }
+
+    @Test
+    public void aesBadTagWithTransientKeystoreCauseIsRetried() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        backend.aesDecryptErrors.add(Fakes.withTransientCause(new AEADBadTagException()));
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+        assertEquals(0, secureStore.diagnostics().lostItems);
+    }
+
+    @Test
+    public void rsaIllegalBlockSizeStaysPermanentAndFallsThroughToPlaintext() throws Exception {
+        backend.createRsaKey();
+        String value = repeat("a", 256);
+        store.map.put("long", Fakes.androidDefaultBase64(utf8(value)));
+        backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
+
+        assertEquals(value, getString("long"));
+        assertTrue("not retried", sleeper.sleeps.isEmpty());
+    }
+
+    @Test
+    public void rsaIllegalBlockSizeWithTransientKeystoreCauseIsRetried() throws Exception {
+        backend.createRsaKey();
+        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        backend.rsaDecryptErrors.add(Fakes.withTransientCause(new IllegalBlockSizeException()));
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
     }
 
     // Sweep

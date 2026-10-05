@@ -116,6 +116,8 @@ final class Fakes {
         byte[] aesDecryptBadTagForAad = null;
         /** When set, aesDecrypt with exactly this AAD returns its result with the first byte changed. */
         byte[] aesDecryptCorruptsForAad = null;
+        /** Thrown by upcoming rsaDecrypt calls, one per call, before anything else happens. */
+        final Deque<GeneralSecurityException> rsaDecryptErrors = new ArrayDeque<>();
 
         private final SecureRandom random = new SecureRandom();
 
@@ -205,6 +207,16 @@ final class Fakes {
         }
 
         @Override
+        public boolean isTransientFailure(Throwable error) {
+            for (Throwable current = error; current != null; current = current.getCause()) {
+                if (current instanceof TransientKeystoreCause) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        @Override
         public boolean hasAesKey() {
             maybeFail();
             return aesKey != null;
@@ -219,6 +231,9 @@ final class Fakes {
         @Override
         public byte[] rsaDecrypt(byte[] ciphertext) throws GeneralSecurityException {
             maybeFail();
+            if (!rsaDecryptErrors.isEmpty()) {
+                throw rsaDecryptErrors.poll();
+            }
             if (rsaKey == null) {
                 throw new KeyUnavailableException("RSA key does not exist");
             }
@@ -230,6 +245,23 @@ final class Fakes {
             }
             return out.toByteArray();
         }
+    }
+
+    /**
+     * Stands in for android.security.KeyStoreException with isTransientFailure() true, which only
+     * exists on Android 13 and later.
+     */
+    static final class TransientKeystoreCause extends Exception {
+
+        TransientKeystoreCause() {
+            super("Keystore busy");
+        }
+    }
+
+    /** Wraps a transient key store cause the way AndroidKeyStore wraps it in doFinal. */
+    static <T extends GeneralSecurityException> T withTransientCause(T error) {
+        error.initCause(new TransientKeystoreCause());
+        return error;
     }
 
     /** Collects submitted tasks so a test decides when the sweep runs. */

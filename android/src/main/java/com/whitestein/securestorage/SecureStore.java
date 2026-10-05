@@ -9,6 +9,8 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
+import javax.crypto.AEADBadTagException;
 import javax.crypto.BadPaddingException;
 import javax.crypto.IllegalBlockSizeException;
 
@@ -192,9 +194,9 @@ final class SecureStore {
     synchronized Diagnostics diagnostics() {
         String keyBackend;
         try {
-            if (withRetry(backend::hasAesKey)) {
+            if (withRetry(backend::hasAesKey, this::isPermanentAes)) {
                 keyBackend = "keystoreAes";
-            } else if (withRetry(backend::hasRsaKey)) {
+            } else if (withRetry(backend::hasRsaKey, this::isPermanentLegacy)) {
                 keyBackend = "keystoreRsaLegacy";
             } else {
                 keyBackend = "none";
@@ -278,7 +280,7 @@ final class SecureStore {
             return undecodable(key, null);
         }
         try {
-            return ReadResult.found(withRetry(() -> backend.aesDecrypt(blob, aad(key))));
+            return ReadResult.found(withRetry(() -> backend.aesDecrypt(blob, aad(key)), this::isPermanentAes));
         } catch (PermanentFailure e) {
             return lost(key, e.getCause());
         } catch (Exception e) {
@@ -297,13 +299,13 @@ final class SecureStore {
         if (bytes.length > 0 && bytes.length % RSA_BLOCK_BYTES == 0) {
             boolean hasRsa;
             try {
-                hasRsa = withRetry(backend::hasRsaKey);
+                hasRsa = withRetry(backend::hasRsaKey, this::isPermanentLegacy);
             } catch (Exception e) {
                 return undecodable(key, e);
             }
             if (hasRsa) {
                 try {
-                    return ReadResult.found(withRetry(() -> backend.rsaDecrypt(bytes)));
+                    return ReadResult.found(withRetry(() -> backend.rsaDecrypt(bytes), this::isPermanentLegacy));
                 } catch (PermanentFailure e) {
                     // Fall through: the bytes may still be a plaintext entry of 256 * n bytes.
                     // Undecryptable RSA output is random and practically never valid UTF-8.
@@ -341,7 +343,7 @@ final class SecureStore {
         try {
             // Decode the string that would be stored, so the check covers the base64 step too.
             byte[] storedBlob = base64.decode(encoded.substring(V2_PREFIX.length()));
-            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(storedBlob, aad(key)));
+            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(storedBlob, aad(key)), this::isPermanentAes);
             if (!Arrays.equals(roundTrip, value)) {
                 skipMigration(key, "Migrated entry decrypts to a different value, keeping legacy entry", null);
                 return;
@@ -366,8 +368,8 @@ final class SecureStore {
             return true;
         }
         try {
-            byte[] blob = withRetry(() -> backend.aesEncrypt(SELF_TEST_PLAINTEXT, SELF_TEST_AAD));
-            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(blob, SELF_TEST_AAD));
+            byte[] blob = withRetry(() -> backend.aesEncrypt(SELF_TEST_PLAINTEXT, SELF_TEST_AAD), this::isPermanentAes);
+            byte[] roundTrip = withRetry(() -> backend.aesDecrypt(blob, SELF_TEST_AAD), this::isPermanentAes);
             if (Arrays.equals(roundTrip, SELF_TEST_PLAINTEXT)) {
                 selfTestPassed = true;
                 selfTestFailed = false;
@@ -387,7 +389,7 @@ final class SecureStore {
     }
 
     private String encryptV2(String key, byte[] value) throws Exception {
-        byte[] blob = withRetry(() -> backend.aesEncrypt(value, aad(key)));
+        byte[] blob = withRetry(() -> backend.aesEncrypt(value, aad(key)), this::isPermanentAes);
         return V2_PREFIX + base64.encode(blob);
     }
 
@@ -404,15 +406,16 @@ final class SecureStore {
     }
 
     /**
-     * Runs a keystore call up to {@code RETRY_DELAYS_MS.length + 1} times. A permanent failure is
-     * thrown as {@link PermanentFailure} right away, the last transient failure is rethrown as is.
+     * Runs a keystore call up to {@code RETRY_DELAYS_MS.length + 1} times. A failure {@code
+     * permanent} accepts is thrown as {@link PermanentFailure} right away, the last transient
+     * failure is rethrown as is.
      */
-    private <T> T withRetry(KeystoreCall<T> call) throws Exception {
+    private <T> T withRetry(KeystoreCall<T> call, Predicate<Throwable> permanent) throws Exception {
         for (int attempt = 0; ; attempt++) {
             try {
                 return call.run();
             } catch (Exception e) {
-                if (isPermanent(e)) {
+                if (permanent.test(e)) {
                     throw new PermanentFailure(e);
                 }
                 if (attempt >= RETRY_DELAYS_MS.length) {
@@ -429,7 +432,28 @@ final class SecureStore {
         }
     }
 
-    static boolean isPermanent(Throwable e) {
+    /**
+     * AES-GCM path. Only a wrong tag and a missing key are permanent. AndroidKeyStore reports most
+     * other doFinal failures as IllegalBlockSizeException, so that and a plain BadPaddingException
+     * are retried and end as an unreadable read, never as a lost item.
+     */
+    private boolean isPermanentAes(Throwable e) {
+        return !backend.isTransientFailure(e) && isPermanentAesType(e);
+    }
+
+    /**
+     * Legacy RSA path. BadPaddingException and IllegalBlockSizeException stay permanent, so a 256
+     * byte multiple that is really a plaintext entry falls through to the UTF-8 reader.
+     */
+    private boolean isPermanentLegacy(Throwable e) {
+        return !backend.isTransientFailure(e) && isPermanentLegacyType(e);
+    }
+
+    static boolean isPermanentAesType(Throwable e) {
+        return e instanceof AEADBadTagException || e instanceof CipherBackend.KeyUnavailableException;
+    }
+
+    static boolean isPermanentLegacyType(Throwable e) {
         return (
             e instanceof BadPaddingException || e instanceof IllegalBlockSizeException || e instanceof CipherBackend.KeyUnavailableException
         );
