@@ -5,11 +5,18 @@
 - Capacitor >= 8.3.0 only, iOS 15+, Android minSdk 24
 - iOS - encryption of stored values with a Secure Enclave key, on by default (`encryptValues` plugin option, set `false` to opt out)
 - iOS - configurable keychain accessibility class (`accessibility` plugin option, default `whenUnlockedThisDeviceOnly`, `afterFirstUnlock` available as an explicit opt-out) and per-call `accessibility` option on `set` (upstream issue #151)
-- iOS - calls made while the device is locked are queued in order and run after unlock instead of failing as missing keys
-- iOS - with `encryptValues` on, plaintext items in `cap_sec` are encrypted when the plugin loads, bundle id service items still move lazily on read
+- iOS - calls made while the device is locked are queued in order and run after unlock instead of failing as missing keys. Protected data is tracked from UIKit notifications without blocking on the main thread, and a one-second timer retries waiting calls so a missed notification cannot strand them
+- iOS - items live in the app-private access group `<team id>.<bundle id>`, resolved at runtime, with a logged fallback to the default group when the app may not use it. The Secure Enclave key is created there too
+- iOS - every key is settled by one migration unit: all copies across groups plus the bundle id service copy, the newest `cap_sec` copy wins, it is written into the app-private group with the tightened class and current encoding, read back and verified, and only then are the other copies deleted. `get` settles its key in the call, a sweep settles all keys once per launch in the foreground, whatever `encryptValues` says. A class chosen by `set` survives the sweep
+- iOS - the Secure Enclave key class follows the configured class: `whenUnlockedThisDeviceOnly`, or `afterFirstUnlockThisDeviceOnly` for an after-first-unlock configuration. Decryption never creates a key and `clear` never deletes it
+- iOS - an item that cannot be decrypted rejects with `Item with given key does not exist` and code `UNREADABLE` and stays overwritable. The fork-only message `Item with given key could not be decrypted` is gone
+- iOS - an item the keychain keeps refusing with -25308 on an unlocked device, as after a Quick Start migration, is classified as lost after three timer retries confirmed by a throwaway write: `get` rejects as missing with code `UNREADABLE`, `remove` and `clear` resolve, `set` replaces it
+- iOS - when encryption fails for a reason other than a locked device, `set` stores plaintext with at least `whenUnlockedThisDeviceOnly` instead of rejecting
+- iOS - rejections carry a `code` (`NOT_FOUND`, `UNREADABLE`, `UNSUPPORTED_ACCESSIBILITY`, `STORAGE_ERROR`, `LOCKED` reserved), the messages are unchanged
+- `getDiagnostics()` returns counters, the key backend and the access group mode. Web resolves zeros, the Android implementation lands separately
 - iOS - remove the SwiftKeychainWrapper dependency, the keychain is accessed directly through Security.framework
 - Android and web - `accessibility` is accepted and ignored
-- `KeychainAccessibility` and `SecureStorageSetOptions` types exported, `PluginsConfig` of `@capacitor/cli` augmented with `SecureStoragePlugin`
+- `KeychainAccessibility`, `SecureStorageSetOptions`, `SecureStorageDiagnostics` and `SecureStorageErrorCode` types exported, `PluginsConfig` of `@capacitor/cli` augmented with `SecureStoragePlugin`
 - Do not downgrade to a build without this fork after values were written with encryption on, see the README
 
 - Behaviour change versus upstream on iOS: with the defaults, values are not readable while the device is locked and calls wait until unlock. Apps that must read values in that state set `accessibility` to `afterFirstUnlock`
