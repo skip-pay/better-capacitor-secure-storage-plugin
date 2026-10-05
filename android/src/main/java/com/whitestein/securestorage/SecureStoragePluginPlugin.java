@@ -161,6 +161,21 @@ public class SecureStoragePluginPlugin extends Plugin {
         call.resolve(_getPlatform());
     }
 
+    /**
+     * Counters of this process since the plugin loaded. Fields that only apply to iOS are always 0
+     * or "n/a" on Android. lostItems and decryptFailures count distinct keys.
+     */
+    @PluginMethod
+    public void getDiagnostics(PluginCall call) {
+        executor.execute(() -> {
+            try {
+                call.resolve(_getDiagnostics());
+            } catch (Exception e) {
+                call.reject(MESSAGE_ERROR, CODE_STORAGE_ERROR, e);
+            }
+        });
+    }
+
     public JSObject _set(String key, String value) throws Exception {
         store().set(key, value.getBytes(StandardCharsets.UTF_8));
         return booleanResult(true);
@@ -198,6 +213,20 @@ public class SecureStoragePluginPlugin extends Plugin {
 
     public JSObject _getPlatform() {
         return valueResult("android");
+    }
+
+    public JSObject _getDiagnostics() {
+        SecureStore.Diagnostics diagnostics = store().diagnostics();
+        JSObject ret = new JSObject();
+        ret.put("parked", 0);
+        ret.put("migrated", diagnostics.migrated);
+        ret.put("duplicatesResolved", 0);
+        ret.put("lostItems", diagnostics.lostItems);
+        ret.put("decryptFailures", diagnostics.decryptFailures);
+        ret.put("plaintextFallbacks", 0);
+        ret.put("keyBackend", diagnostics.keyBackend);
+        ret.put("accessGroupMode", "n/a");
+        return ret;
     }
 
     private static JSObject valueResult(String value) {
