@@ -1,15 +1,11 @@
 import Foundation
+import UIKit
 import Capacitor
-import SwiftKeychainWrapper
 
-/**
- * Please read the Capacitor iOS Plugin Development Guide
- * here: https://capacitor.ionicframework.com/docs/plugins/ios
- */
 @objc(SecureStoragePlugin)
 public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
-    public let identifier = "SecureStoragePlugin" 
-    public let jsName = "SecureStoragePlugin" 
+    public let identifier = "SecureStoragePlugin"
+    public let jsName = "SecureStoragePlugin"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "set", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "get", returnType: CAPPluginReturnPromise),
@@ -17,115 +13,95 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "remove", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "clear", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "getPlatform", returnType: CAPPluginReturnPromise),
-    ] 
-    var keychainwrapper: KeychainWrapper = KeychainWrapper.init(serviceName: "cap_sec")
-    
+    ]
+    private var vault: SecureStorageVault?
+
+    override public func load() {
+        guard let configuration = readConfiguration() else { return }
+        let vault = SecureStorageVault(configuration: configuration, isProtectedDataAvailable: {
+            DispatchQueue.main.sync { UIApplication.shared.isProtectedDataAvailable }
+        })
+        self.vault = vault
+        observeWakeEvents()
+        vault.submitOperation(named: "sweep", key: "*", run: { vault.migrateLegacyValues() })
+    }
+
     @objc func set(_ call: CAPPluginCall) {
+        guard let vault = requireVault(for: call) else { return }
         let key = call.getString("key") ?? ""
         let value = call.getString("value") ?? ""
-        let saveSuccessful: Bool = keychainwrapper.set(value, forKey: key, withAccessibility: .afterFirstUnlock)
-        if(saveSuccessful) {
-            call.resolve([
-                "value": saveSuccessful
-            ])
+        guard let accessibility = vault.resolveAccessibility(call.getString("accessibility")) else {
+            call.reject(SecureStorageVault.unsupportedAccessibilityMessage)
+            return
         }
-        else {
-            call.reject("error")
-        }
+        submitCall(call, to: vault, named: "set", key: key) { vault in vault.storeValue(value, forKey: key, accessibility: accessibility) }
     }
-    
+
     @objc func get(_ call: CAPPluginCall) {
+        guard let vault = requireVault(for: call) else { return }
         let key = call.getString("key") ?? ""
-        let hasValueDedicated = keychainwrapper.hasValue(forKey: key)
-        let hasValueStandard = KeychainWrapper.standard.hasValue(forKey: key)
-        
-        // copy standard value to dedicated and remove standard key
-        if (hasValueStandard && !hasValueDedicated) {
-            let syncValueSuccessful: Bool = keychainwrapper.set(
-                KeychainWrapper.standard.string(forKey: key) ?? "",
-                forKey: key,
-                withAccessibility: .afterFirstUnlock
-            )
-            let removeValueSuccessful: Bool = KeychainWrapper.standard.removeObject(forKey: key)
-            if (!syncValueSuccessful || !removeValueSuccessful) {
-                call.reject("error")
-            }
-        }
-        
-        if(hasValueDedicated || hasValueStandard) {
-            call.resolve([
-                "value": keychainwrapper.string(forKey: key) ?? ""
-            ])
-        }
-        else {
-            call.reject("Item with given key does not exist")
-        }
+        submitCall(call, to: vault, named: "get", key: key) { vault in vault.loadValue(forKey: key) }
     }
-    
+
     @objc func keys(_ call: CAPPluginCall) {
-        let keys = keychainwrapper.allKeys();
-        call.resolve([
-            "value": Array(keys)
-        ])
+        guard let vault = requireVault(for: call) else { return }
+        submitCall(call, to: vault, named: "keys", key: "*") { vault in vault.listStoredKeys() }
     }
-    
+
     @objc func remove(_ call: CAPPluginCall) {
+        guard let vault = requireVault(for: call) else { return }
         let key = call.getString("key") ?? ""
-        let hasValueDedicated = keychainwrapper.hasValue(forKey: key)
-        let hasValueStandard = KeychainWrapper.standard.hasValue(forKey: key)
-        
-        if(hasValueDedicated || hasValueStandard) {
-            KeychainWrapper.standard.removeObject(forKey: key);
-            let removeDedicatedSuccessful: Bool = keychainwrapper.removeObject(forKey: key)
-            if(removeDedicatedSuccessful) {
-                call.resolve([
-                    "value": removeDedicatedSuccessful
-                ])
-            }
-            else {
-                call.reject("Remove failed")
-            }
-        }
-        else {
-            call.reject("Item with given key does not exist")
-        }
+        submitCall(call, to: vault, named: "remove", key: key) { vault in vault.removeValue(forKey: key) }
     }
-    
+
     @objc func clear(_ call: CAPPluginCall) {
-        let keys = keychainwrapper.allKeys();
-        // cleanup standard keychain wrapper keys
-        
-        if(keys.count == 0) {
-            call.resolve([
-                "value": true
-            ])
-        }
-        else {            
-            for key in keys {
-                let hasValueStandard = KeychainWrapper.standard.hasValue(forKey: key)
-                if (hasValueStandard) {
-                    let removeStandardSuccessful = KeychainWrapper.standard.removeObject(forKey: key)
-                    if (!removeStandardSuccessful) {
-                        call.reject("error")
-                    }
-                }
-            }
-            
-            let clearSuccessful: Bool = keychainwrapper.removeAllKeys()
-            if(clearSuccessful) {
-                call.resolve([
-                    "value": clearSuccessful
-                ])
-            }
-            else {
-                call.reject("error")
-            }
-        }
+        guard let vault = requireVault(for: call) else { return }
+        submitCall(call, to: vault, named: "clear", key: "*") { vault in vault.removeAllValues() }
     }
-    
+
     @objc func getPlatform(_ call: CAPPluginCall) {
         call.resolve([
             "value": "ios"
         ])
+    }
+
+    private func readConfiguration() -> SecureStorageVault.Configuration? {
+        let config = getConfig()
+        return SecureStorageVault.Configuration(
+            requestedAccessibility: config.getString("accessibility"),
+            encryptsValues: config.getBoolean("encryptValues", false)
+        )
+    }
+
+    private func requireVault(for call: CAPPluginCall) -> SecureStorageVault? {
+        guard let vault = vault else {
+            call.reject(SecureStorageVault.unsupportedConfigurationMessage)
+            return nil
+        }
+        return vault
+    }
+
+    private func submitCall(_ call: CAPPluginCall, to vault: SecureStorageVault, named name: String, key: String, run: @escaping (SecureStorageVault) -> SecureStorageVault.Outcome) {
+        vault.submitOperation(named: name, key: key, run: { run(vault) }, completion: { outcome in
+            switch outcome {
+            case .resolve(let data):
+                call.resolve(data)
+            case .reject(let message):
+                call.reject(message)
+            case .locked:
+                break
+            }
+        })
+    }
+
+    private func observeWakeEvents() {
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(resumeParkedOperations), name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
+        center.addObserver(self, selector: #selector(resumeParkedOperations), name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(resumeParkedOperations), name: UIApplication.didBecomeActiveNotification, object: nil)
+    }
+
+    @objc private func resumeParkedOperations() {
+        vault?.drainParkedOperations()
     }
 }

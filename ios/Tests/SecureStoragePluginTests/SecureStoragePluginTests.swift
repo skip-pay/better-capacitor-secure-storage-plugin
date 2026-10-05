@@ -1,247 +1,296 @@
 import XCTest
 import Capacitor
-import SwiftKeychainWrapper
+@testable import SecureStoragePlugin
 
-@testable import Plugin
+final class SecureStorageConfigurationTests: XCTestCase {
+    func testAccessibilityMapsToKeychainClasses() {
+        let expected: [(String, CFString, Bool)] = [
+            ("whenUnlocked", kSecAttrAccessibleWhenUnlocked, true),
+            ("whenUnlockedThisDeviceOnly", kSecAttrAccessibleWhenUnlockedThisDeviceOnly, true),
+            ("afterFirstUnlock", kSecAttrAccessibleAfterFirstUnlock, false),
+            ("afterFirstUnlockThisDeviceOnly", kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly, false),
+            ("whenPasscodeSetThisDeviceOnly", kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly, true),
+        ]
+        for (rawValue, attribute, requiresUnlock) in expected {
+            let accessibility = SecureStorageVault.Accessibility(rawValue: rawValue)
+            XCTAssertEqual(accessibility?.attribute, attribute, rawValue)
+            XCTAssertEqual(accessibility?.requiresUnlock, requiresUnlock, rawValue)
+        }
+    }
 
-class PluginTests: XCTestCase {
-    
-    func setupDedicatedWrapper() -> KeychainWrapper {
-        let wrapper = KeychainWrapper.init(serviceName: "cap_sec")
-        wrapper.removeAllKeys()
-        return wrapper
+    func testConfigurationDefaultsMatchUpstream() {
+        let configuration = SecureStorageVault.Configuration()
+        XCTAssertEqual(configuration.accessibility, .afterFirstUnlock)
+        XCTAssertFalse(configuration.encryptsValues)
+        let parsed = SecureStorageVault.Configuration(requestedAccessibility: nil, encryptsValues: true)
+        XCTAssertEqual(parsed?.accessibility, .afterFirstUnlock)
+        XCTAssertEqual(parsed?.encryptsValues, true)
     }
-    
-    func testSet() {
-        let key = "key"
-        let value = "Hello, World!"
-        let valueModified = "Modified"
-        let keychainwrapper = setupDedicatedWrapper()
-        KeychainWrapper.standard.set(value, forKey: key)
-        
-        let plugin = SecureStoragePlugin()
-        
-        let call = CAPPluginCall(callbackId: "test", options: [
-            "key": key,
-            "value": valueModified
-            ], success: { (result, call) in
-                let resultValue = result!.data?["value"] as? Bool
-                XCTAssertTrue(resultValue ?? false)
-                // dedicated keychain wrapper
-                let dedicatedValue = keychainwrapper.string(forKey: key)
-                XCTAssertEqual(valueModified, dedicatedValue)
-                // standard keychain wrapper should not be modified
-                let standardValue = KeychainWrapper.standard.string(forKey: key)
-                XCTAssertEqual(value, standardValue)
-        }, error: { (err) in
-            XCTFail("Error shouldn't have been called")
-        })
-        
-        plugin.set(call!)
-    }
-    
-    func testGet() {
-        let key = "key"
-        let value = "Hello, World!"
-        let keychainwrapper = setupDedicatedWrapper()
-        keychainwrapper.set(value, forKey: key)
-        
-        let plugin = SecureStoragePlugin()
-        
-        let call = CAPPluginCall(callbackId: "test", options: [
-            "key": key
-            ], success: { (result, call) in
-                let resultValue = result!.data?["value"] as? String
-                XCTAssertEqual(value, resultValue)
-        }, error: { (err) in
-            XCTFail("Error shouldn't have been called")
-        })
-        
-        plugin.get(call!)
-    }
-    
-    func testGetCopy() {
-        let key = "key"
-        let value = "Hello, World!"
-        let keychainwrapper = setupDedicatedWrapper()
-        
-        KeychainWrapper.standard.set(value, forKey: key)
-        
-        let plugin = SecureStoragePlugin()
-        
-        let call = CAPPluginCall(callbackId: "test", options: [
-            "key": key
-            ], success: { (result, call) in
-                let resultValue = result!.data?["value"] as? String
-                XCTAssertEqual(value, resultValue)
-                let dedicatedValue = keychainwrapper.string(forKey: key)
-                XCTAssertEqual(value, dedicatedValue)
-                let standardValue = KeychainWrapper.standard.string(forKey: key)
-                XCTAssertNil(standardValue)
-        }, error: { (err) in
-            XCTFail("Error shouldn't have been called")
-        })
-        
-        plugin.get(call!)
-    }
-    
-    func testKeys() {
-        let key = "key"
-        let key2 = "key2"
-        let value = "value"
 
-        let plugin = SecureStoragePlugin()
+    func testConfigurationParsesSupportedAccessibility() {
+        let parsed = SecureStorageVault.Configuration(requestedAccessibility: "whenUnlockedThisDeviceOnly", encryptsValues: false)
+        XCTAssertEqual(parsed?.accessibility, .whenUnlockedThisDeviceOnly)
+        XCTAssertEqual(parsed?.encryptsValues, false)
+    }
 
-        let keychainwrapper = setupDedicatedWrapper()
-        keychainwrapper.set(value, forKey: key)
-        keychainwrapper.set(value, forKey: key2)
+    func testConfigurationRejectsUnsupportedAccessibility() {
+        for rawValue in ["always", "", "WhenUnlocked", "kSecAttrAccessibleWhenUnlocked", " afterFirstUnlock"] {
+            XCTAssertNil(SecureStorageVault.Configuration(requestedAccessibility: rawValue, encryptsValues: true), rawValue)
+        }
+    }
 
+    func testKeychainAttributeMapsBackToAccessibility() {
+        for accessibility in SecureStorageVault.Accessibility.allCases {
+            XCTAssertEqual(SecureStorageVault.Accessibility(attribute: accessibility.attribute as String), accessibility)
+        }
+        for attribute in ["dk", "dku", "", "aku2"] {
+            XCTAssertNil(SecureStorageVault.Accessibility(attribute: attribute), attribute)
+        }
+    }
 
-        let callOne = CAPPluginCall(callbackId: "test", options: [:],
-                                    success: { (result, call) in
-                let resultValue = result!.data?["value"] as? Array<String>
-                XCTAssertEqual(2, resultValue!.count)
-            XCTAssertTrue(resultValue!.contains(key))
-            XCTAssertTrue(resultValue!.contains(key2))
-        }, error: { (err) in
-            XCTFail("Error shouldn't have been called")
-        })
-        plugin.keys(callOne!)
+    func testTightenedCoversAllPairs() {
+        let order: [SecureStorageVault.Accessibility] = [.afterFirstUnlock, .afterFirstUnlockThisDeviceOnly, .whenUnlocked, .whenUnlockedThisDeviceOnly, .whenPasscodeSetThisDeviceOnly]
+        let expected: [[SecureStorageVault.Accessibility]] = [
+            [.afterFirstUnlock, .afterFirstUnlockThisDeviceOnly, .whenUnlocked, .whenUnlockedThisDeviceOnly, .whenPasscodeSetThisDeviceOnly],
+            [.afterFirstUnlockThisDeviceOnly, .afterFirstUnlockThisDeviceOnly, .whenUnlockedThisDeviceOnly, .whenUnlockedThisDeviceOnly, .whenPasscodeSetThisDeviceOnly],
+            [.whenUnlocked, .whenUnlockedThisDeviceOnly, .whenUnlocked, .whenUnlockedThisDeviceOnly, .whenPasscodeSetThisDeviceOnly],
+            [.whenUnlockedThisDeviceOnly, .whenUnlockedThisDeviceOnly, .whenUnlockedThisDeviceOnly, .whenUnlockedThisDeviceOnly, .whenPasscodeSetThisDeviceOnly],
+            [.whenPasscodeSetThisDeviceOnly, .whenPasscodeSetThisDeviceOnly, .whenPasscodeSetThisDeviceOnly, .whenPasscodeSetThisDeviceOnly, .whenPasscodeSetThisDeviceOnly],
+        ]
+        XCTAssertEqual(Set(order), Set(SecureStorageVault.Accessibility.allCases))
+        var checked = 0
+        for (row, existing) in order.enumerated() {
+            for (column, configured) in order.enumerated() {
+                XCTAssertEqual(existing.tightened(toAtLeast: configured), expected[row][column], "\(existing.rawValue) + \(configured.rawValue)")
+                checked += 1
+            }
+        }
+        XCTAssertEqual(checked, 25)
     }
-    
-    func testNonExistingGet() {
-        let key = "keyNonExisting"
-        
-        let plugin = SecureStoragePlugin()
-        
-        let call = CAPPluginCall(callbackId: "test", options: [
-            "key": key
-            ], success: { (result, call) in
-                XCTFail("Error shouldn't have been called")
-        }, error: { (err) in
-            XCTAssertNotNil(err)
-        })
-        
-        plugin.get(call!)
+
+    func testRejectMessagesMatchOtherPlatforms() {
+        XCTAssertEqual(SecureStorageVault.missingItemMessage, "Item with given key does not exist")
+        XCTAssertEqual(SecureStorageVault.undecryptableItemMessage, "Item with given key could not be decrypted")
+        XCTAssertEqual(SecureStorageVault.unsupportedAccessibilityMessage, "Unsupported accessibility value")
+        XCTAssertEqual(SecureStorageVault.unsupportedConfigurationMessage, "Unsupported accessibility value in plugin configuration")
     }
-    
-    func testNonExistingRemoveBoth() {
-        let key = "keyNonExisting"
-        
-        let plugin = SecureStoragePlugin()
-        
-        let call = CAPPluginCall(callbackId: "test", options: [
-            "key": key
-        ], success: { (result, call) in
-            XCTFail("Error shouldn't have been called")
-        }, error: { (err) in
-            XCTAssertNotNil(err)
-        })
-        
-        plugin.remove(call!)
+
+    func testResolveAccessibilityFallsBackToConfiguredDefault() {
+        let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: .whenUnlockedThisDeviceOnly, encryptsValues: true))
+        XCTAssertEqual(vault.resolveAccessibility(nil), .whenUnlockedThisDeviceOnly)
+        XCTAssertEqual(vault.resolveAccessibility("afterFirstUnlock"), .afterFirstUnlock)
+        XCTAssertNil(vault.resolveAccessibility("always"))
+        XCTAssertNil(vault.resolveAccessibility(""))
     }
-    
-    func testRemoveBoth() {
-        let key = "key"
-        let value = "Hello, World!"
-        // prefill dedicated keychain wrapper
-        let keychainwrapper = setupDedicatedWrapper()
-        keychainwrapper.set(value, forKey: key)
-        // prefill standard keychain wrapper
-        KeychainWrapper.standard.set(value, forKey: key)
-        
-        let plugin = SecureStoragePlugin()
-        
-        let call = CAPPluginCall(callbackId: "test", options: [
-            "key": key
-            ], success: { (result, call) in
-                let resultValue = result!.data?["value"] as? Bool
-                XCTAssertTrue(resultValue ?? false)
-                // dedicated keychain wrapper
-                let dedicatedValue = keychainwrapper.string(forKey: key)
-                XCTAssertNil(dedicatedValue)
-                // standard keychain wrapper
-                let standardValueRemoved = KeychainWrapper.standard.string(forKey: key)
-                XCTAssertNil(standardValueRemoved)
-        }, error: { (err) in
-            XCTFail("Error shouldn't have been called")
-        })
-        
-        plugin.remove(call!)
+}
+
+final class SecureStorageGateTests: XCTestCase {
+    private final class EventLog {
+        private let lock = NSLock()
+        private var storage: [String] = []
+
+        var events: [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+
+        func record(_ event: String) {
+            lock.lock()
+            storage.append(event)
+            lock.unlock()
+        }
     }
-    
-    // same as testRemoveBoth, but don't prefill standard wrapper
-    func testRemove() {
-        let key = "key"
-        let value = "Hello, World!"
-        // prefill dedicated keychain wrapper
-        let keychainwrapper = setupDedicatedWrapper()
-        keychainwrapper.set(value, forKey: key)
-        
-        let plugin = SecureStoragePlugin()
-        
-        let call = CAPPluginCall(callbackId: "test", options: [
-            "key": key
-            ], success: { (result, call) in
-                let resultValue = result!.data?["value"] as? Bool
-                XCTAssertTrue(resultValue ?? false)
-                // dedicated keychain wrapper
-                let dedicatedValue = keychainwrapper.string(forKey: key)
-                XCTAssertNil(dedicatedValue)
-        }, error: { (err) in
-            XCTFail("Error shouldn't have been called")
-        })
-        
-        plugin.remove(call!)
+
+    private final class Flag {
+        private let lock = NSLock()
+        private var storage: Bool
+        private var readCount = 0
+
+        init(_ value: Bool) {
+            storage = value
+        }
+
+        var reads: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return readCount
+        }
+
+        func read() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            readCount += 1
+            return storage
+        }
+
+        func write(_ value: Bool) {
+            lock.lock()
+            storage = value
+            lock.unlock()
+        }
     }
-    
-    func testClear() {
-        let key = "key"
-        let value = "Hello, World!"
-        let standardOnlyKey = "standard key"
-        let standardOnlyValue = "standard value"
-        // prefill dedicated keychain wrapper
-        let keychainwrapper = setupDedicatedWrapper()
-        keychainwrapper.set(value, forKey: key)
-        keychainwrapper.set(value + "2", forKey: key + "2")
-        // prefill standard keychain wrapper
-        KeychainWrapper.standard.set(value, forKey: key)
-        KeychainWrapper.standard.set(standardOnlyValue, forKey: standardOnlyKey)
-        
-        let plugin = SecureStoragePlugin()
-        
-        let call = CAPPluginCall(callbackId: "test", options: [
-            "key": key
-            ], success: { (result, call) in
-                let resultValue = result!.data?["value"] as? Bool
-                XCTAssertTrue(resultValue ?? false)
-                // key present in dedicated and standard wrapper removed
-                let dedicatedValue = keychainwrapper.string(forKey: key)
-                XCTAssertNil(dedicatedValue)
-                let dedicatedValue2 = keychainwrapper.string(forKey: key + "2")
-                XCTAssertNil(dedicatedValue2)
-                let standardValue = KeychainWrapper.standard.string(forKey: key)
-                XCTAssertNil(standardValue)
-                // key only defined in standard wrapper still present
-                let standardValue2 = KeychainWrapper.standard.string(forKey: standardOnlyKey)
-                XCTAssertEqual(standardOnlyValue, standardValue2)
-        }, error: { (err) in
-            XCTFail("Error shouldn't have been called")
-        })
-        
-        plugin.clear(call!)
+
+    private func describe(_ outcome: SecureStorageVault.Outcome) -> String {
+        switch outcome {
+        case .resolve(let data): return "resolve \(data["value"].map { "\($0)" } ?? "-")"
+        case .reject(let message): return "reject \(message)"
+        case .locked: return "locked"
+        }
     }
-    
-    func testGetPlatform() {
+
+    private func settle(_ vault: SecureStorageVault) {
+        vault.drainParkedOperations()
+        vault.queue.sync {}
+    }
+
+    func testParkedOperationBlocksLaterOperationsAndSettlesOnce() {
+        let vault = SecureStorageVault()
+        let log = EventLog()
+        var attempts = 0
+        vault.submitOperation(named: "first", key: "k", run: {
+            attempts += 1
+            return attempts < 4 ? .locked : .resolve(["value": "one"])
+        }, completion: { log.record("first \(self.describe($0))") })
+        vault.submitOperation(named: "second", key: "k", run: { .resolve(["value": "two"]) }, completion: { log.record("second \(self.describe($0))") })
+        vault.queue.sync {}
+        XCTAssertTrue(log.events.isEmpty)
+        XCTAssertEqual(vault.queue.sync { attempts }, 2)
+        settle(vault)
+        XCTAssertTrue(log.events.isEmpty)
+        XCTAssertEqual(vault.queue.sync { attempts }, 3)
+        settle(vault)
+        XCTAssertEqual(log.events, ["first resolve one", "second resolve two"])
+        vault.submitOperation(named: "third", key: "k", run: { .locked }, completion: { log.record("third \(self.describe($0))") })
+        settle(vault)
+        settle(vault)
+        XCTAssertEqual(log.events, ["first resolve one", "second resolve two"])
+    }
+
+    func testDrainStopsAtFirstReparkedOperation() {
+        let vault = SecureStorageVault()
+        let log = EventLog()
+        var runs: [String] = []
+        var headReady = false
+        var middleReady = false
+        vault.submitOperation(named: "X", key: "x", run: { runs.append("X"); return headReady ? .resolve(["value": "x"]) : .locked }, completion: { log.record("X \(self.describe($0))") })
+        vault.submitOperation(named: "Y", key: "y", run: { runs.append("Y"); return middleReady ? .resolve(["value": "y"]) : .locked }, completion: { log.record("Y \(self.describe($0))") })
+        vault.submitOperation(named: "Z", key: "z", run: { runs.append("Z"); return .resolve(["value": "z"]) }, completion: { log.record("Z \(self.describe($0))") })
+        vault.queue.sync {}
+        XCTAssertTrue(log.events.isEmpty)
+        XCTAssertTrue(vault.queue.sync { runs.allSatisfy { $0 == "X" } })
+        vault.queue.sync { headReady = true }
+        settle(vault)
+        XCTAssertEqual(log.events, ["X resolve x"])
+        XCTAssertFalse(vault.queue.sync { runs.contains("Z") })
+        settle(vault)
+        XCTAssertEqual(log.events, ["X resolve x"])
+        vault.queue.sync { middleReady = true }
+        settle(vault)
+        settle(vault)
+        XCTAssertEqual(log.events, ["X resolve x", "Y resolve y", "Z resolve z"])
+        XCTAssertEqual(vault.queue.sync { runs.filter { $0 == "Z" }.count }, 1)
+    }
+
+    func testGateParksWithoutRunningWhenDefaultClassRequiresUnlock() {
+        for accessibility in [SecureStorageVault.Accessibility.whenUnlocked, .whenUnlockedThisDeviceOnly, .whenPasscodeSetThisDeviceOnly] {
+            let available = Flag(false)
+            let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: accessibility), isProtectedDataAvailable: { available.read() })
+            let log = EventLog()
+            vault.submitOperation(named: "A", key: "a", run: { log.record("run A"); return .resolve(["value": "a"]) }, completion: { log.record("A \(self.describe($0))") })
+            vault.submitOperation(named: "B", key: "b", run: { log.record("run B"); return .resolve(["value": "b"]) }, completion: { log.record("B \(self.describe($0))") })
+            vault.queue.sync {}
+            XCTAssertTrue(log.events.isEmpty, accessibility.rawValue)
+            XCTAssertGreaterThan(available.reads, 0, accessibility.rawValue)
+            available.write(true)
+            settle(vault)
+            XCTAssertEqual(log.events, ["run A", "A resolve a", "run B", "B resolve b"], accessibility.rawValue)
+        }
+    }
+
+    func testGateIsBypassedWhenDefaultClassIsAvailableAfterFirstUnlock() {
+        for accessibility in [SecureStorageVault.Accessibility.afterFirstUnlock, .afterFirstUnlockThisDeviceOnly] {
+            let available = Flag(false)
+            let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: accessibility), isProtectedDataAvailable: { available.read() })
+            let log = EventLog()
+            vault.submitOperation(named: "A", key: "a", run: { .resolve(["value": "a"]) }, completion: { log.record("A \(self.describe($0))") })
+            vault.submitOperation(named: "B", key: "b", run: { .reject("nope") }, completion: { log.record("B \(self.describe($0))") })
+            vault.queue.sync {}
+            XCTAssertEqual(log.events, ["A resolve a", "B reject nope"], accessibility.rawValue)
+            XCTAssertEqual(available.reads, 0, accessibility.rawValue)
+        }
+    }
+
+    func testLockedOutcomeStillParksWhenGateIsBypassed() {
+        let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: .afterFirstUnlock), isProtectedDataAvailable: { false })
+        let log = EventLog()
+        var locked = true
+        vault.submitOperation(named: "A", key: "a", run: { locked ? .locked : .resolve(["value": "a"]) }, completion: { log.record("A \(self.describe($0))") })
+        vault.submitOperation(named: "B", key: "b", run: { .resolve(["value": "b"]) }, completion: { log.record("B \(self.describe($0))") })
+        vault.queue.sync {}
+        XCTAssertTrue(log.events.isEmpty)
+        vault.queue.sync { locked = false }
+        settle(vault)
+        XCTAssertEqual(log.events, ["A resolve a", "B resolve b"])
+    }
+}
+
+final class SecureStorageSweepTests: XCTestCase {
+    func testSweepSkipsLockedKeysAndContinues() {
+        let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: .whenUnlockedThisDeviceOnly, encryptsValues: true))
+        var attempted: [String] = []
+        let outcome = vault.migrateKeys(["a", "b", "c"]) { key in
+            attempted.append(key)
+            return key == "b" ? .locked : .resolve([:])
+        }
+        XCTAssertEqual(attempted, ["a", "b", "c"])
+        guard case .resolve = outcome else {
+            return XCTFail("sweep parked on a locked key")
+        }
+    }
+
+    func testSweepWithoutEncryptionDoesNotTouchTheKeychain() {
+        let vault = SecureStorageVault(configuration: SecureStorageVault.Configuration(accessibility: .whenUnlockedThisDeviceOnly, encryptsValues: false))
+        guard case .resolve(let data) = vault.queue.sync(execute: { vault.migrateLegacyValues() }) else {
+            return XCTFail("sweep did not resolve")
+        }
+        XCTAssertTrue(data.isEmpty)
+    }
+}
+
+final class SecureStoragePluginTests: XCTestCase {
+    private func invoke(_ method: (SecureStoragePlugin) -> (CAPPluginCall) -> Void, options: [String: Any] = [:]) -> (resolved: PluginCallResultData?, rejected: String?) {
         let plugin = SecureStoragePlugin()
-        let call = CAPPluginCall(callbackId: "test",
-                                 success: { (result, call) in
-                let resultValue = result!.data?["value"] as? String
-                XCTAssertEqual("ios", resultValue)
-        }, error: { (err) in
-            XCTFail("Error shouldn't have been called")
+        var resolved: PluginCallResultData?
+        var rejected: String?
+        let call = CAPPluginCall(callbackId: "test", methodName: "test", options: options, success: { result, _ in
+            resolved = result?.data ?? [:]
+        }, error: { error in
+            rejected = error?.message
         })
-        
-        plugin.getPlatform(call!)
+        method(plugin)(call!)
+        return (resolved, rejected)
+    }
+
+    func testStorageCallsRejectWithoutConfiguredVault() {
+        let calls: [(String, (SecureStoragePlugin) -> (CAPPluginCall) -> Void, [String: Any])] = [
+            ("set", SecureStoragePlugin.set, ["key": "k", "value": "v"]),
+            ("set with accessibility", SecureStoragePlugin.set, ["key": "k", "value": "v", "accessibility": "always"]),
+            ("get", SecureStoragePlugin.get, ["key": "k"]),
+            ("keys", SecureStoragePlugin.keys, [:]),
+            ("remove", SecureStoragePlugin.remove, ["key": "k"]),
+            ("clear", SecureStoragePlugin.clear, [:]),
+        ]
+        for (name, method, options) in calls {
+            let result = invoke(method, options: options)
+            XCTAssertNil(result.resolved, name)
+            XCTAssertEqual(result.rejected, SecureStorageVault.unsupportedConfigurationMessage, name)
+        }
+    }
+
+    func testGetPlatformResolvesIos() {
+        let result = invoke(SecureStoragePlugin.getPlatform)
+        XCTAssertNil(result.rejected)
+        XCTAssertEqual(result.resolved?["value"] as? String, "ios")
     }
 }

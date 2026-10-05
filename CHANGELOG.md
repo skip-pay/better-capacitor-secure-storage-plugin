@@ -3,6 +3,14 @@
 - Fork of capacitor-secure-storage-plugin 0.13.0 maintained by Skip Pay
 - Package renamed to `better-capacitor-secure-storage-plugin` (`npm install better-capacitor-secure-storage-plugin`), the plugin name `SecureStoragePlugin` and the JavaScript API are unchanged
 - Capacitor >= 8.3.0 only, iOS 15+, Android minSdk 24
+- iOS - optional encryption of stored values with a Secure Enclave key (`encryptValues` plugin option, off by default)
+- iOS - configurable keychain accessibility class (`accessibility` plugin option, default `afterFirstUnlock`) and per-call `accessibility` option on `set` (upstream issue #151)
+- iOS - calls made while the device is locked are queued in order and run after unlock instead of failing as missing keys
+- iOS - with `encryptValues` on, plaintext items in `cap_sec` are encrypted when the plugin loads, bundle id service items still move lazily on read
+- iOS - remove the SwiftKeychainWrapper dependency, the keychain is accessed directly through Security.framework
+- Android and web - `accessibility` is accepted and ignored
+- `KeychainAccessibility` and `SecureStorageSetOptions` types exported, `PluginsConfig` of `@capacitor/cli` augmented with `SecureStoragePlugin`
+- Do not downgrade to a build without this fork after enabling `encryptValues`, see the README
 
 ## Upstream history (capacitor-secure-storage-plugin)
 

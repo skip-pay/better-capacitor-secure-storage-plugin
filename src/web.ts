@@ -1,9 +1,8 @@
 import { WebPlugin } from '@capacitor/core';
-import type { SecureStoragePluginPlugin } from './definitions';
 
-export class SecureStoragePluginWeb
-  extends WebPlugin
-  implements SecureStoragePluginPlugin {
+import type { SecureStoragePluginPlugin, SecureStorageSetOptions } from './definitions';
+
+export class SecureStoragePluginWeb extends WebPlugin implements SecureStoragePluginPlugin {
   PREFIX = 'cap_sec_';
 
   get(options: { key: string }): Promise<{ value: string }> {
@@ -14,12 +13,12 @@ export class SecureStoragePluginWeb
         })
       : Promise.reject('Item with given key does not exist');
   }
-  set(options: { key: string; value: string }): Promise<{ value: boolean }> {
+  set(options: SecureStorageSetOptions): Promise<{ value: boolean }> {
     localStorage.setItem(this.addPrefix(options.key), btoa(options.value));
     return Promise.resolve({ value: true });
   }
   remove(options: { key: string }): Promise<{ value: boolean }> {
-    if (localStorage.getItem(this.addPrefix(options.key))) {
+    if (localStorage.getItem(this.addPrefix(options.key)) !== null) {
       localStorage.removeItem(this.addPrefix(options.key));
       return Promise.resolve({ value: true });
     } else {
@@ -36,7 +35,7 @@ export class SecureStoragePluginWeb
   }
   keys(): Promise<{ value: string[] }> {
     const keys = Object.keys(localStorage)
-      .filter(k => k.indexOf(this.PREFIX) === 0)
+      .filter((k) => k.indexOf(this.PREFIX) === 0)
       .map(this.removePrefix);
     return Promise.resolve({ value: keys });
   }
