@@ -13,6 +13,8 @@ import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.whitestein.securestorage.SecureStoragePluginPlugin;
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
@@ -283,6 +285,12 @@ public class ExampleInstrumentedTest {
         plugin._clear();
         assertEquals(0, prefs.getAll().size());
         assertTrue(keyStore().containsAlias(aesAlias));
+    }
+
+    @Test
+    public void callExecutorIsSharedByAllInstances() throws Exception {
+        Field field = SecureStoragePluginPlugin.class.getDeclaredField("CALL_EXECUTOR");
+        assertTrue("one call thread per process, not per plugin instance", Modifier.isStatic(field.getModifiers()));
     }
 
     @Test
