@@ -154,7 +154,7 @@ final class SecureStorageVault {
         let accessibility: Accessibility
         let encryptsValues: Bool
 
-        init(accessibility: Accessibility = .afterFirstUnlock, encryptsValues: Bool = false) {
+        init(accessibility: Accessibility = .whenUnlockedThisDeviceOnly, encryptsValues: Bool = true) {
             self.accessibility = accessibility
             self.encryptsValues = encryptsValues
         }

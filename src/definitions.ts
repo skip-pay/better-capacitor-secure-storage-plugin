@@ -48,24 +48,25 @@ declare module '@capacitor/cli' {
     SecureStoragePlugin?: {
       /**
        * Default keychain accessibility class for items written by the plugin (iOS only).
+       * `afterFirstUnlock` is available as an explicit opt-out, for example when the app must read values while the device is locked.
        * An unknown value makes every storage call reject with
        * `Unsupported accessibility value in plugin configuration`, only `getPlatform` still resolves.
        *
        * @since 1.0.0
-       * @default 'afterFirstUnlock'
-       * @example "whenUnlockedThisDeviceOnly"
+       * @default 'whenUnlockedThisDeviceOnly'
+       * @example "afterFirstUnlock"
        */
       accessibility?: KeychainAccessibility;
       /**
-       * Encrypt stored values with a Secure Enclave key (iOS only).
+       * Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default, set `false` to opt out.
        * Plaintext items in the plugin's `cap_sec` keychain service are encrypted when the plugin loads.
        * Items in the app bundle id service move into `cap_sec` and are encrypted lazily when `get` reads them.
        * A migrated item keeps its keychain class when that class is stricter than the configured default.
        * Android always encrypts with AndroidKeyStore, web ignores the option.
        *
        * @since 1.0.0
-       * @default false
-       * @example true
+       * @default true
+       * @example false
        */
       encryptValues?: boolean;
     };

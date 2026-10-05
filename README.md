@@ -10,13 +10,13 @@ This is a Skip Pay fork of [martinkasa/capacitor-secure-storage-plugin](https://
 
 What differs from upstream:
 
-- iOS values can be encrypted at rest with a Secure Enclave key (`encryptValues`, off by default).
-- The iOS keychain accessibility class is configurable, globally in the plugin configuration and per `set` call (upstream issue [#151](https://github.com/martinkasa/capacitor-secure-storage-plugin/issues/151)). The default is `afterFirstUnlock`.
+- iOS values can be encrypted at rest with a Secure Enclave key (`encryptValues`, on by default).
+- The iOS keychain accessibility class is configurable, globally in the plugin configuration and per `set` call (upstream issue [#151](https://github.com/martinkasa/capacitor-secure-storage-plugin/issues/151)). The default is the hardened `whenUnlockedThisDeviceOnly`, `afterFirstUnlock` stays available as an explicit opt-out.
 - iOS no longer fails a read as "missing" while the device is locked. Calls that hit a locked keychain are queued and run in order after unlock.
 - The SwiftKeychainWrapper dependency is gone. iOS talks to the keychain directly through Security.framework.
 - With `encryptValues` on, plaintext items in the `cap_sec` service are encrypted when the plugin loads.
 
-With the default configuration the stored data and the migration behaviour match upstream 0.13.0 on all platforms. The one difference is that iOS calls hitting a locked keychain wait for unlock instead of failing.
+The defaults on iOS are hardened: values are encrypted with a Secure Enclave key and stored with the `whenUnlockedThisDeviceOnly` class, so they are not available while the device is locked and do not leave the device in backups. To get the upstream behaviour, set `encryptValues` to `false` and `accessibility` to `afterFirstUnlock` in the plugin configuration. Android and web behave as in upstream 0.13.0.
 
 Requirements: Capacitor >= 8.3.0, iOS 15+, Android minSdk 24. For older Capacitor versions use the upstream package.
 
@@ -44,10 +44,10 @@ Set the options under `plugins.SecureStoragePlugin` in the Capacitor configurati
 
 Configuration of better-capacitor-secure-storage-plugin.
 
-| Prop                | Type                                                                    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                | Default                         | Since |
-| ------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------- | ----- |
-| **`accessibility`** | <code><a href="#keychainaccessibility">KeychainAccessibility</a></code> | Default keychain accessibility class for items written by the plugin (iOS only). An unknown value makes every storage call reject with `Unsupported accessibility value in plugin configuration`, only `getPlatform` still resolves.                                                                                                                                                                                                       | <code>'afterFirstUnlock'</code> | 1.0.0 |
-| **`encryptValues`** | <code>boolean</code>                                                    | Encrypt stored values with a Secure Enclave key (iOS only). Plaintext items in the plugin's `cap_sec` keychain service are encrypted when the plugin loads. Items in the app bundle id service move into `cap_sec` and are encrypted lazily when `get` reads them. A migrated item keeps its keychain class when that class is stricter than the configured default. Android always encrypts with AndroidKeyStore, web ignores the option. | <code>false</code>              | 1.0.0 |
+| Prop                | Type                                                                    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Default                                   | Since |
+| ------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | ----- |
+| **`accessibility`** | <code><a href="#keychainaccessibility">KeychainAccessibility</a></code> | Default keychain accessibility class for items written by the plugin (iOS only). `afterFirstUnlock` is available as an explicit opt-out, for example when the app must read values while the device is locked. An unknown value makes every storage call reject with `Unsupported accessibility value in plugin configuration`, only `getPlatform` still resolves.                                                                                                                     | <code>'whenUnlockedThisDeviceOnly'</code> | 1.0.0 |
+| **`encryptValues`** | <code>boolean</code>                                                    | Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default, set `false` to opt out. Plaintext items in the plugin's `cap_sec` keychain service are encrypted when the plugin loads. Items in the app bundle id service move into `cap_sec` and are encrypted lazily when `get` reads them. A migrated item keeps its keychain class when that class is stricter than the configured default. Android always encrypts with AndroidKeyStore, web ignores the option. | <code>true</code>                         | 1.0.0 |
 
 ### Examples
 
@@ -57,8 +57,8 @@ In `capacitor.config.json`:
 {
   "plugins": {
     "SecureStoragePlugin": {
-      "accessibility": "whenUnlockedThisDeviceOnly",
-      "encryptValues": true
+      "accessibility": "afterFirstUnlock",
+      "encryptValues": false
     }
   }
 }
@@ -74,8 +74,8 @@ import { CapacitorConfig } from '@capacitor/cli';
 const config: CapacitorConfig = {
   plugins: {
     SecureStoragePlugin: {
-      accessibility: "whenUnlockedThisDeviceOnly",
-      encryptValues: true,
+      accessibility: "afterFirstUnlock",
+      encryptValues: false,
     },
   },
 };
@@ -85,15 +85,15 @@ export default config;
 
 </docgen-config>
 
-An unknown `accessibility` value in the configuration makes every storage call reject with `Unsupported accessibility value in plugin configuration`. `getPlatform` still resolves. A value of the wrong type is not detected and falls back to the default: `encryptValues` must be a boolean (the string `"true"` counts as `false`) and `accessibility` must be a string.
+An unknown `accessibility` value in the configuration makes every storage call reject with `Unsupported accessibility value in plugin configuration`. `getPlatform` still resolves. A value of the wrong type is not detected and falls back to the default: `encryptValues` must be a boolean (the string `"false"` counts as `true`) and `accessibility` must be a string.
 
 ### Accessibility
 
 | Value                            | iOS constant                                       | Available                              |
 | -------------------------------- | -------------------------------------------------- | -------------------------------------- |
 | `whenUnlocked`                   | `kSecAttrAccessibleWhenUnlocked`                   | only while the device is unlocked      |
-| `whenUnlockedThisDeviceOnly`     | `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`     | only while unlocked, not in backups    |
-| `afterFirstUnlock` (default)     | `kSecAttrAccessibleAfterFirstUnlock`               | after the first unlock since boot      |
+| `whenUnlockedThisDeviceOnly` (default) | `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` | only while unlocked, not in backups |
+| `afterFirstUnlock`               | `kSecAttrAccessibleAfterFirstUnlock`               | after the first unlock since boot      |
 | `afterFirstUnlockThisDeviceOnly` | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` | after first unlock, not in backups     |
 | `whenPasscodeSetThisDeviceOnly`  | `kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly`  | while unlocked, only with a passcode   |
 
@@ -299,8 +299,8 @@ if !UserDefaults.standard.bool(forKey: "firstTimeLaunchOccurred") {
 
 #### Storage format
 
-- `encryptValues: false` (default) stores the value as plain UTF-8, the same as upstream.
-- `encryptValues: true` stores the magic prefix `0x00 0x53 0x4B 0x01` followed by an ECIES ciphertext (`eciesEncryptionCofactorVariableIVX963SHA256AESGCM`). The key is a P-256 key in the Secure Enclave with the tag `capacitor-secure-storage-plugin.v1`. Its access class is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so it is available whenever an item of any class is, and the item class carries the restriction. It is created on first use, looked up by tag afterwards and never deleted by the plugin. Lookup and creation are serialised across the whole process, so concurrent plugin instances share one key. On the simulator a software key is used instead.
+- `encryptValues: false` (opt-out) stores the value as plain UTF-8, the same as upstream.
+- `encryptValues: true` (default) stores the magic prefix `0x00 0x53 0x4B 0x01` followed by an ECIES ciphertext (`eciesEncryptionCofactorVariableIVX963SHA256AESGCM`). The key is a P-256 key in the Secure Enclave with the tag `capacitor-secure-storage-plugin.v1`. Its access class is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so it is available whenever an item of any class is, and the item class carries the restriction. It is created on first use, looked up by tag afterwards and never deleted by the plugin. Lookup and creation are serialised across the whole process, so concurrent plugin instances share one key. On the simulator a software key is used instead.
 - Readers accept both formats at all times, whatever `encryptValues` says.
 - With `encryptValues` on, a class without `ThisDeviceOnly` gains nothing. The Secure Enclave key never leaves the device, so items restored from a backup onto another device cannot be decrypted there and reject with `Item with given key could not be decrypted`. A `set` overwrites them. Use a `ThisDeviceOnly` class together with encryption.
 - An item that cannot be decrypted rejects with `Item with given key could not be decrypted`. A missing key rejects with `Item with given key does not exist` on every platform.
@@ -319,11 +319,11 @@ A migration never gives an item a looser class. The plugin combines the item's c
 
 While the device is locked, keychain items with an unlock-bound class fail with `errSecInteractionNotAllowed` (-25308). A silent push can launch the app in that state. Such calls are not reported as missing keys. They are queued strictly in order and run after `protectedDataDidBecomeAvailable`, `willEnterForeground` or `didBecomeActive`. There is no timeout. A call that is still locked stays at the head of the queue and everything behind it waits.
 
-When the configured default class is `whenUnlocked`, `whenUnlockedThisDeviceOnly` or `whenPasscodeSetThisDeviceOnly`, calls are held back while protected data is unavailable, without touching the keychain. With `afterFirstUnlock` or `afterFirstUnlockThisDeviceOnly` calls run right away, and only a call that still gets -25308 is queued.
+When the configured default class is `whenUnlocked`, `whenUnlockedThisDeviceOnly` (the default) or `whenPasscodeSetThisDeviceOnly`, calls are held back while protected data is unavailable, without touching the keychain. With `afterFirstUnlock` or `afterFirstUnlockThisDeviceOnly` calls run right away, and only a call that still gets -25308 is queued. An app that must read values while the device is locked, for example when a silent push wakes it, has to opt out with `"accessibility": "afterFirstUnlock"`.
 
-#### Never downgrade after enabling encryption
+#### Never downgrade after encryption was used
 
-A build without this fork cannot read encrypted items and cannot overwrite them either. Do not switch back to upstream after `encryptValues` was on. To stop encrypting, set `encryptValues` to `false`. New writes are plaintext again and the fork still reads the encrypted items that remain.
+A build without this fork cannot read encrypted items and cannot overwrite them either. Encryption is on by default, so do not switch back to upstream once this fork has written values with the defaults. To stop encrypting, set `encryptValues` to `false`. New writes are plaintext again and the fork still reads the encrypted items that remain.
 
 #### Tests
 

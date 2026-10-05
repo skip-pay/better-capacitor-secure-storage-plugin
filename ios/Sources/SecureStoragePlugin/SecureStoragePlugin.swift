@@ -69,7 +69,7 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         let config = getConfig()
         return SecureStorageVault.Configuration(
             requestedAccessibility: config.getString("accessibility"),
-            encryptsValues: config.getBoolean("encryptValues", false)
+            encryptsValues: config.getBoolean("encryptValues", true)
         )
     }
 

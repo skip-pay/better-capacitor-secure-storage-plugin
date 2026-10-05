@@ -18,13 +18,16 @@ final class SecureStorageConfigurationTests: XCTestCase {
         }
     }
 
-    func testConfigurationDefaultsMatchUpstream() {
+    func testConfigurationDefaultsAreHardened() {
         let configuration = SecureStorageVault.Configuration()
-        XCTAssertEqual(configuration.accessibility, .afterFirstUnlock)
-        XCTAssertFalse(configuration.encryptsValues)
+        XCTAssertEqual(configuration.accessibility, .whenUnlockedThisDeviceOnly)
+        XCTAssertTrue(configuration.encryptsValues)
         let parsed = SecureStorageVault.Configuration(requestedAccessibility: nil, encryptsValues: true)
-        XCTAssertEqual(parsed?.accessibility, .afterFirstUnlock)
+        XCTAssertEqual(parsed?.accessibility, .whenUnlockedThisDeviceOnly)
         XCTAssertEqual(parsed?.encryptsValues, true)
+        let optedOut = SecureStorageVault.Configuration(requestedAccessibility: "afterFirstUnlock", encryptsValues: false)
+        XCTAssertEqual(optedOut?.accessibility, .afterFirstUnlock)
+        XCTAssertEqual(optedOut?.encryptsValues, false)
     }
 
     func testConfigurationParsesSupportedAccessibility() {
