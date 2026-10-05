@@ -452,6 +452,8 @@ final class SecureStorageVault {
     private var sweepBody: (SecureStorageVault) -> Bool = { $0.runSweep() }
     /// Only read or written on `queue`.
     private(set) var counters = Counters()
+    /// Test hook for the plaintext fallback: encryption reports a non-lock failure. Set on `queue` only.
+    var simulatesEncryptionFailure = false
 
     /// - Parameters:
     ///   - bundleIdentifier: builds the app-private access group `<TEAM>.<bundle id>`. `nil` keeps the default group.
@@ -550,6 +552,13 @@ final class SecureStorageVault {
         return Accessibility(rawValue: requested)
     }
 
+    /// `<TEAM>.<bundle id>`, the team prefix taken before the first `.` of the group the keychain picked for a throwaway item.
+    static func appPrivateGroup(defaultGroup: String, bundleIdentifier: String?) -> String? {
+        guard let dot = defaultGroup.firstIndex(of: "."), dot != defaultGroup.startIndex else { return nil }
+        guard let bundle = bundleIdentifier, !bundle.isEmpty else { return nil }
+        return "\(defaultGroup[..<dot]).\(bundle)"
+    }
+
     /// Resolves and caches the app-private access group. `nil` means the keychain is locked and the caller should park.
     func resolveAccessGroup() -> AccessGroupMode? {
         if let mode = accessGroupMode {
@@ -585,10 +594,9 @@ final class SecureStorageVault {
         guard throwaway.status == errSecSuccess, let defaultGroup = throwaway.group else {
             return fallBackToDefaultGroup(nil, reason: "throwaway item \(throwaway.status)")
         }
-        guard let dot = defaultGroup.firstIndex(of: "."), dot != defaultGroup.startIndex, let bundle = bundleIdentifier, !bundle.isEmpty else {
+        guard let explicitGroup = SecureStorageVault.appPrivateGroup(defaultGroup: defaultGroup, bundleIdentifier: bundleIdentifier) else {
             return fallBackToDefaultGroup(defaultGroup, reason: "no team prefix or bundle id")
         }
-        let explicitGroup = "\(defaultGroup[..<dot]).\(bundle)"
         if explicitGroup != defaultGroup {
             let check = probe(explicitGroup)
             if check.status == errSecInteractionNotAllowed {
@@ -847,6 +855,7 @@ final class SecureStorageVault {
     func encodeValue(_ value: String) -> EncodeResult {
         let plaintext = Data(value.utf8)
         guard configuration.encryptsValues else { return .encoded(plaintext) }
+        guard !simulatesEncryptionFailure else { return .failure }
         let key: SecKey
         switch acquirePrivateKey(creating: true) {
         case .key(let acquired):
@@ -1222,6 +1231,13 @@ final class SecureStorageVault {
         keyLock.lock()
         defer { keyLock.unlock() }
         return cachedKeys[tag]
+    }
+
+    /// Access control of the key object this process holds, for tests. A key created in this process reports its creation
+    /// class, a key looked up from the keychain may not (the simulator reports `cku;dacl(true)` for every looked-up key).
+    func keyAccessControlDescription() -> String? {
+        guard let cached = SecureStorageVault.cachedKey(for: keyTag), let attributes = SecKeyCopyAttributes(cached.key) as? [String: Any] else { return nil }
+        return attributes[kSecAttrAccessControl as String].map { String(describing: $0) }
     }
 
     /// `secureEnclave`, `software` (simulator fallback) or `none` when no key exists or it cannot be looked up right now.
