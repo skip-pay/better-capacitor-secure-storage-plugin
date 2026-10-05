@@ -1,7 +1,9 @@
 package com.whitestein.securestorage;
 
+import android.os.Build;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
+import androidx.annotation.RequiresApi;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.security.GeneralSecurityException;
@@ -104,6 +106,39 @@ final class KeystoreCipherBackend implements CipherBackend {
             out.write(block, 0, block.length);
         }
         return out.toByteArray();
+    }
+
+    /**
+     * On Android 13 and later AndroidKeyStore attaches an {@link android.security.KeyStoreException}
+     * as the cause of a failed operation, and that exception says whether retrying can help.
+     */
+    @Override
+    public boolean isTransientFailure(Throwable error) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return false;
+        }
+        return Api33.hasTransientKeyStoreCause(error);
+    }
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    private static final class Api33 {
+
+        /** Causes followed at most, guards against cyclic cause chains. */
+        private static final int MAX_CAUSE_DEPTH = 8;
+
+        static boolean hasTransientKeyStoreCause(Throwable error) {
+            Throwable current = error;
+            for (int depth = 0; current != null && depth < MAX_CAUSE_DEPTH; depth++) {
+                if (
+                    current instanceof android.security.KeyStoreException &&
+                    ((android.security.KeyStoreException) current).isTransientFailure()
+                ) {
+                    return true;
+                }
+                current = current.getCause();
+            }
+            return false;
+        }
     }
 
     private SecretKey getOrCreateAesKey() throws GeneralSecurityException {

@@ -10,6 +10,9 @@ import static org.junit.Assert.fail;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Base64;
+import javax.crypto.AEADBadTagException;
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
 import org.junit.Before;
 import org.junit.Test;
 
@@ -235,11 +238,50 @@ public class SecureStoreTest {
     @Test
     public void legacyNonUtf8IsUndecodable() {
         store.map.put("bin", Fakes.androidDefaultBase64(new byte[] { (byte) 0xff, (byte) 0xfe, 0x00 }));
+        // android.util.Base64 decodes "%%%" to zero bytes without throwing, like the fake now does,
+        // so this holds on a device only because the reader rejects non-base64 text itself.
         store.map.put("notBase64", "%%%");
 
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("bin").status);
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("notBase64").status);
+        assertEquals("%%%", store.map.get("notBase64"));
         assertEquals(2, secureStore.diagnostics().decryptFailures);
+    }
+
+    @Test
+    public void legacyWithCharactersOutsideBase64IsUndecodable() {
+        // On a device "QUJD%" decodes to "ABC" and "\n" to nothing.
+        store.map.put("junk", Fakes.androidDefaultBase64(utf8("ABC")).trim() + "%");
+        store.map.put("blank", "\n");
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("junk").status);
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("blank").status);
+        assertEquals(2, secureStore.diagnostics().decryptFailures);
+        assertEquals(0, secureStore.diagnostics().migrated);
+    }
+
+    @Test
+    public void fakeBase64DecodesLikeAndroid() {
+        assertArrayEquals(new byte[0], Fakes.BASE64.decode("%%%"));
+        assertArrayEquals(utf8("ABC"), Fakes.BASE64.decode("QU%J\nD"));
+        assertArrayEquals(utf8("A"), Fakes.BASE64.decode("QQ=="));
+        assertArrayEquals(utf8("A"), Fakes.BASE64.decode("QQ"));
+        assertArrayEquals(utf8("AB"), Fakes.BASE64.decode("QUI="));
+        for (String bad : new String[] { "Q", "QQ=", "=QQQ", "QQ==Q", "QUI=Q" }) {
+            try {
+                Fakes.BASE64.decode(bad);
+                fail("must throw for " + bad);
+            } catch (IllegalArgumentException expected) {}
+        }
+    }
+
+    @Test
+    public void base64TextCheck() {
+        assertTrue(SecureStore.isBase64Text(""));
+        assertTrue(SecureStore.isBase64Text("QUJD\nQUI=\r\n"));
+        assertFalse(SecureStore.isBase64Text("QUJD%"));
+        assertFalse(SecureStore.isBase64Text("v2:QUJD"));
+        assertFalse(SecureStore.isBase64Text("QUJD\u00e9"));
     }
 
     @Test
@@ -254,6 +296,7 @@ public class SecureStoreTest {
         assertEquals("abc", getString("plain"));
         assertEquals("legacy entry kept", legacy, store.map.get("pin"));
         assertEquals(0, secureStore.diagnostics().migrated);
+        assertEquals(2, secureStore.diagnostics().migrationSkipped);
 
         backend.aesCreatable = true;
         assertEquals("1234", getString("pin"));
@@ -269,6 +312,116 @@ public class SecureStoreTest {
         assertEquals("1234", getString("pin"));
         assertEquals(legacy, store.map.get("pin"));
         assertEquals(0, secureStore.diagnostics().migrated);
+        assertEquals(1, secureStore.diagnostics().migrationSkipped);
+    }
+
+    // Verified migration and self-test
+
+    private int selfTestEncryptions() {
+        String selfTestAad = new String(SecureStore.SELF_TEST_AAD, StandardCharsets.UTF_8);
+        int count = 0;
+        for (String aad : backend.aesEncryptAads) {
+            if (aad.equals(selfTestAad)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Test
+    public void legacyEntryIsKeptAndReadableWhenAesDecryptFails() throws Exception {
+        backend.createRsaKey();
+        String rsa = backend.upstreamRsaEncrypt(utf8("1234"));
+        String plain = Fakes.androidDefaultBase64(utf8("abc"));
+        store.map.put("pin", rsa);
+        store.map.put("plain", plain);
+        backend.aesDecryptAlwaysThrows = new AEADBadTagException("Tag mismatch");
+
+        assertEquals("1234", getString("pin"));
+        assertEquals("abc", getString("plain"));
+        sweepExecutor.runAll();
+        assertEquals("legacy entry unchanged", rsa, store.map.get("pin"));
+        assertEquals("legacy entry unchanged", plain, store.map.get("plain"));
+        assertEquals("still readable", "1234", getString("pin"));
+        assertEquals("still readable", "abc", getString("plain"));
+
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(0, diagnostics.migrated);
+        assertEquals(2, diagnostics.migrationSkipped);
+        assertEquals("a skipped migration is not a read failure", 0, diagnostics.lostItems);
+        assertEquals(0, diagnostics.decryptFailures);
+    }
+
+    @Test
+    public void legacyEntryIsKeptWhenItsNewBlobDoesNotDecrypt() throws Exception {
+        String legacy = Fakes.androidDefaultBase64(utf8("1234"));
+        store.map.put("pin", legacy);
+        store.map.put("other", Fakes.androidDefaultBase64(utf8("5678")));
+        backend.aesDecryptBadTagForAad = SecureStore.aad("pin");
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(legacy, store.map.get("pin"));
+        assertEquals("1234", getString("pin"));
+        assertEquals("5678", getString("other"));
+        assertTrue("self-test passed, other keys migrate", store.map.get("other").startsWith("v2:"));
+        assertEquals(1, secureStore.diagnostics().migrated);
+        assertEquals(1, secureStore.diagnostics().migrationSkipped);
+    }
+
+    @Test
+    public void legacyEntryIsKeptWhenItsNewBlobDecryptsToOtherBytes() throws Exception {
+        String legacy = Fakes.androidDefaultBase64(utf8("1234"));
+        store.map.put("pin", legacy);
+        backend.aesDecryptCorruptsForAad = SecureStore.aad("pin");
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(legacy, store.map.get("pin"));
+        assertEquals(0, secureStore.diagnostics().migrated);
+        assertEquals(1, secureStore.diagnostics().migrationSkipped);
+    }
+
+    @Test
+    public void selfTestRunsOnceBeforeTheFirstMigrationWrite() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        store.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        store.map.put("c", Fakes.androidDefaultBase64(utf8("3")));
+
+        assertEquals("1", getString("a"));
+        assertEquals(new String(SecureStore.SELF_TEST_AAD, StandardCharsets.UTF_8), backend.aesEncryptAads.get(0));
+        sweepExecutor.runAll();
+        secureStore.set("d", utf8("4"));
+
+        assertEquals(1, selfTestEncryptions());
+        assertEquals(3, secureStore.diagnostics().migrated);
+    }
+
+    @Test
+    public void setDoesNotRunTheSelfTest() throws Exception {
+        secureStore.set("a", utf8("1"));
+        assertEquals(Arrays.asList("v2:a"), backend.aesEncryptAads);
+    }
+
+    @Test
+    public void failedSelfTestStopsTheSweepAndIsRetriedLater() throws Exception {
+        String a = Fakes.androidDefaultBase64(utf8("1"));
+        String b = Fakes.androidDefaultBase64(utf8("2"));
+        store.map.put("a", a);
+        store.map.put("b", b);
+        backend.aesDecryptAlwaysThrows = new AEADBadTagException("Tag mismatch");
+
+        secureStore.contains("a");
+        sweepExecutor.runAll();
+        assertEquals("sweep stops after the first failed self-test", 1, selfTestEncryptions());
+        assertEquals(a, store.map.get("a"));
+        assertEquals(b, store.map.get("b"));
+
+        secureStore.set("c", utf8("3"));
+        assertTrue("set follows its normal path", store.map.get("c").startsWith("v2:"));
+
+        backend.aesDecryptAlwaysThrows = null;
+        assertEquals("1", getString("a"));
+        assertTrue("migrated once the self-test passes", store.map.get("a").startsWith("v2:"));
+        assertEquals(2, selfTestEncryptions());
     }
 
     // Fail-closed writes
@@ -335,6 +488,151 @@ public class SecureStoreTest {
         } catch (StorageException expected) {}
         secureStore.set("pin", utf8("5678"));
         assertEquals("5678", getString("pin"));
+    }
+
+    // Retry classes per path
+
+    @Test
+    public void aesDecryptIllegalBlockSizeIsRetried() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        backend.aesDecryptErrors.add(new IllegalBlockSizeException());
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+        assertEquals(0, secureStore.diagnostics().decryptFailures);
+    }
+
+    @Test
+    public void aesEncryptIllegalBlockSizeIsRetried() throws Exception {
+        backend.aesEncryptErrors.add(new IllegalBlockSizeException());
+        backend.aesEncryptErrors.add(new IllegalBlockSizeException());
+
+        secureStore.set("pin", utf8("1234"));
+        assertEquals(Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals("1234", getString("pin"));
+    }
+
+    @Test
+    public void aesDecryptPlainBadPaddingIsRetried() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        backend.aesDecryptErrors.add(new BadPaddingException());
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+    }
+
+    @Test
+    public void aesDecryptIllegalBlockSizeAfterAllRetriesIsUnreadableNotLost() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        String stored = store.map.get("pin");
+        for (int i = 0; i < 3; i++) {
+            backend.aesDecryptErrors.add(new IllegalBlockSizeException());
+        }
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
+        assertEquals(Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals(stored, store.map.get("pin"));
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(1, diagnostics.decryptFailures);
+        assertEquals(0, diagnostics.lostItems);
+        assertEquals("next read works", "1234", getString("pin"));
+    }
+
+    @Test
+    public void aesBadTagWithTransientKeystoreCauseIsRetried() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        backend.aesDecryptErrors.add(Fakes.withTransientCause(new AEADBadTagException()));
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+        assertEquals(0, secureStore.diagnostics().lostItems);
+    }
+
+    @Test
+    public void rsaIllegalBlockSizeStaysPermanentAndFallsThroughToPlaintext() throws Exception {
+        backend.createRsaKey();
+        String value = repeat("a", 256);
+        store.map.put("long", Fakes.androidDefaultBase64(utf8(value)));
+        backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
+
+        assertEquals(value, getString("long"));
+        assertTrue("not retried", sleeper.sleeps.isEmpty());
+    }
+
+    @Test
+    public void rsaIllegalBlockSizeWithTransientKeystoreCauseIsRetried() throws Exception {
+        backend.createRsaKey();
+        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        backend.rsaDecryptErrors.add(Fakes.withTransientCause(new IllegalBlockSizeException()));
+
+        assertEquals("1234", getString("pin"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+    }
+
+    // Single attempt while the AES path is failing
+
+    @Test
+    public void brokenKeystoreAddsRetrySleepsToOneLegacyGetOnly() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        store.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        backend.aesCreatable = false;
+
+        assertEquals("1", getString("a"));
+        assertEquals("first migration retries", Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals("2", getString("b"));
+        assertEquals("1", getString("a"));
+        assertEquals("later migrations make one attempt", Arrays.asList(50L, 200L), sleeper.sleeps);
+        assertEquals(2, secureStore.diagnostics().migrationSkipped);
+
+        try {
+            secureStore.set("c", utf8("3"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+        assertEquals("set still retries", Arrays.asList(50L, 200L, 50L, 200L), sleeper.sleeps);
+
+        backend.aesCreatable = true;
+        assertEquals("1", getString("a"));
+        assertTrue("one attempt still migrates once the keystore works", store.map.get("a").startsWith("v2:"));
+    }
+
+    @Test
+    public void sweepMakesSingleAttemptsAfterAFailedEncrypt() throws Exception {
+        backend.createRsaKey();
+        String rsa = backend.upstreamRsaEncrypt(utf8("one"));
+        String plain = Fakes.androidDefaultBase64(utf8("two"));
+        store.map.put("rsa", rsa);
+        store.map.put("plain", plain);
+        backend.aesCreatable = false;
+        try {
+            secureStore.set("x", utf8("3"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+        sleeper.sleeps.clear();
+
+        backend.transientFailures = 1;
+        sweepExecutor.runAll();
+
+        assertTrue("no retry sleeps in the sweep", sleeper.sleeps.isEmpty());
+        assertEquals(rsa, store.map.get("rsa"));
+        assertEquals(plain, store.map.get("plain"));
+    }
+
+    @Test
+    public void successfulSetRestoresRetriesForMigration() throws Exception {
+        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        backend.aesCreatable = false;
+        try {
+            secureStore.set("x", utf8("3"));
+            fail("set must throw");
+        } catch (StorageException expected) {}
+        backend.aesCreatable = true;
+        secureStore.set("y", utf8("4"));
+        sleeper.sleeps.clear();
+
+        backend.aesEncryptErrors.add(new IllegalBlockSizeException());
+        assertEquals("1", getString("a"));
+        assertEquals(Arrays.asList(50L), sleeper.sleeps);
+        assertTrue(store.map.get("a").startsWith("v2:"));
     }
 
     // Sweep

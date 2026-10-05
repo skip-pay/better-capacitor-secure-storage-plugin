@@ -13,6 +13,8 @@ import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.whitestein.securestorage.SecureStoragePluginPlugin;
 import java.io.ByteArrayOutputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
@@ -258,12 +260,37 @@ public class ExampleInstrumentedTest {
     }
 
     @Test
+    public void legacyEntryOutsideBase64IsUnreadable() throws Exception {
+        // android.util.Base64 skips characters outside the alphabet instead of throwing.
+        assertEquals(0, Base64.decode("%%%", Base64.DEFAULT).length);
+        prefs.edit().putString("garbage", "%%%").putString("junk", "QUJD%").commit();
+
+        SecureStoragePluginPlugin plugin = newPlugin();
+        for (String key : new String[] { "garbage", "junk" }) {
+            try {
+                plugin._get(key);
+                fail("must not read as a value: " + key);
+            } catch (Exception expected) {
+                assertEquals("Item with given key does not exist", expected.getMessage());
+            }
+        }
+        assertEquals("%%%", prefs.getString("garbage", null));
+        assertEquals(2, plugin._getDiagnostics().getInteger("decryptFailures").intValue());
+    }
+
+    @Test
     public void clearKeepsKeystoreKeys() throws Exception {
         SecureStoragePluginPlugin plugin = newPlugin();
         plugin._set("pin", "1234");
         plugin._clear();
         assertEquals(0, prefs.getAll().size());
         assertTrue(keyStore().containsAlias(aesAlias));
+    }
+
+    @Test
+    public void callExecutorIsSharedByAllInstances() throws Exception {
+        Field field = SecureStoragePluginPlugin.class.getDeclaredField("CALL_EXECUTOR");
+        assertTrue("one call thread per process, not per plugin instance", Modifier.isStatic(field.getModifiers()));
     }
 
     @Test

@@ -33,8 +33,12 @@ public class SecureStoragePluginPlugin extends Plugin {
         return thread;
     });
 
-    /** Runs storage calls in order and keeps keystore work off the Capacitor bridge thread. */
-    private final ExecutorService executor = Executors.newSingleThreadExecutor((runnable) -> {
+    /**
+     * Runs storage calls in order and keeps keystore work off the Capacitor bridge thread. One
+     * thread per process, shared by every plugin instance, so a new Bridge neither leaks a thread
+     * nor reorders calls against an older instance.
+     */
+    private static final ExecutorService CALL_EXECUTOR = Executors.newSingleThreadExecutor((runnable) -> {
         Thread thread = new Thread(runnable, "SecureStoragePlugin");
         thread.setDaemon(true);
         return thread;
@@ -84,7 +88,7 @@ public class SecureStoragePluginPlugin extends Plugin {
         String key = call.getString("key");
         String value = call.getString("value");
         String finalValue = value == null ? "" : value;
-        executor.execute(() -> {
+        CALL_EXECUTOR.execute(() -> {
             try {
                 call.resolve(_set(key, finalValue));
             } catch (Exception e) {
@@ -96,7 +100,7 @@ public class SecureStoragePluginPlugin extends Plugin {
     @PluginMethod
     public void get(PluginCall call) {
         String key = call.getString("key");
-        executor.execute(() -> {
+        CALL_EXECUTOR.execute(() -> {
             SecureStore.ReadResult result;
             try {
                 result = store().get(key);
@@ -120,7 +124,7 @@ public class SecureStoragePluginPlugin extends Plugin {
 
     @PluginMethod
     public void keys(PluginCall call) {
-        executor.execute(() -> {
+        CALL_EXECUTOR.execute(() -> {
             try {
                 call.resolve(_keys());
             } catch (Exception e) {
@@ -132,7 +136,7 @@ public class SecureStoragePluginPlugin extends Plugin {
     @PluginMethod
     public void remove(PluginCall call) {
         String key = call.getString("key");
-        executor.execute(() -> {
+        CALL_EXECUTOR.execute(() -> {
             try {
                 if (store().contains(key)) {
                     call.resolve(_remove(key));
@@ -147,7 +151,7 @@ public class SecureStoragePluginPlugin extends Plugin {
 
     @PluginMethod
     public void clear(PluginCall call) {
-        executor.execute(() -> {
+        CALL_EXECUTOR.execute(() -> {
             try {
                 call.resolve(_clear());
             } catch (Exception e) {
@@ -163,11 +167,12 @@ public class SecureStoragePluginPlugin extends Plugin {
 
     /**
      * Counters of this process since the plugin loaded. Fields that only apply to iOS are always 0
-     * or "n/a" on Android. lostItems and decryptFailures count distinct keys.
+     * or "n/a" on Android. lostItems, decryptFailures and migrationSkipped count distinct keys.
+     * migrationSkipped is Android only.
      */
     @PluginMethod
     public void getDiagnostics(PluginCall call) {
-        executor.execute(() -> {
+        CALL_EXECUTOR.execute(() -> {
             try {
                 call.resolve(_getDiagnostics());
             } catch (Exception e) {
@@ -223,6 +228,7 @@ public class SecureStoragePluginPlugin extends Plugin {
         ret.put("duplicatesResolved", 0);
         ret.put("lostItems", diagnostics.lostItems);
         ret.put("decryptFailures", diagnostics.decryptFailures);
+        ret.put("migrationSkipped", diagnostics.migrationSkipped);
         ret.put("plaintextFallbacks", 0);
         ret.put("keyBackend", diagnostics.keyBackend);
         ret.put("accessGroupMode", "n/a");
