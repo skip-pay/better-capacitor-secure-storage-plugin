@@ -82,6 +82,76 @@ struct SecureStorageItemStore {
     }
 }
 
+/// Protected-data and app-state signals. The plugin writes them from UIKit notifications on the main thread and the vault
+/// reads them on its own queue, so neither side waits for the other. `nil` protected data means not known yet.
+final class SecureStorageSignals {
+    private let lock = NSLock()
+    private var protectedData: Bool?
+    private var active: Bool
+
+    init(protectedDataAvailable: Bool? = nil, applicationActive: Bool = false) {
+        protectedData = protectedDataAvailable
+        active = applicationActive
+    }
+
+    var isProtectedDataAvailable: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return protectedData
+    }
+
+    var isApplicationActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
+    }
+
+    func setProtectedDataAvailable(_ available: Bool) {
+        lock.lock()
+        protectedData = available
+        lock.unlock()
+    }
+
+    func setApplicationActive(_ isActive: Bool) {
+        lock.lock()
+        active = isActive
+        lock.unlock()
+    }
+}
+
+/// Repeating timer that re-runs the parked queue. The vault starts and stops it on its own queue only.
+protocol SecureStorageTicker: AnyObject {
+    func start(on queue: DispatchQueue, handler: @escaping () -> Void)
+    func stop()
+}
+
+final class SecureStorageDispatchTicker: SecureStorageTicker {
+    private let interval: DispatchTimeInterval
+    private var timer: DispatchSourceTimer?
+
+    init(interval: DispatchTimeInterval = .seconds(1)) {
+        self.interval = interval
+    }
+
+    deinit {
+        timer?.cancel()
+    }
+
+    func start(on queue: DispatchQueue, handler: @escaping () -> Void) {
+        guard timer == nil else { return }
+        let source = DispatchSource.makeTimerSource(queue: queue)
+        source.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(100))
+        source.setEventHandler(handler: handler)
+        source.resume()
+        timer = source
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
+    }
+}
+
 final class SecureStorageVault {
     enum Accessibility: String, CaseIterable {
         case whenUnlocked
@@ -185,8 +255,13 @@ final class SecureStorageVault {
 
     enum Outcome {
         case resolve([String: Any])
-        case reject(String)
+        case reject(String, code: String? = nil)
         case locked
+    }
+
+    struct Counters {
+        var parked = 0
+        var lostItems = 0
     }
 
     private enum KeyResult {
@@ -202,11 +277,23 @@ final class SecureStorageVault {
         case failed
     }
 
-    private struct PendingOperation {
+    private final class PendingOperation {
         let name: String
         let key: String
         let run: () -> Outcome
+        let lost: (() -> Outcome)?
         let complete: ((Outcome) -> Void)?
+        var wasParked = false
+        var confirmedLockedAttempts = 0
+        var lastCountedTick: Int?
+
+        init(name: String, key: String, run: @escaping () -> Outcome, lost: (() -> Outcome)?, complete: ((Outcome) -> Void)?) {
+            self.name = name
+            self.key = key
+            self.run = run
+            self.lost = lost
+            self.complete = complete
+        }
     }
 
     private typealias KeyCandidate = (tag: Data, secureEnclave: Bool)
@@ -216,6 +303,9 @@ final class SecureStorageVault {
     static let undecryptableItemMessage = "Item with given key could not be decrypted"
     static let unsupportedAccessibilityMessage = "Unsupported accessibility value"
     static let unsupportedConfigurationMessage = "Unsupported accessibility value in plugin configuration"
+    static let unreadableCode = "UNREADABLE"
+    /// Retries after the first locked result seen while protected data is available, at most one per timer tick.
+    static let lockedRetriesBeforeLost = 3
 
     let queue = DispatchQueue(label: "capacitor-secure-storage-plugin.vault")
     let configuration: Configuration
@@ -227,17 +317,35 @@ final class SecureStorageVault {
 
     private let keyTag: Data
     private let keyCandidates: [KeyCandidate]
-    private let isProtectedDataAvailable: () -> Bool
+    private let isProtectedDataAvailable: () -> Bool?
+    private let refreshSignals: () -> Void
+    private let unlockProbe: (() -> Bool)?
+    private let ticker: SecureStorageTicker
     private let algorithm = SecKeyAlgorithm.eciesEncryptionCofactorVariableIVX963SHA256AESGCM
     private let logger = Logger(subsystem: "capacitor-secure-storage-plugin", category: "vault")
     private var parkedOperations: [PendingOperation] = []
+    private var tickerRunning = false
+    private var tickCount = 0
+    /// Only read or written on `queue`.
+    private(set) var counters = Counters()
 
+    /// - Parameters:
+    ///   - isProtectedDataAvailable: cheap pre-check, `nil` while not known yet. Unknown counts as available and the keychain's
+    ///     own `errSecInteractionNotAllowed` decides.
+    ///   - refreshSignals: asks the owner to re-read the protected-data state. Called on timer ticks while calls are parked and
+    ///     the state is not known to be available, so a missed notification cannot strand the queue.
+    ///   - unlockProbe: confirms that the keychain accepts an unlock-bound write before a stuck item is classified as lost.
+    ///     `nil` uses a throwaway keychain item.
+    ///   - ticker: re-runs the parked queue while it is not empty.
     init(
         configuration: Configuration = Configuration(),
         dedicatedService: String = "cap_sec",
         standardService: String = Bundle.main.bundleIdentifier ?? "SwiftKeychainWrapper",
         keyTag: String = "capacitor-secure-storage-plugin.v1",
-        isProtectedDataAvailable: @escaping () -> Bool = { true }
+        isProtectedDataAvailable: @escaping () -> Bool? = { true },
+        refreshSignals: @escaping () -> Void = {},
+        unlockProbe: (() -> Bool)? = nil,
+        ticker: SecureStorageTicker = SecureStorageDispatchTicker()
     ) {
         self.configuration = configuration
         dedicated = SecureStorageItemStore(service: dedicatedService)
@@ -249,10 +357,20 @@ final class SecureStorageVault {
         keyCandidates = [(tag: Data(keyTag.utf8), secureEnclave: true)]
         #endif
         self.isProtectedDataAvailable = isProtectedDataAvailable
+        self.refreshSignals = refreshSignals
+        self.unlockProbe = unlockProbe
+        self.ticker = ticker
     }
 
-    func submitOperation(named name: String, key: String, run: @escaping () -> Outcome, completion: ((Outcome) -> Void)? = nil) {
-        let operation = PendingOperation(name: name, key: key, run: run, complete: completion)
+    deinit {
+        ticker.stop()
+    }
+
+    /// Queues an operation behind every parked one. A `.locked` outcome parks it until a later drain or timer tick.
+    /// `lost` replaces `run` once the operation keeps reporting a locked keychain while protected data is available
+    /// (`lockedRetriesBeforeLost`). Without `lost` such an operation rejects as missing with code `UNREADABLE`.
+    func submitOperation(named name: String, key: String, run: @escaping () -> Outcome, lost: (() -> Outcome)? = nil, completion: ((Outcome) -> Void)? = nil) {
+        let operation = PendingOperation(name: name, key: key, run: run, lost: lost, complete: completion)
         queue.async {
             self.parkedOperations.append(operation)
             self.runParkedOperations()
@@ -263,6 +381,25 @@ final class SecureStorageVault {
         queue.async {
             self.runParkedOperations()
         }
+    }
+
+    /// One timer tick. Runs on `queue`.
+    func tick() {
+        tickCount += 1
+        if isProtectedDataAvailable() != true {
+            refreshSignals()
+        }
+        runParkedOperations()
+    }
+
+    /// Only meaningful on `queue`.
+    var isTickerRunning: Bool {
+        return tickerRunning
+    }
+
+    /// Only meaningful on `queue`.
+    var parkedCount: Int {
+        return parkedOperations.count
     }
 
     func resolveAccessibility(_ requested: String?) -> Accessibility? {
@@ -291,6 +428,13 @@ final class SecureStorageVault {
         }
     }
 
+    /// `set` for an item the keychain keeps refusing while unlocked: drop every copy, then write a fresh one.
+    func replaceLostValue(_ value: String, forKey key: String, accessibility: Accessibility? = nil) -> Outcome {
+        _ = classifyStatus(dedicated.deleteItem(key), context: "delete lost \(key)")
+        _ = classifyStatus(standard.deleteItem(key), context: "delete lost standard \(key)")
+        return storeValue(value, forKey: key, accessibility: accessibility)
+    }
+
     func loadValue(forKey key: String) -> Outcome {
         let read = dedicated.readItem(key)
         switch classifyStatus(read.status, context: "read \(key)") {
@@ -305,6 +449,11 @@ final class SecureStorageVault {
         }
     }
 
+    /// `get` for an item the keychain keeps refusing while unlocked.
+    func lostValue(forKey key: String) -> Outcome {
+        return .reject(SecureStorageVault.missingItemMessage, code: SecureStorageVault.unreadableCode)
+    }
+
     func listStoredKeys() -> Outcome {
         let list = dedicated.listKeys()
         switch classifyStatus(list.status, context: "list") {
@@ -315,6 +464,11 @@ final class SecureStorageVault {
         case .failed:
             return .reject("error")
         }
+    }
+
+    /// `keys` while the keychain keeps refusing the listing although the device is unlocked.
+    func lostKeyList() -> Outcome {
+        return .resolve(["value": [String]()])
     }
 
     func removeValue(forKey key: String) -> Outcome {
@@ -344,6 +498,13 @@ final class SecureStorageVault {
         return removed ? .resolve(["value": true]) : .reject("Remove failed")
     }
 
+    /// `remove` for an item the keychain keeps refusing while unlocked. The app cannot read it any more, so it counts as removed.
+    func removeLostValue(forKey key: String) -> Outcome {
+        _ = classifyStatus(dedicated.deleteItem(key), context: "delete lost \(key)")
+        _ = classifyStatus(standard.deleteItem(key), context: "delete lost standard \(key)")
+        return .resolve(["value": true])
+    }
+
     func removeAllValues() -> Outcome {
         let list = dedicated.listKeys()
         if case .locked = classifyStatus(list.status, context: "list before clear") {
@@ -362,6 +523,12 @@ final class SecureStorageVault {
             }
         }
         return cleared ? .resolve(["value": true]) : .reject("error")
+    }
+
+    /// `clear` while the keychain keeps refusing it although the device is unlocked.
+    func removeAllLostValues() -> Outcome {
+        _ = classifyStatus(dedicated.deleteAll(), context: "clear lost")
+        return .resolve(["value": true])
     }
 
     func migrateLegacyValues() -> Outcome {
@@ -480,6 +647,33 @@ final class SecureStorageVault {
         return .decrypted(value)
     }
 
+    /// Writes and deletes a throwaway item with an unlock-bound class. Only an explicit `errSecInteractionNotAllowed` counts as
+    /// locked, any other result leaves the decision to the protected-data signal.
+    func confirmUnlocked() -> Bool {
+        if let probe = unlockProbe {
+            return probe()
+        }
+        let probe: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: dedicated.service + ".probe",
+            kSecAttrAccount as String: Data("unlock.\(UUID().uuidString)".utf8),
+            kSecAttrSynchronizable as String: false,
+        ]
+        let add = probe.merging([
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecValueData as String: Data(),
+        ]) { _, new in new }
+        let status = SecItemAdd(add as CFDictionary, nil)
+        if status == errSecSuccess {
+            SecItemDelete(probe as CFDictionary)
+        }
+        if status == errSecInteractionNotAllowed {
+            logger.notice("unlock probe locked")
+            return false
+        }
+        return true
+    }
+
     private func resolveMigrationAccessibility(_ existing: String?) -> Accessibility {
         guard let current = existing.flatMap(Accessibility.init(attribute:)) else { return configuration.accessibility }
         return current.tightened(toAtLeast: configuration.accessibility)
@@ -487,29 +681,67 @@ final class SecureStorageVault {
 
     private func runParkedOperations() {
         let operations = parkedOperations
+        var remaining: [PendingOperation] = []
         for (index, operation) in operations.enumerated() {
             guard executeOperation(operation) else {
-                parkedOperations = Array(operations[index...])
-                return
+                remaining = Array(operations[index...])
+                break
             }
         }
-        parkedOperations = []
+        parkedOperations = remaining
+        updateTicker()
+    }
+
+    private func updateTicker() {
+        if parkedOperations.isEmpty {
+            guard tickerRunning else { return }
+            ticker.stop()
+            tickerRunning = false
+        } else {
+            guard !tickerRunning else { return }
+            tickerRunning = true
+            ticker.start(on: queue) { [weak self] in self?.tick() }
+        }
     }
 
     private func executeOperation(_ operation: PendingOperation) -> Bool {
-        let gated = configuration.accessibility.requiresUnlock && !isProtectedDataAvailable()
-        let outcome = gated ? .locked : operation.run()
+        let gated = configuration.accessibility.requiresUnlock && isProtectedDataAvailable() == false
+        var outcome = gated ? .locked : operation.run()
+        if !gated, case .locked = outcome, isProtectedDataAvailable() == true, countLockedWhileUnlocked(operation) {
+            counters.lostItems += 1
+            logger.fault("lost \(operation.name, privacy: .public) \(operation.key, privacy: .public) after \(operation.confirmedLockedAttempts, privacy: .public) locked results while unlocked")
+            outcome = operation.lost?() ?? .reject(SecureStorageVault.missingItemMessage, code: SecureStorageVault.unreadableCode)
+            if case .locked = outcome {
+                outcome = .reject("error")
+            }
+        }
         switch outcome {
         case .locked:
+            if !operation.wasParked {
+                operation.wasParked = true
+                counters.parked += 1
+            }
             logger.notice("parked \(operation.name, privacy: .public) \(operation.key, privacy: .public)")
             return false
-        case .reject(let message) where message != SecureStorageVault.missingItemMessage:
+        case .reject(let message, _) where message != SecureStorageVault.missingItemMessage:
             logger.notice("rejected \(operation.name, privacy: .public) \(operation.key, privacy: .public): \(message, privacy: .public)")
         case .reject, .resolve:
             break
         }
         operation.complete?(outcome)
         return true
+    }
+
+    /// Counts a locked result seen while protected data is known to be available, at most once per timer tick and only when
+    /// the unlock probe agrees, so a stale signal never turns a locked device into lost items. True once the retries are used up.
+    private func countLockedWhileUnlocked(_ operation: PendingOperation) -> Bool {
+        if let last = operation.lastCountedTick, last == tickCount {
+            return false
+        }
+        guard confirmUnlocked() else { return false }
+        operation.lastCountedTick = tickCount
+        operation.confirmedLockedAttempts += 1
+        return operation.confirmedLockedAttempts > SecureStorageVault.lockedRetriesBeforeLost
     }
 
     private func resolveStoredValue(_ data: Data, forKey key: String) -> Outcome {
@@ -620,7 +852,7 @@ final class SecureStorageVault {
 
     private func isLockedFailure(_ error: Unmanaged<CFError>?, context: String) -> Bool {
         let code = extractCode(from: error)
-        if code == Int(errSecInteractionNotAllowed) || !isProtectedDataAvailable() {
+        if code == Int(errSecInteractionNotAllowed) || isProtectedDataAvailable() == false {
             logger.notice("\(context, privacy: .public) locked \(code, privacy: .public)")
             return true
         }

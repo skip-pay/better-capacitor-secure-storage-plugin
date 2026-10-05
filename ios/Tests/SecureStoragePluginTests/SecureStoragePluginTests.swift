@@ -137,7 +137,7 @@ final class SecureStorageGateTests: XCTestCase {
     private func describe(_ outcome: SecureStorageVault.Outcome) -> String {
         switch outcome {
         case .resolve(let data): return "resolve \(data["value"].map { "\($0)" } ?? "-")"
-        case .reject(let message): return "reject \(message)"
+        case .reject(let message, _): return "reject \(message)"
         case .locked: return "locked"
         }
     }

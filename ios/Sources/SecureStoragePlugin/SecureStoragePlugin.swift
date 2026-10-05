@@ -15,14 +15,19 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "getPlatform", returnType: CAPPluginReturnPromise),
     ]
     private var vault: SecureStorageVault?
+    private let signals = SecureStorageSignals()
 
     override public func load() {
         guard let configuration = readConfiguration() else { return }
-        let vault = SecureStorageVault(configuration: configuration, isProtectedDataAvailable: {
-            DispatchQueue.main.sync { UIApplication.shared.isProtectedDataAvailable }
-        })
+        let signals = self.signals
+        let vault = SecureStorageVault(
+            configuration: configuration,
+            isProtectedDataAvailable: { signals.isProtectedDataAvailable },
+            refreshSignals: { [weak self] in self?.refreshSignals() }
+        )
         self.vault = vault
-        observeWakeEvents()
+        observeSignals()
+        refreshSignals()
         vault.submitOperation(named: "sweep", key: "*", run: { vault.migrateLegacyValues() })
     }
 
@@ -34,29 +39,33 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
             call.reject(SecureStorageVault.unsupportedAccessibilityMessage)
             return
         }
-        submitCall(call, to: vault, named: "set", key: key) { vault in vault.storeValue(value, forKey: key, accessibility: accessibility) }
+        submitCall(call, to: vault, named: "set", key: key, run: { vault in
+            vault.storeValue(value, forKey: key, accessibility: accessibility)
+        }, lost: { vault in
+            vault.replaceLostValue(value, forKey: key, accessibility: accessibility)
+        })
     }
 
     @objc func get(_ call: CAPPluginCall) {
         guard let vault = requireVault(for: call) else { return }
         let key = call.getString("key") ?? ""
-        submitCall(call, to: vault, named: "get", key: key) { vault in vault.loadValue(forKey: key) }
+        submitCall(call, to: vault, named: "get", key: key, run: { vault in vault.loadValue(forKey: key) }, lost: { vault in vault.lostValue(forKey: key) })
     }
 
     @objc func keys(_ call: CAPPluginCall) {
         guard let vault = requireVault(for: call) else { return }
-        submitCall(call, to: vault, named: "keys", key: "*") { vault in vault.listStoredKeys() }
+        submitCall(call, to: vault, named: "keys", key: "*", run: { vault in vault.listStoredKeys() }, lost: { vault in vault.lostKeyList() })
     }
 
     @objc func remove(_ call: CAPPluginCall) {
         guard let vault = requireVault(for: call) else { return }
         let key = call.getString("key") ?? ""
-        submitCall(call, to: vault, named: "remove", key: key) { vault in vault.removeValue(forKey: key) }
+        submitCall(call, to: vault, named: "remove", key: key, run: { vault in vault.removeValue(forKey: key) }, lost: { vault in vault.removeLostValue(forKey: key) })
     }
 
     @objc func clear(_ call: CAPPluginCall) {
         guard let vault = requireVault(for: call) else { return }
-        submitCall(call, to: vault, named: "clear", key: "*") { vault in vault.removeAllValues() }
+        submitCall(call, to: vault, named: "clear", key: "*", run: { vault in vault.removeAllValues() }, lost: { vault in vault.removeAllLostValues() })
     }
 
     @objc func getPlatform(_ call: CAPPluginCall) {
@@ -81,27 +90,59 @@ public class SecureStoragePlugin: CAPPlugin, CAPBridgedPlugin {
         return vault
     }
 
-    private func submitCall(_ call: CAPPluginCall, to vault: SecureStorageVault, named name: String, key: String, run: @escaping (SecureStorageVault) -> SecureStorageVault.Outcome) {
-        vault.submitOperation(named: name, key: key, run: { run(vault) }, completion: { outcome in
+    private func submitCall(
+        _ call: CAPPluginCall,
+        to vault: SecureStorageVault,
+        named name: String,
+        key: String,
+        run: @escaping (SecureStorageVault) -> SecureStorageVault.Outcome,
+        lost: @escaping (SecureStorageVault) -> SecureStorageVault.Outcome
+    ) {
+        vault.submitOperation(named: name, key: key, run: { run(vault) }, lost: { lost(vault) }, completion: { outcome in
             switch outcome {
             case .resolve(let data):
                 call.resolve(data)
-            case .reject(let message):
-                call.reject(message)
+            case .reject(let message, let code):
+                call.reject(message, code)
             case .locked:
                 break
             }
         })
     }
 
-    private func observeWakeEvents() {
+    private func observeSignals() {
         let center = NotificationCenter.default
-        center.addObserver(self, selector: #selector(resumeParkedOperations), name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
-        center.addObserver(self, selector: #selector(resumeParkedOperations), name: UIApplication.willEnterForegroundNotification, object: nil)
-        center.addObserver(self, selector: #selector(resumeParkedOperations), name: UIApplication.didBecomeActiveNotification, object: nil)
+        center.addObserver(self, selector: #selector(protectedDataWillBecomeUnavailable), name: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil)
+        center.addObserver(self, selector: #selector(protectedDataDidBecomeAvailable), name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
+        center.addObserver(self, selector: #selector(applicationStateChanged), name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(applicationStateChanged), name: UIApplication.didBecomeActiveNotification, object: nil)
+        center.addObserver(self, selector: #selector(applicationStateChanged), name: UIApplication.didEnterBackgroundNotification, object: nil)
     }
 
-    @objc private func resumeParkedOperations() {
+    /// Reads the UIKit state on the main thread without blocking the caller, then retries the parked calls.
+    private func refreshSignals() {
+        DispatchQueue.main.async { [weak self] in
+            self?.readSignals()
+        }
+    }
+
+    private func readSignals() {
+        let application = UIApplication.shared
+        signals.setProtectedDataAvailable(application.isProtectedDataAvailable)
+        signals.setApplicationActive(application.applicationState == .active)
         vault?.drainParkedOperations()
+    }
+
+    @objc private func protectedDataWillBecomeUnavailable() {
+        signals.setProtectedDataAvailable(false)
+    }
+
+    @objc private func protectedDataDidBecomeAvailable() {
+        signals.setProtectedDataAvailable(true)
+        vault?.drainParkedOperations()
+    }
+
+    @objc private func applicationStateChanged() {
+        readSignals()
     }
 }
