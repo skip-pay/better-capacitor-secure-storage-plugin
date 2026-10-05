@@ -795,6 +795,72 @@ final class SecureStorageDecryptTests: XCTestCase {
     }
 }
 
+final class SecureStorageEncryptionCheckTests: XCTestCase {
+    private func encodeResult(_ vault: SecureStorageVault, _ value: String = "1234") -> String {
+        return vault.queue.sync {
+            switch vault.encodeValue(value) {
+            case .encoded(let data): return vault.isEncodedValue(data) ? "encoded" : "plaintext"
+            case .locked: return "locked"
+            case .failure: return "failure"
+            }
+        }
+    }
+
+    func testCiphertextThatDecryptsIsReturned() {
+        let vault = makeVault()
+        let key = makeSoftwareKey()
+        _ = stubKeyLookup(vault, key: key)
+        let calls = stubDecryption(vault, failures: [])
+        let encoded = vault.queue.sync { () -> Data? in
+            if case .encoded(let data) = vault.encodeValue("1234") { return data }
+            return nil
+        }
+        XCTAssertEqual(calls.read(), 1, "decrypted once in memory before it is returned")
+        XCTAssertEqual(encoded.map { data in vault.queue.sync { describe(vault.decodeValue(data)) } }, "decrypted(1234)")
+    }
+
+    func testCiphertextThatDoesNotDecryptIsAFailure() {
+        for code in [errSecParam, errSecDecode, errSecInternalError] {
+            let vault = makeVault()
+            _ = stubKeyLookup(vault, key: makeSoftwareKey())
+            _ = stubDecryption(vault, failures: [code], repeatLast: true)
+            XCTAssertEqual(encodeResult(vault), "failure", "\(code)")
+        }
+    }
+
+    func testCiphertextThatDecryptsToOtherBytesIsAFailure() {
+        let vault = makeVault()
+        _ = stubKeyLookup(vault, key: makeSoftwareKey())
+        vault.queue.sync {
+            vault.decryptCiphertext = { _, _, _, _ in Data("5678".utf8) as CFData }
+        }
+        XCTAssertEqual(encodeResult(vault), "failure")
+    }
+
+    func testCheckThatFailsBecauseLockedParks() {
+        let cases: [(String, () -> Bool?, () -> Bool, OSStatus)] = [
+            ("errSecInteractionNotAllowed", { true }, { true }, errSecInteractionNotAllowed),
+            ("protected data unavailable", { false }, { true }, errSecParam),
+            ("probe says locked", { true }, { false }, errSecParam),
+        ]
+        for (name, protectedData, probe, code) in cases {
+            let vault = makeVault(.afterFirstUnlock, protectedData: protectedData, probe: probe)
+            _ = stubKeyLookup(vault, key: makeSoftwareKey())
+            _ = stubDecryption(vault, failures: [code], repeatLast: true)
+            XCTAssertEqual(encodeResult(vault), "locked", name)
+        }
+    }
+
+    func testTransientCheckFailureIsRetried() {
+        let vault = makeVault()
+        _ = stubKeyLookup(vault, key: makeSoftwareKey())
+        let calls = stubDecryption(vault, failures: [errSecInternalError])
+        XCTAssertEqual(encodeResult(vault), "encoded")
+        XCTAssertEqual(calls.read(), 2)
+        XCTAssertEqual(vault.queue.sync { vault.counters.decryptRetries }, 1)
+    }
+}
+
 final class SecureStorageUnusableKeyTests: XCTestCase {
     /// A `set` reduced to its encoding: an encrypted value, the plaintext fallback, or parked.
     private func submitEncodingSet(_ vault: SecureStorageVault, log: EventLog) {

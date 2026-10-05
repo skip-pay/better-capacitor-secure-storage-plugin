@@ -1086,6 +1086,43 @@ zombieReader.queue.sync {
     check("34 a process whose key works again still decrypts the kept ciphertext", describe(zombieReader.loadValue(forKey: "zk1")) == "resolve __secured_z1")
 }
 
+print("--- 35 ciphertext is checked before it is written")
+cleanAll()
+/// The real decryption for the first `successes` calls, `errSecParam` afterwards.
+func decryptionFailing(after successes: Int) -> (SecKey, SecKeyAlgorithm, CFData, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFData? {
+    var calls = 0
+    return { key, algorithm, ciphertext, error in
+        calls += 1
+        guard calls > successes else { return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error) }
+        error?.pointee = osStatusError(errSecParam)
+        return nil
+    }
+}
+let checkTags = tags("harness.35")
+let checkVault = makeVault(keyTag: checkTags.name)
+checkVault.queue.sync {
+    checkVault.decryptRetryDelays = [0, 0]
+    checkVault.decryptCiphertext = decryptionFailing(after: 0)
+    let fallbacksBefore = checkVault.counters.plaintextFallbacks
+    check("35 a set whose ciphertext does not decrypt stores plaintext with the strict class", describe(checkVault.storeValue("__secured_c0", forKey: "c0")) == "resolve true" && storedData("c0") == [Data("__secured_c0".utf8)] && accessible("c0") == ["aku"] && checkVault.counters.plaintextFallbacks - fallbacksBefore == 1, "\(accessible("c0"))")
+    check("35 seed legacy plaintext in the shared group", legacy.set("__secured_c1", forKey: "c1", withAccessibility: .afterFirstUnlock))
+    check("35 get of a legacy value whose new ciphertext does not decrypt returns the value", describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1")
+    check("35 that migration fell back to plaintext with the strict class and the value still reads back", storedData("c1") == [Data("__secured_c1".utf8)] && accessible("c1") == ["aku"] && groups("c1") == [appIdGroup] && describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1", "\(accessible("c1")) \(groups("c1"))")
+
+    // The check in memory passes, the read-back after the write does not: the write is undone.
+    check("35 seed legacy plaintext in the app-ID group", legacyAppGroup.set("__secured_c2", forKey: "c2", withAccessibility: .afterFirstUnlock))
+    checkVault.decryptCiphertext = decryptionFailing(after: 1)
+    check("35 get returns the legacy value although the rewritten copy does not verify", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2")
+    check("35 an update that does not verify is put back: plaintext, ck, unmarked, app-ID group", storedData("c2") == [Data("__secured_c2".utf8)] && accessible("c2") == ["ck"] && marked("c2") == [false] && groups("c2") == [appIdGroup], "\(accessible("c2")) \(marked("c2"))")
+    check("35 seed legacy plaintext in the shared group for an add", legacy.set("__secured_c3", forKey: "c3", withAccessibility: .afterFirstUnlock))
+    checkVault.decryptCiphertext = decryptionFailing(after: 1)
+    check("35 get returns the legacy value although the added copy does not verify", describe(checkVault.loadValue(forKey: "c3")) == "resolve __secured_c3")
+    check("35 an add that does not verify is deleted again and the legacy copy stays as it was", groups("c3") == [sharedGroup] && storedData("c3") == [Data("__secured_c3".utf8)] && accessible("c3") == ["ck"], "\(groups("c3"))")
+    checkVault.decryptCiphertext = SecKeyCreateDecryptedData
+    check("35 once decryption works the sweep migrates them", describe(checkVault.migrateLegacyValues()) == "resolve -" && encrypted("c2") && encrypted("c3") && groups("c3") == [appIdGroup] && accessible("c2") == ["aku"] && accessible("c3") == ["aku"])
+    check("35 the values read back", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2" && describe(checkVault.loadValue(forKey: "c3")) == "resolve __secured_c3")
+}
+
 cleanAll()
 check("cleanup items", items().isEmpty && allKeyCount() == 0)
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")

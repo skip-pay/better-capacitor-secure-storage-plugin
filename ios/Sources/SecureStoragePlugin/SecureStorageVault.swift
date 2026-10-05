@@ -9,8 +9,11 @@ struct SecureStorageItemStore {
         let accessibility: String?
         let modified: Date?
         let persistentRef: Data?
+        let label: String?
         /// Written by this plugin version, so its class was chosen by a `set` and a migration keeps it.
-        let isMarked: Bool
+        var isMarked: Bool {
+            return label == SecureStorageItemStore.marker
+        }
     }
 
     /// Label on every item this version writes. Not part of any query, so the 0.13.0 query shape still finds the items.
@@ -49,10 +52,30 @@ struct SecureStorageItemStore {
                 accessibility: attributes[kSecAttrAccessible as String] as? String,
                 modified: attributes[kSecAttrModificationDate as String] as? Date,
                 persistentRef: attributes[kSecValuePersistentRef as String] as? Data,
-                isMarked: attributes[kSecAttrLabel as String] as? String == SecureStorageItemStore.marker
+                label: attributes[kSecAttrLabel as String] as? String
             )
         }
         return (status, copies)
+    }
+
+    /// Reads the data of one copy, by its group.
+    func readCopy(_ copy: Copy, of key: String) -> (status: OSStatus, data: Data) {
+        guard let group = copy.accessGroup else { return (errSecParam, Data()) }
+        let read = readItem(key, accessGroup: group)
+        return (read.status, read.data)
+    }
+
+    /// Puts back what the copy in `accessGroup` held before a write that did not verify: data, class and label.
+    func restoreItem(_ key: String, data: Data, accessibility: String?, label: String?, accessGroup: String) -> OSStatus {
+        var attributes: [String: Any] = [
+            kSecValueData as String: data,
+            // There is no way to drop an attribute, an empty label is not the marker either.
+            kSecAttrLabel as String: label ?? "",
+        ]
+        if let accessibility = accessibility {
+            attributes[kSecAttrAccessible as String] = accessibility
+        }
+        return SecItemUpdate(makeItemQuery(key, accessGroup: accessGroup) as CFDictionary, attributes as CFDictionary)
     }
 
     /// Updates the item in `accessGroup` (every copy when `nil`) and adds it there when it does not exist yet.
@@ -388,14 +411,17 @@ final class SecureStorageVault {
 
     private enum DecryptResult {
         case plaintext(Data)
+        /// The device is locked or not confirmed to be unlocked.
         case locked
-        case invalid
+        /// Still failing after the retries on a device confirmed to be unlocked, or the key lookup failed.
+        case failed(DecryptFailure)
         case unusable
     }
 
     /// Why the last decryption attempt failed.
     private enum DecryptFailure {
         case missingKey
+        case lookupFailed
         case code(Int)
     }
 
@@ -898,7 +924,18 @@ final class SecureStorageVault {
         guard let ciphertext = SecKeyCreateEncryptedData(publicKey, algorithm, plaintext as CFData, &error) as Data? else {
             return isLockedFailure(error, context: "encrypt") ? .locked : .failure
         }
-        return .encoded(SecureStorageVault.magic + ciphertext)
+        // Ciphertext the key cannot open again would replace a readable value, so it is opened once before anyone writes it.
+        switch decrypt(ciphertext, context: "encryption check") {
+        case .plaintext(let decrypted) where decrypted == plaintext:
+            return .encoded(SecureStorageVault.magic + ciphertext)
+        case .plaintext:
+            logger.fault("encryption check returned other bytes")
+            return .failure
+        case .locked:
+            return .locked
+        case .failed, .unusable:
+            return .failure
+        }
     }
 
     func decodeValue(_ data: Data) -> DecodeResult {
@@ -913,19 +950,24 @@ final class SecureStorageVault {
         case .plaintext(let plaintext):
             guard let value = String(data: plaintext, encoding: .utf8) else { return .invalid }
             return .decrypted(value)
-        case .locked:
+        case .locked, .failed(.lookupFailed):
             return .locked
-        case .invalid, .unusable:
+        case .failed(.missingKey), .unusable:
+            return .invalid
+        case .failed(.code(let code)):
+            // Only a wrong key or corrupt ciphertext is final. Anything else parks and the tick-bounded lost escape decides.
+            guard code == Int(errSecParam) || code == Int(errSecDecode) else {
+                logger.error("decrypt failure \(code, privacy: .public) is not known to be permanent, parked")
+                return .locked
+            }
             return .invalid
         }
     }
 
     /// Decrypts with the key under the tag and never creates one, a new key cannot open old ciphertext. A decryption that
     /// fails while the device is known to be unlocked drops the cached key, looks the key up again and retries after each of
-    /// `decryptRetryDelays`. What still fails is `.invalid` only for a wrong key or corrupt ciphertext (`errSecParam`,
-    /// `errSecDecode`) or a key that does not exist, and only when the unlock probe agrees. Any other failure, a key lookup
-    /// that fails included, is `.locked`: the call parks and the tick-bounded lost escape ends it if it never recovers.
-    /// A -25308 counts towards `noteKeyRefusal` like one from the key lookup.
+    /// `decryptRetryDelays`. `.failed` is what still fails afterwards while the unlock probe confirms an unlocked device,
+    /// or a key lookup that failed. A -25308 counts towards `noteKeyRefusal` like one from the key lookup.
     private func decrypt(_ ciphertext: Data, context: String) -> DecryptResult {
         var failure = DecryptFailure.missingKey
         for attempt in 0...decryptRetryDelays.count {
@@ -939,13 +981,15 @@ final class SecureStorageVault {
             case .key(let acquired):
                 key = acquired
             case .missing where attempt == 0:
-                return isLockedFailure(code: Int(errSecItemNotFound), context: "\(context) without key") ? .locked : .invalid
+                return isLockedFailure(code: Int(errSecItemNotFound), context: "\(context) without key") ? .locked : .failed(.missingKey)
             case .missing:
                 // The key was there a moment ago, give the lookup the remaining attempts.
                 failure = .missingKey
                 continue
-            case .locked, .failure:
+            case .locked:
                 return .locked
+            case .failure:
+                return .failed(.lookupFailed)
             case .unusable:
                 return .unusable
             }
@@ -969,19 +1013,16 @@ final class SecureStorageVault {
             logger.notice("\(context, privacy: .public) attempt \(attempt + 1, privacy: .public) failed \(code, privacy: .public)")
             failure = .code(code)
         }
+        let code: Int
         switch failure {
         case .missingKey:
-            return isLockedFailure(code: Int(errSecItemNotFound), context: "\(context) without key") ? .locked : .invalid
-        case .code(let code):
-            if isLockedFailure(code: code, context: context) {
-                return .locked
-            }
-            guard code == Int(errSecParam) || code == Int(errSecDecode) else {
-                logger.error("\(context, privacy: .public) failure \(code, privacy: .public) is not known to be permanent, parked")
-                return .locked
-            }
-            return .invalid
+            code = Int(errSecItemNotFound)
+        case .lookupFailed:
+            return .failed(failure)
+        case .code(let failed):
+            code = failed
         }
+        return isLockedFailure(code: code, context: context) ? .locked : .failed(failure)
     }
 
     /// Writes and deletes a throwaway item with an unlock-bound class. Only an explicit `errSecInteractionNotAllowed` counts as
@@ -1101,22 +1142,46 @@ final class SecureStorageVault {
         guard needsWrite || !others.isEmpty else { return }
         var added = 0
         if needsWrite {
-            let hasTargetCopy = sources.contains(where: isTargetCopy)
-            var status = hasTargetCopy
-                ? dedicated.updateItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: targetGroup)
-                : dedicated.addItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: targetGroup)
-            if status == errSecDuplicateItem {
-                status = dedicated.updateItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: targetGroup)
-            } else if status == errSecSuccess && !hasTargetCopy {
-                added = 1
+            let target = sources.first(where: isTargetCopy)
+            // What the target copy holds now, so a write that does not verify can be put back.
+            var original: (data: Data, accessibility: String?, label: String?, group: String)?
+            let status: OSStatus
+            if let target = target {
+                guard let group = target.copy.accessGroup else { return }
+                if !chosen.isLegacyService && chosen.copy.accessGroup == group {
+                    original = (data, chosen.copy.accessibility, chosen.copy.label, group)
+                } else {
+                    let read = dedicated.readCopy(target.copy, of: key)
+                    guard case .ok = classifyStatus(read.status, context: "read target copy of \(key)") else { return }
+                    original = (read.data, target.copy.accessibility, target.copy.label, group)
+                }
+                status = dedicated.updateItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: group)
+            } else {
+                status = dedicated.addItem(key, data: targetData, accessibility: targetClass.attribute, accessGroup: targetGroup)
+                if status == errSecDuplicateItem {
+                    // A copy the listing did not return sits in the target group. It is not overwritten, because nothing could
+                    // put it back, and the next run lists the copies again.
+                    logger.notice("migration of \(key, privacy: .public) postponed, unlisted copy in the target group")
+                    return
+                }
+                if status == errSecSuccess {
+                    added = 1
+                }
             }
             if mode.isExplicit, status == errSecMissingEntitlement || status == errSecParam {
                 _ = fallBackToDefaultGroup(mode.defaultGroup, reason: "migration write \(status)")
                 return
             }
             guard case .ok = classifyStatus(status, context: "migration write \(key)") else { return }
-            guard verify(key, value: value, in: targetGroup) else {
-                logger.fault("migration of \(key, privacy: .public) not verified, other copies kept")
+            guard verify(key, value: value, in: original?.group ?? targetGroup) else {
+                // Put the copies back as they were: the old data, class and label of the target copy, or delete the added copy
+                // so the copy that was read stays the newest.
+                if let original = original {
+                    _ = classifyStatus(dedicated.restoreItem(key, data: original.data, accessibility: original.accessibility, label: original.label, accessGroup: original.group), context: "restore \(key) after an unverified migration")
+                } else {
+                    removeAddedCopies(of: key, besides: sources)
+                }
+                logger.fault("migration of \(key, privacy: .public) not verified, write undone, other copies kept")
                 return
             }
             counters.migrated += 1
@@ -1133,6 +1198,17 @@ final class SecureStorageVault {
         }
         counters.duplicatesResolved += max(0, deleted - added)
         logger.notice("settled \(key, privacy: .public) wrote \(needsWrite, privacy: .public) removed \(deleted, privacy: .public)")
+    }
+
+    /// Deletes the `cap_sec` copies of a key that are not among `sources`, the ones a migration write just added.
+    private func removeAddedCopies(of key: String, besides sources: [Source]) {
+        let known = Set(sources.filter { !$0.isLegacyService }.compactMap { $0.copy.persistentRef })
+        let found = dedicated.copies(of: key)
+        guard case .ok = classifyStatus(found.status, context: "find added copy of \(key)") else { return }
+        for copy in found.copies {
+            guard let reference = copy.persistentRef, !known.contains(reference) else { continue }
+            _ = classifyStatus(dedicated.deleteCopy(copy, of: key), context: "delete added copy of \(key)")
+        }
     }
 
     private func verify(_ key: String, value: String, in group: String?) -> Bool {
