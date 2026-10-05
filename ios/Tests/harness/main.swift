@@ -1104,8 +1104,36 @@ parkVault.queue.sync {}
 parkTicker.fire(times: 2)
 check("33 a get that keeps failing waits through the tick retries", parkLog.events.isEmpty, "\(parkLog.events)")
 parkTicker.fire()
-check("33 then rejects as missing UNREADABLE through the lost escape", parkLog.events == ["get reject Item with given key does not exist UNREADABLE"] && counter(diagnostics(parkVault), "lostItems") == 1, "\(parkLog.events)")
+check("33 then rejects as missing UNREADABLE, the key failing everywhere is unusable for the process", parkLog.events == ["get reject Item with given key does not exist UNREADABLE"] && counter(diagnostics(parkVault), "lostItems") == 0 && diagnostics(parkVault)["keyBackend"] as? String == "unusable", "\(parkLog.events) \(diagnostics(parkVault))")
 check("33 the item is untouched", items(account: "r1").count == 1 && encrypted("r1"))
+parkVault.submitOperation(named: "get", key: "r1", run: { parkVault.loadValue(forKey: "r1") }, lost: { parkVault.lostValue(forKey: "r1") }, completion: { parkLog.record("get \(describe($0)) \(code($0))") })
+parkVault.queue.sync {}
+check("33 the next get rejects at once", parkLog.events.count == 2 && parkLog.events.last == "get reject Item with given key does not exist UNREADABLE", "\(parkLog.events)")
+parkVault.queue.sync {
+    check("33 a set stores plaintext with the strict class", describe(parkVault.storeValue("__secured_r2", forKey: "r2")) == "resolve true" && storedData("r2") == [Data("__secured_r2".utf8)] && accessible("r2") == ["aku"], "\(accessible("r2"))")
+}
+check("33 the key is kept", keyCount(retryTags.secureEnclave) + keyCount(retryTags.software) == 1)
+// A failure that only this ciphertext shows: the key still opens fresh ciphertext, so only this call ends, as lost.
+let brokenCiphertext = storedData("r1").first.map { Data($0.dropFirst(magic.count)) }
+let itemTicker = HarnessTicker()
+let itemVault = SecureStorageVault(keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: itemTicker)
+let itemLog = EventLog()
+itemVault.queue.sync {
+    itemVault.decryptRetryDelays = [0, 0]
+    itemVault.decryptCiphertext = { key, algorithm, ciphertext, error in
+        guard (ciphertext as Data) != brokenCiphertext else {
+            error?.pointee = osStatusError(errSecInternalError)
+            return nil
+        }
+        return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
+    }
+    check("33 seed a second encrypted value", describe(itemVault.storeValue("__secured_r3", forKey: "r3")) == "resolve true" && encrypted("r3"))
+}
+itemVault.submitOperation(named: "get", key: "r1", run: { itemVault.loadValue(forKey: "r1") }, lost: { itemVault.lostValue(forKey: "r1") }, completion: { itemLog.record("get \(describe($0)) \(code($0))") })
+itemVault.queue.sync {}
+itemTicker.fire(times: 3)
+check("33 a failure of one ciphertext rejects that get through the lost escape", itemLog.events == ["get reject Item with given key does not exist UNREADABLE"] && counter(diagnostics(itemVault), "lostItems") == 1, "\(itemLog.events) \(diagnostics(itemVault))")
+check("33 and keeps the key usable for the other items", diagnostics(itemVault)["keyBackend"] as? String != "unusable" && itemVault.queue.sync { describe(itemVault.loadValue(forKey: "r3")) } == "resolve __secured_r3", "\(diagnostics(itemVault))")
 
 print("--- 34 a key that keeps refusing with -25308 while unlocked (Quick Start zombie)")
 cleanAll()
