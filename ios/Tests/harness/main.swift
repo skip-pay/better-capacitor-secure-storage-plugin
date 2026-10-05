@@ -74,7 +74,7 @@ func encrypted(_ account: String, in itemService: String = service) -> Bool {
 }
 
 /// Adds an item with the SwiftKeychainWrapper shape directly, optionally in a given group.
-func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFString = kSecAttrAccessibleAfterFirstUnlock, in itemService: String = service) -> OSStatus {
+func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFString = kSecAttrAccessibleAfterFirstUnlock, in itemService: String = service, label: String? = nil) -> OSStatus {
     let encoded = Data(account.utf8)
     var query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
@@ -86,6 +86,7 @@ func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFSt
         kSecValueData as String: data,
     ]
     if let group = group { query[kSecAttrAccessGroup as String] = group }
+    if let label = label { query[kSecAttrLabel as String] = label }
     return SecItemAdd(query as CFDictionary, nil)
 }
 
@@ -178,7 +179,21 @@ func describe(_ result: SecureStorageVault.DecodeResult) -> String {
     case .decrypted(let s): return "decrypted(\(s))"
     case .locked: return "locked"
     case .invalid: return "invalid"
-    case .failure: return "failure"
+    }
+}
+
+func osStatusError(_ code: OSStatus) -> Unmanaged<CFError> {
+    return Unmanaged.passRetained(CFErrorCreate(nil, kCFErrorDomainOSStatus, CFIndex(code), nil)!)
+}
+
+/// Wraps the real decryption and records the code of every failure.
+func recordingDecryption(_ codes: @escaping (Int) -> Void) -> (SecKey, SecKeyAlgorithm, CFData, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFData? {
+    return { key, algorithm, ciphertext, error in
+        let result = SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
+        if result == nil, let failure = error?.pointee {
+            codes(CFErrorGetCode(failure.takeUnretainedValue()))
+        }
+        return result
     }
 }
 
@@ -346,7 +361,12 @@ vault.queue.sync {
     print("--- 5 invalid ciphertext")
     let garbage = magic + Data((0..<80).map { UInt8(truncatingIfNeeded: $0 &* 37) })
     check("5 write garbage", write(vault, "bad", garbage) == errSecSuccess)
+    var garbageCodes: [Int] = []
+    vault.decryptCiphertext = recordingDecryption { garbageCodes.append($0) }
+    let retriesBefore = vault.counters.decryptRetries
     check("5 decodeValue invalid (not locked)", describe(vault.decodeValue(garbage)) == "invalid")
+    check("5 garbage fails with errSecParam or errSecDecode on each of three attempts", garbageCodes.count == 3 && garbageCodes.allSatisfy { $0 == Int(errSecParam) || $0 == Int(errSecDecode) } && vault.counters.decryptRetries - retriesBefore == 2, "\(garbageCodes)")
+    vault.decryptCiphertext = SecKeyCreateDecryptedData
     let badRead = vault.loadValue(forKey: "bad")
     check("5 loadValue reports undecryptable as missing with code UNREADABLE", describe(badRead) == "reject Item with given key does not exist" && code(badRead) == "UNREADABLE", "\(describe(badRead)) \(code(badRead))")
     check("5 item still exists", items(account: "bad").count == 1)
@@ -722,31 +742,39 @@ check("22a seed stale copy in the app-ID group (written before the entitlement c
 Thread.sleep(forTimeInterval: 0.05)
 check("22a seed newer copy in the shared group (first add after the change)", legacy.set("__secured_new", forKey: "d1", withAccessibility: .afterFirstUnlock))
 check("22a two copies", groups("d1") == [appIdGroup, sharedGroup], "\(groups("d1"))")
+// What 0.13.0 returned: SwiftKeychainWrapper without a group, limit one, read before the vault touches the key.
+let upstreamD1 = legacy.string(forKey: "d1") ?? "nil"
 dupVault.queue.sync {
-    check("22a get returns the newer shared copy, not the stale app-ID one", describe(dupVault.loadValue(forKey: "d1")) == "resolve __secured_new")
+    check("22a get returns the copy upstream 0.13.0 read, not the newest one", describe(dupVault.loadValue(forKey: "d1")) == "resolve \(upstreamD1)", upstreamD1)
     check("22a one copy left: app-ID group, encrypted, aku, marked", groups("d1") == [appIdGroup] && encrypted("d1") && accessible("d1") == ["aku"] && marked("d1") == [true], "\(groups("d1")) \(accessible("d1"))")
-    check("22a next get returns the same value", describe(dupVault.loadValue(forKey: "d1")) == "resolve __secured_new")
+    check("22a next get returns the same value", describe(dupVault.loadValue(forKey: "d1")) == "resolve \(upstreamD1)")
 }
 check("22b seed older copy in the shared group", legacy.set("__secured_old2", forKey: "d2", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 0.05)
 check("22b seed newer copy in the app-ID group", legacyAppGroup.set("__secured_new2", forKey: "d2", withAccessibility: .afterFirstUnlock))
+let upstreamD2 = legacy.string(forKey: "d2") ?? "nil"
+let conflictsBefore22 = counter(diagnostics(dupVault), "conflictingDuplicates")
 dupVault.queue.sync {
-    check("22b get returns the newer app-ID copy", describe(dupVault.loadValue(forKey: "d2")) == "resolve __secured_new2")
-    check("22b shared copy deleted after the verified write", groups("d2") == [appIdGroup] && encrypted("d2"), "\(groups("d2"))")
+    check("22b get returns the copy upstream 0.13.0 read", describe(dupVault.loadValue(forKey: "d2")) == "resolve \(upstreamD2)", upstreamD2)
+    check("22b other copy deleted after the verified write", groups("d2") == [appIdGroup] && encrypted("d2"), "\(groups("d2"))")
+    check("22b next get returns the same value", describe(dupVault.loadValue(forKey: "d2")) == "resolve \(upstreamD2)")
 }
+check("22b the copy with the other value counts as a conflicting duplicate", counter(diagnostics(dupVault), "conflictingDuplicates") - conflictsBefore22 == 1)
+check("22ab the upstream read differs from the newest copy at least once, so the rule is exercised", upstreamD1 == "__secured_old" || upstreamD2 == "__secured_old2", "\(upstreamD1) \(upstreamD2)")
 check("22c seed stale app-ID copy", legacyAppGroup.set("__secured_s_old", forKey: "d3", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 0.05)
 check("22c seed newer shared copy", legacy.set("__secured_s_new", forKey: "d3", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 0.05)
 check("22c seed an even newer bundle id copy", KeychainWrapper.standard.set("__secured_s_std", forKey: "d3"))
+let upstreamD3 = legacy.string(forKey: "d3") ?? "nil"
 let before22 = diagnostics(dupVault)
 dupVault.queue.sync {
     check("22c sweep resolves", describe(dupVault.migrateLegacyValues()) == "resolve -")
-    check("22c sweep kept the newest cap_sec copy, the bundle id copy ranks below cap_sec", describe(dupVault.loadValue(forKey: "d3")) == "resolve __secured_s_new")
+    check("22c sweep kept the cap_sec copy upstream read, the bundle id copy ranks below cap_sec", describe(dupVault.loadValue(forKey: "d3")) == "resolve \(upstreamD3)", upstreamD3)
 }
 check("22c one copy left and the bundle id copy is gone", groups("d3") == [appIdGroup] && !KeychainWrapper.standard.hasValue(forKey: "d3"), "\(groups("d3"))")
 let after22 = diagnostics(dupVault)
-check("22c diagnostics: one migration, two duplicates resolved", counter(after22, "migrated") - counter(before22, "migrated") == 1 && counter(after22, "duplicatesResolved") - counter(before22, "duplicatesResolved") == 2, "\(before22) \(after22)")
+check("22c diagnostics: one migration, two duplicates resolved, both with another value", counter(after22, "migrated") - counter(before22, "migrated") == 1 && counter(after22, "duplicatesResolved") - counter(before22, "duplicatesResolved") == 2 && counter(after22, "conflictingDuplicates") - counter(before22, "conflictingDuplicates") == 2, "\(before22) \(after22)")
 check("22d seed two copies of d4", legacyAppGroup.set("__secured_a", forKey: "d4", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_b", forKey: "d4", withAccessibility: .afterFirstUnlock))
 dupVault.queue.sync {
     check("22d set over two copies leaves one fresh copy", describe(dupVault.storeValue("__secured_c", forKey: "d4")) == "resolve true" && groups("d4") == [appIdGroup] && describe(dupVault.loadValue(forKey: "d4")) == "resolve __secured_c", "\(groups("d4"))")
@@ -757,6 +785,14 @@ dupVault.queue.sync {
     }())
 }
 check("22f the 0.13.0 query shape (no group, account + generic) still finds migrated items", legacy.hasValue(forKey: "d1") && legacy.hasValue(forKey: "d3") && legacy.hasValue(forKey: "d4"))
+dupVault.queue.sync {
+    check("22g seed a copy written by this version", describe(dupVault.storeValue("__secured_marked", forKey: "d5")) == "resolve true" && marked("d5") == [true])
+}
+Thread.sleep(forTimeInterval: 0.05)
+check("22g seed a newer unmarked copy in the shared group", legacy.set("__secured_unmarked", forKey: "d5", withAccessibility: .afterFirstUnlock) && groups("d5") == [appIdGroup, sharedGroup], "\(groups("d5"))")
+dupVault.queue.sync {
+    check("22g a copy written by this version beats a newer unmarked one", describe(dupVault.loadValue(forKey: "d5")) == "resolve __secured_marked" && groups("d5") == [appIdGroup], "\(groups("d5"))")
+}
 
 print("--- 23 legacy bundle id service item")
 check("23a seed bundle id item", KeychainWrapper.standard.set("__secured_std1", forKey: "std1"))
@@ -807,22 +843,56 @@ cleanAll()
 let badVault = makeVault()
 check("25 seed older plaintext copy in the shared group", legacy.set("__secured_older", forKey: "u1", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 0.05)
-check("25 seed newer undecryptable copy in the app-ID group", addRaw("u1", magic + Data(repeating: 0x5A, count: 97), group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly) == errSecSuccess)
+check("25 seed newer undecryptable copy in the app-ID group, written by this version", addRaw("u1", magic + Data(repeating: 0x5A, count: 97), group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
 let before25 = diagnostics(badVault)
+let garbage25 = magic + Data(repeating: 0x5A, count: 97)
+func copy(_ account: String, in group: String) -> [String: Any]? {
+    return items(account: account).first { ($0[kSecAttrAccessGroup as String] as? String) == group }
+}
+func copyData(_ account: String, in group: String) -> Data? {
+    return copy(account, in: group)?[kSecValueData as String] as? Data
+}
+func copyClass(_ account: String, in group: String) -> String? {
+    return copy(account, in: group)?[kSecAttrAccessible as String] as? String
+}
+func copyMarked(_ account: String, in group: String) -> Bool {
+    return copy(account, in: group)?[kSecAttrLabel as String] as? String == marker
+}
 badVault.queue.sync {
     let read = badVault.loadValue(forKey: "u1")
     check("25 get reports missing with code UNREADABLE", describe(read) == "reject Item with given key does not exist" && code(read) == "UNREADABLE", "\(describe(read)) \(code(read))")
     check("25 nothing deleted, no stale value resurrected", groups("u1") == [appIdGroup, sharedGroup])
+    check("25 the older plaintext copy is encrypted and tightened in place: shared group, aku, still unmarked", copyData("u1", in: sharedGroup)?.starts(with: magic) == true && copyClass("u1", in: sharedGroup) == "aku" && !copyMarked("u1", in: sharedGroup), "\(copyClass("u1", in: sharedGroup) ?? "nil")")
+    check("25 the undecryptable copy is untouched", copyData("u1", in: appIdGroup) == garbage25 && copyMarked("u1", in: appIdGroup))
+    let again = badVault.loadValue(forKey: "u1")
+    check("25 the next get is still UNREADABLE, the rewritten older copy does not win", code(again) == "UNREADABLE", describe(again))
     check("25 sweep leaves both copies", describe(badVault.migrateLegacyValues()) == "resolve -" && groups("u1") == [appIdGroup, sharedGroup])
     check("25 set overwrites, one copy left", describe(badVault.storeValue("__secured_fresh", forKey: "u1")) == "resolve true" && describe(badVault.loadValue(forKey: "u1")) == "resolve __secured_fresh" && groups("u1") == [appIdGroup], "\(groups("u1"))")
 }
-check("25 decryptFailures counted", counter(diagnostics(badVault), "decryptFailures") - counter(before25, "decryptFailures") == 2, "\(diagnostics(badVault))")
+check("25 decryptFailures counted for two gets and the sweep", counter(diagnostics(badVault), "decryptFailures") - counter(before25, "decryptFailures") == 3, "\(diagnostics(badVault))")
 let noKeyTags = tags("harness.25.nokey")
 let noKeyVault = makeVault(keyTag: noKeyTags.name)
 noKeyVault.queue.sync {
     let read = noKeyVault.loadValue(forKey: "u1")
     check("25 ciphertext of a key that does not exist is UNREADABLE", describe(read) == "reject Item with given key does not exist" && code(read) == "UNREADABLE", describe(read))
     check("25 decrypting never creates a key", keyCount(noKeyTags.secureEnclave) + keyCount(noKeyTags.software) == 0)
+}
+check("25b seed older plaintext copy in the shared group", legacy.set("__secured_older_b", forKey: "u2", withAccessibility: .afterFirstUnlock))
+Thread.sleep(forTimeInterval: 0.05)
+check("25b seed an undecryptable copy without the label in the app-ID group", addRaw("u2", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly) == errSecSuccess)
+check("25b upstream 0.13.0 reads the undecryptable copy", legacy.data(forKey: "u2") == garbage25)
+badVault.queue.sync {
+    check("25b get is UNREADABLE", code(badVault.loadValue(forKey: "u2")) == "UNREADABLE")
+    check("25b the older unlabelled copy is encrypted and tightened in place", copyData("u2", in: sharedGroup)?.starts(with: magic) == true && copyClass("u2", in: sharedGroup) == "aku" && !copyMarked("u2", in: sharedGroup))
+    check("25b the next get still settles on the copy upstream read", code(badVault.loadValue(forKey: "u2")) == "UNREADABLE" && legacy.data(forKey: "u2") == garbage25)
+}
+check("25c seed an older copy that is not UTF-8 in the shared group", addRaw("u3", Data([0xFF, 0xFE, 0x00]), group: sharedGroup) == errSecSuccess)
+Thread.sleep(forTimeInterval: 0.05)
+check("25c seed a newer undecryptable copy written by this version", addRaw("u3", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
+badVault.queue.sync {
+    check("25c get is UNREADABLE", code(badVault.loadValue(forKey: "u3")) == "UNREADABLE")
+    check("25c an older copy that is not readable plaintext stays as it is", copyData("u3", in: sharedGroup) == Data([0xFF, 0xFE, 0x00]) && copyClass("u3", in: sharedGroup) == "ck")
+    check("25c the next set removes it", describe(badVault.storeValue("__secured_u3", forKey: "u3")) == "resolve true" && groups("u3") == [appIdGroup])
 }
 
 print("--- 26 clear and remove only touch cap_sec")
@@ -869,7 +939,7 @@ explicitVault.queue.sync {
 }
 let explicitDiagnostics = diagnostics(explicitVault)
 check("27 diagnostics accessGroupMode explicit, keyBackend secureEnclave", explicitDiagnostics["accessGroupMode"] as? String == "explicit" && explicitDiagnostics["keyBackend"] as? String == "secureEnclave", "\(explicitDiagnostics)")
-check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "keyBackend", "accessGroupMode"])
+check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates", "keyBackend", "accessGroupMode"], "\(explicitDiagnostics.keys.sorted())")
 fallbackVault.queue.sync {
     check("27 fallback mode moves an app-ID item into the default group", addRaw("fb2", Data("__secured_fb2".utf8), group: appIdGroup) == errSecSuccess && describe(fallbackVault.loadValue(forKey: "fb2")) == "resolve __secured_fb2" && groups("fb2") == [sharedGroup], "\(groups("fb2"))")
 }
@@ -986,6 +1056,123 @@ check("32 parked while locked, nothing migrated", gateLog.events.isEmpty && grou
 gateFlag.write(true)
 gateTicker.fire()
 check("32 resolves with the value after unlock, migrated", gateLog.events == ["get resolve __secured_1234"] && groups("pin") == [appIdGroup] && encrypted("pin") && accessible("pin") == ["aku"], "\(gateLog.events)")
+
+print("--- 33 decryption failures on an unlocked device")
+cleanAll()
+// cleanAll deletes the keys but not the process-wide key reference cache, so a section that retries a lookup needs its own tag.
+let retryTags = tags("harness.33")
+let retryVault = makeVault(keyTag: retryTags.name)
+retryVault.queue.sync {
+    check("33 seed encrypted value", describe(retryVault.storeValue("__secured_retry", forKey: "r1")) == "resolve true")
+    var calls = 0
+    retryVault.decryptCiphertext = { key, algorithm, ciphertext, error in
+        calls += 1
+        guard calls > 1 else {
+            error?.pointee = osStatusError(errSecInternalError)
+            return nil
+        }
+        return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
+    }
+    let retriesBefore = retryVault.counters.decryptRetries
+    check("33 a transient failure is retried with a fresh key lookup and get resolves", describe(retryVault.loadValue(forKey: "r1")) == "resolve __secured_retry" && calls == 2 && retryVault.counters.decryptRetries - retriesBefore == 1, "\(calls)")
+    retryVault.decryptCiphertext = { _, _, _, error in
+        error?.pointee = osStatusError(errSecInternalError)
+        return nil
+    }
+    check("33 a failure that is not known to be permanent parks instead of UNREADABLE", describe(retryVault.loadValue(forKey: "r1")) == "locked")
+    retryVault.decryptCiphertext = { _, _, _, error in
+        error?.pointee = osStatusError(errSecDecode)
+        return nil
+    }
+    let decodeRead = retryVault.loadValue(forKey: "r1")
+    check("33 errSecDecode after the retries is UNREADABLE", code(decodeRead) == "UNREADABLE", describe(decodeRead))
+    retryVault.decryptCiphertext = SecKeyCreateDecryptedData
+    check("33 nothing was deleted, the value still reads back", describe(retryVault.loadValue(forKey: "r1")) == "resolve __secured_retry" && items(account: "r1").count == 1)
+}
+let parkTicker = HarnessTicker()
+let parkVault = SecureStorageVault(keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: parkTicker)
+let parkLog = EventLog()
+parkVault.queue.sync {
+    parkVault.decryptRetryDelays = [0, 0]
+    parkVault.decryptCiphertext = { _, _, _, error in
+        error?.pointee = osStatusError(errSecInternalError)
+        return nil
+    }
+}
+parkVault.submitOperation(named: "get", key: "r1", run: { parkVault.loadValue(forKey: "r1") }, lost: { parkVault.lostValue(forKey: "r1") }, completion: { parkLog.record("get \(describe($0)) \(code($0))") })
+parkVault.queue.sync {}
+parkTicker.fire(times: 2)
+check("33 a get that keeps failing waits through the tick retries", parkLog.events.isEmpty, "\(parkLog.events)")
+parkTicker.fire()
+check("33 then rejects as missing UNREADABLE through the lost escape", parkLog.events == ["get reject Item with given key does not exist UNREADABLE"] && counter(diagnostics(parkVault), "lostItems") == 1, "\(parkLog.events)")
+check("33 the item is untouched", items(account: "r1").count == 1 && encrypted("r1"))
+
+print("--- 34 a key that keeps refusing with -25308 while unlocked (Quick Start zombie)")
+cleanAll()
+let zombieTags = tags("harness.34")
+let zombieTicker = HarnessTicker()
+let zombieVault = SecureStorageVault(keyTag: zombieTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: zombieTicker)
+let zombieLog = EventLog()
+zombieVault.queue.sync {
+    check("34 seed an encrypted value while the key works", describe(zombieVault.storeValue("__secured_z1", forKey: "zk1")) == "resolve true" && encrypted("zk1"))
+    zombieVault.forgetCachedKey()
+    zombieVault.copyMatchingKey = { _, _ in errSecInteractionNotAllowed }
+}
+zombieVault.submitOperation(named: "set", key: "zk2", run: { zombieVault.storeValue("__secured_z2", forKey: "zk2") }, lost: { zombieVault.replaceLostValue("__secured_z2", forKey: "zk2") }, completion: { zombieLog.record("set \(describe($0))") })
+zombieVault.queue.sync {}
+zombieTicker.fire(times: 2)
+check("34 set waits while the refusals are counted", zombieLog.events.isEmpty, "\(zombieLog.events)")
+zombieTicker.fire()
+check("34 then stores plaintext with the strict class instead of parking for ever", zombieLog.events == ["set resolve true"] && storedData("zk2") == [Data("__secured_z2".utf8)] && accessible("zk2") == ["aku"] && groups("zk2") == [appIdGroup], "\(zombieLog.events) \(accessible("zk2"))")
+let zombieDiagnostics = diagnostics(zombieVault)
+check("34 diagnostics: keyBackend unusable, one plaintext fallback, no lost item", zombieDiagnostics["keyBackend"] as? String == "unusable" && counter(zombieDiagnostics, "plaintextFallbacks") == 1 && counter(zombieDiagnostics, "lostItems") == 0, "\(zombieDiagnostics)")
+zombieVault.queue.sync {
+    let read = zombieVault.loadValue(forKey: "zk1")
+    check("34 ciphertext of the refused key reads as missing UNREADABLE right away", code(read) == "UNREADABLE", describe(read))
+    check("34 the plaintext fallback reads back", describe(zombieVault.loadValue(forKey: "zk2")) == "resolve __secured_z2")
+}
+check("34 the ciphertext item and the key are kept", encrypted("zk1") && items(account: "zk1").count == 1 && keyCount(zombieTags.secureEnclave) + keyCount(zombieTags.software) == 1)
+let zombieReader = makeVault(keyTag: zombieTags.name)
+zombieReader.queue.sync {
+    check("34 a process whose key works again still decrypts the kept ciphertext", describe(zombieReader.loadValue(forKey: "zk1")) == "resolve __secured_z1")
+}
+
+print("--- 35 ciphertext is checked before it is written")
+cleanAll()
+/// The real decryption for the first `successes` calls, `errSecParam` afterwards.
+func decryptionFailing(after successes: Int) -> (SecKey, SecKeyAlgorithm, CFData, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> CFData? {
+    var calls = 0
+    return { key, algorithm, ciphertext, error in
+        calls += 1
+        guard calls > successes else { return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error) }
+        error?.pointee = osStatusError(errSecParam)
+        return nil
+    }
+}
+let checkTags = tags("harness.35")
+let checkVault = makeVault(keyTag: checkTags.name)
+checkVault.queue.sync {
+    checkVault.decryptRetryDelays = [0, 0]
+    checkVault.decryptCiphertext = decryptionFailing(after: 0)
+    let fallbacksBefore = checkVault.counters.plaintextFallbacks
+    check("35 a set whose ciphertext does not decrypt stores plaintext with the strict class", describe(checkVault.storeValue("__secured_c0", forKey: "c0")) == "resolve true" && storedData("c0") == [Data("__secured_c0".utf8)] && accessible("c0") == ["aku"] && checkVault.counters.plaintextFallbacks - fallbacksBefore == 1, "\(accessible("c0"))")
+    check("35 seed legacy plaintext in the shared group", legacy.set("__secured_c1", forKey: "c1", withAccessibility: .afterFirstUnlock))
+    check("35 get of a legacy value whose new ciphertext does not decrypt returns the value", describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1")
+    check("35 that migration fell back to plaintext with the strict class and the value still reads back", storedData("c1") == [Data("__secured_c1".utf8)] && accessible("c1") == ["aku"] && groups("c1") == [appIdGroup] && describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1", "\(accessible("c1")) \(groups("c1"))")
+
+    // The check in memory passes, the read-back after the write does not: the write is undone.
+    check("35 seed legacy plaintext in the app-ID group", legacyAppGroup.set("__secured_c2", forKey: "c2", withAccessibility: .afterFirstUnlock))
+    checkVault.decryptCiphertext = decryptionFailing(after: 1)
+    check("35 get returns the legacy value although the rewritten copy does not verify", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2")
+    check("35 an update that does not verify is put back: plaintext, ck, unmarked, app-ID group", storedData("c2") == [Data("__secured_c2".utf8)] && accessible("c2") == ["ck"] && marked("c2") == [false] && groups("c2") == [appIdGroup], "\(accessible("c2")) \(marked("c2"))")
+    check("35 seed legacy plaintext in the shared group for an add", legacy.set("__secured_c3", forKey: "c3", withAccessibility: .afterFirstUnlock))
+    checkVault.decryptCiphertext = decryptionFailing(after: 1)
+    check("35 get returns the legacy value although the added copy does not verify", describe(checkVault.loadValue(forKey: "c3")) == "resolve __secured_c3")
+    check("35 an add that does not verify is deleted again and the legacy copy stays as it was", groups("c3") == [sharedGroup] && storedData("c3") == [Data("__secured_c3".utf8)] && accessible("c3") == ["ck"], "\(groups("c3"))")
+    checkVault.decryptCiphertext = SecKeyCreateDecryptedData
+    check("35 once decryption works the sweep migrates them", describe(checkVault.migrateLegacyValues()) == "resolve -" && encrypted("c2") && encrypted("c3") && groups("c3") == [appIdGroup] && accessible("c2") == ["aku"] && accessible("c3") == ["aku"])
+    check("35 the values read back", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2" && describe(checkVault.loadValue(forKey: "c3")) == "resolve __secured_c3")
+}
 
 cleanAll()
 check("cleanup items", items().isEmpty && allKeyCount() == 0)
