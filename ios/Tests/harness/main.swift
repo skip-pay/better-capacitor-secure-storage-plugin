@@ -1421,14 +1421,26 @@ partial.queue.sync {
     let cleared = partial.removeAllValues()
     check("I clear rejects when the cap_sec deletion fails and leaves cap_sec_v2 alone", describe(cleared) == "reject error" && code(cleared) == "STORAGE_ERROR" && faults.log.events.last == legacyService && !faults.log.events.contains(currentService), "\(faults.log.events)")
     check("I every newer value still reads back", describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1" && describe(partial.loadValue(forKey: "std")) == "resolve __secured_s1")
-    check("I a lost remove resolves and keeps the cap_sec_v2 item when the cap_sec deletion fails", describe(partial.removeLostValue(forKey: "token")) == "resolve true" && describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1")
-    check("I a lost clear resolves and keeps cap_sec_v2 when the cap_sec deletion fails", describe(partial.removeAllLostValues()) == "resolve true" && listed(partial) == ["std", "token"], "\(listed(partial) ?? [])")
+    faults.log.reset()
+    let lostRemoved = partial.removeLostValue(forKey: "token")
+    check("I a lost remove rejects STORAGE_ERROR and keeps the cap_sec_v2 item when the cap_sec deletion fails", describe(lostRemoved) == "reject Remove failed" && code(lostRemoved) == "STORAGE_ERROR" && !faults.log.events.contains(currentService) && describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1", "\(faults.log.events)")
+    faults.log.reset()
+    let lostCleared = partial.removeAllLostValues()
+    check("I a lost clear rejects STORAGE_ERROR and keeps cap_sec_v2 when the cap_sec deletion fails", describe(lostCleared) == "reject error" && code(lostCleared) == "STORAGE_ERROR" && !faults.log.events.contains(currentService) && listed(partial) == ["std", "token"], "\(faults.log.events) \(listed(partial) ?? [])")
 }
 faults.set(legacyService, errSecInteractionNotAllowed)
 partial.queue.sync {
     check("I a lost remove whose cap_sec deletion is refused still deletes the cap_sec_v2 item", describe(partial.removeLostValue(forKey: "token")) == "resolve true" && items(account: "token").isEmpty && items(account: "token", in: legacyService).count == 1)
 }
 faults.set(legacyService, nil)
+faults.set(currentService, errSecIO)
+partial.queue.sync {
+    let lostRemoved = partial.removeLostValue(forKey: "std")
+    check("I a lost remove rejects STORAGE_ERROR when the cap_sec_v2 deletion fails", describe(lostRemoved) == "reject Remove failed" && code(lostRemoved) == "STORAGE_ERROR" && describe(partial.loadValue(forKey: "std")) == "resolve __secured_s1")
+    let lostCleared = partial.removeAllLostValues()
+    check("I a lost clear rejects STORAGE_ERROR when the cap_sec_v2 deletion fails", describe(lostCleared) == "reject error" && code(lostCleared) == "STORAGE_ERROR" && items(in: legacyService).isEmpty && listed(partial) == ["std"], "\(listed(partial) ?? [])")
+}
+faults.set(currentService, nil)
 partial.queue.sync {
     check("I seed r", describe(partial.storeValue("__secured_r", forKey: "r")) == "resolve true")
     faults.log.reset()

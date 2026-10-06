@@ -889,8 +889,9 @@ final class SecureStorageVault {
         let legacyStatuses = [legacy, standard].map { store in
             classifyStatus(store.deleteItem(key), context: "delete lost \(key) in \(store.service)")
         }
-        if !legacyStatuses.contains(.failed) {
-            _ = classifyStatus(current.deleteItem(key), context: "delete lost \(key) in \(current.service)")
+        guard !legacyStatuses.contains(.failed),
+              classifyStatus(current.deleteItem(key), context: "delete lost \(key) in \(current.service)") != .failed else {
+            return .reject(SecureStorageVault.removeFailedMessage, code: .storageError)
         }
         return .resolve(["value": true])
     }
@@ -930,8 +931,9 @@ final class SecureStorageVault {
 
     /// `clear` while the keychain keeps refusing it although the device is unlocked.
     func removeAllLostValues() -> Outcome {
-        if classifyStatus(legacy.deleteAll(), context: "clear lost legacy") != .failed {
-            _ = classifyStatus(current.deleteAll(), context: "clear lost")
+        guard classifyStatus(legacy.deleteAll(), context: "clear lost legacy") != .failed,
+              classifyStatus(current.deleteAll(), context: "clear lost") != .failed else {
+            return .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
         }
         return .resolve(["value": true])
     }
