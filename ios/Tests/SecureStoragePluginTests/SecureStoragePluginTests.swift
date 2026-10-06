@@ -254,6 +254,24 @@ final class SecureStorageConfigurationTests: XCTestCase {
         XCTAssertEqual(optedOut?.encryptsValues, false)
     }
 
+    func testOlderCopiesAreKeptByDefault() {
+        XCTAssertFalse(SecureStorageVault.deletesLegacyCopies)
+        XCTAssertFalse(SecureStorageVault.Configuration().deletesLegacyCopies)
+        XCTAssertEqual(SecureStorageVault.Configuration(requestedAccessibility: nil, encryptsValues: true)?.deletesLegacyCopies, false)
+        XCTAssertEqual(SecureStorageVault.Configuration(requestedAccessibility: "afterFirstUnlock", encryptsValues: false)?.deletesLegacyCopies, false)
+        let vault = makeVault()
+        XCTAssertFalse(vault.configuration.deletesLegacyCopies)
+        XCTAssertEqual(vault.queue.sync { vault.diagnostics()["legacyCopiesKept"] as? Int }, 0)
+    }
+
+    func testDeletionOfOlderCopiesCanBeSwitchedOnThroughTheConfiguration() {
+        let configuration = SecureStorageVault.Configuration(deletesLegacyCopies: true)
+        XCTAssertTrue(configuration.deletesLegacyCopies)
+        XCTAssertEqual(configuration.accessibility, .whenUnlockedThisDeviceOnly)
+        XCTAssertTrue(configuration.encryptsValues)
+        XCTAssertTrue(SecureStorageVault(configuration: configuration, bundleIdentifier: nil, ticker: ManualTicker()).configuration.deletesLegacyCopies)
+    }
+
     func testConfigurationParsesSupportedAccessibility() {
         let parsed = SecureStorageVault.Configuration(requestedAccessibility: "whenUnlockedThisDeviceOnly", encryptsValues: false)
         XCTAssertEqual(parsed?.accessibility, .whenUnlockedThisDeviceOnly)
@@ -1358,7 +1376,7 @@ final class SecureStoragePluginTests: XCTestCase {
     func testGetDiagnosticsResolvesWithoutConfiguredVault() {
         let result = invoke(SecureStoragePlugin.getDiagnostics)
         XCTAssertNil(result.rejected)
-        let counters = ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates"]
+        let counters = ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates", "legacyCopiesKept"]
         for counter in counters {
             XCTAssertEqual(result.resolved?[counter] as? Int, 0, counter)
         }

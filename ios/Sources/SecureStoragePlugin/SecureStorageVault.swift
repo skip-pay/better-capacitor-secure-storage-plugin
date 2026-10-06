@@ -128,6 +128,10 @@ struct SecureStorageItemStore {
         return SecItemDelete(makeItemQuery(key) as CFDictionary)
     }
 
+    func deleteItem(_ key: String, accessGroup: String) -> OSStatus {
+        return SecItemDelete(makeItemQuery(key, accessGroup: accessGroup) as CFDictionary)
+    }
+
     func deleteCopy(_ copy: Copy, of key: String) -> OSStatus {
         guard let reference = copy.persistentRef else {
             guard let group = copy.accessGroup else { return errSecParam }
@@ -333,10 +337,12 @@ final class SecureStorageVault {
     struct Configuration {
         let accessibility: Accessibility
         let encryptsValues: Bool
+        let deletesLegacyCopies: Bool
 
-        init(accessibility: Accessibility = .whenUnlockedThisDeviceOnly, encryptsValues: Bool = true) {
+        init(accessibility: Accessibility = .whenUnlockedThisDeviceOnly, encryptsValues: Bool = true, deletesLegacyCopies: Bool = SecureStorageVault.deletesLegacyCopies) {
             self.accessibility = accessibility
             self.encryptsValues = encryptsValues
+            self.deletesLegacyCopies = deletesLegacyCopies
         }
 
         init?(requestedAccessibility: String?, encryptsValues: Bool) {
@@ -414,6 +420,7 @@ final class SecureStorageVault {
         var plaintextFallbacks = 0
         var decryptRetries = 0
         var conflictingDuplicates = 0
+        var legacyCopiesKept = 0
     }
 
     private enum KeyResult {
@@ -492,6 +499,8 @@ final class SecureStorageVault {
     static let lockedRetriesBeforeLost = 3
     /// Runs of the load sweep per process when keys had to be skipped.
     static let sweepAttempts = 3
+    // TODO(SS-12183): enable in the app version that follows the migration release, once most users have migrated
+    static let deletesLegacyCopies = false
 
     let queue = DispatchQueue(label: "capacitor-secure-storage-plugin.vault")
     let configuration: Configuration
@@ -540,6 +549,7 @@ final class SecureStorageVault {
     private var singleDecryptAttempt = false
     /// Only read or written on `queue`.
     private(set) var counters = Counters()
+    private var keysWithKeptCopies: Set<String> = []
     /// Test hook for the plaintext fallback: encryption reports a non-lock failure. Set on `queue` only.
     var simulatesEncryptionFailure = false
     /// Test hooks in place of `SecItemCopyMatching` for the key lookup and `SecKeyCreateDecryptedData`. Set on `queue` only.
@@ -770,7 +780,11 @@ final class SecureStorageVault {
                 counters.plaintextFallbacks += 1
                 logger.fault("stored \(key, privacy: .public) as plaintext \(itemClass.rawValue, privacy: .public), encryption unavailable")
             }
-            removeStaleCopies(of: key, keeping: write.group)
+            if configuration.deletesLegacyCopies {
+                removeStaleCopies(of: key, keeping: write.group)
+            } else {
+                noteStaleCopies(of: key, keeping: write.group)
+            }
             return .resolve(["value": true])
         case .locked:
             return .locked
@@ -779,10 +793,15 @@ final class SecureStorageVault {
         }
     }
 
-    /// `set` for an item the keychain keeps refusing while unlocked: drop every copy, then write a fresh one.
+    /// `set` for an item the keychain keeps refusing while unlocked: drop the copy in the target group (every copy with
+    /// `deletesLegacyCopies`), then write a fresh one.
     func replaceLostValue(_ value: String, forKey key: String, accessibility: Accessibility? = nil) -> Outcome {
-        _ = classifyStatus(dedicated.deleteItem(key), context: "delete lost \(key)")
-        _ = classifyStatus(standard.deleteItem(key), context: "delete lost standard \(key)")
+        if configuration.deletesLegacyCopies {
+            _ = classifyStatus(dedicated.deleteItem(key), context: "delete lost \(key)")
+            _ = classifyStatus(standard.deleteItem(key), context: "delete lost standard \(key)")
+        } else if let group = resolveAccessGroup()?.targetGroup {
+            _ = classifyStatus(dedicated.deleteItem(key, accessGroup: group), context: "delete lost \(key)")
+        }
         return storeValue(value, forKey: key, accessibility: accessibility)
     }
 
@@ -896,6 +915,9 @@ final class SecureStorageVault {
         switch classifyStatus(list.status, context: "list for sweep") {
         case .ok, .notFound:
             return migrateKeys(list.keys) { key in
+                if !self.configuration.deletesLegacyCopies, self.isSettled(key) {
+                    return .resolve([:])
+                }
                 switch self.settleKey(key, includeLegacyService: true, migrate: true) {
                 case .locked:
                     return .locked
@@ -926,8 +948,8 @@ final class SecureStorageVault {
 
     /// Reads a key across all of its copies. The `cap_sec` copy that `rank` puts first wins. The bundle id service only
     /// counts when `cap_sec` has none (or for cleanup with `includeLegacyService`). With `migrate` it writes the winner into
-    /// the target group with the target class and encoding, reads it back and verifies it, and only then deletes every
-    /// other copy.
+    /// the target group with the target class and encoding, reads it back and verifies it, and only then, with
+    /// `deletesLegacyCopies`, deletes every other copy.
     func settleKey(_ key: String, includeLegacyService: Bool, migrate: Bool) -> SettleResult {
         guard let mode = resolveAccessGroup() else { return .locked }
         let found = dedicated.copies(of: key)
@@ -978,8 +1000,10 @@ final class SecureStorageVault {
         case .invalid:
             counters.decryptFailures += 1
             logger.error("\(key, privacy: .public) cannot be decoded, reported as missing, other copies kept")
-            if migrate {
+            if migrate, configuration.deletesLegacyCopies {
                 protectPlaintextCopies(of: key, in: sources)
+            } else if migrate, sources.count > 1 {
+                noteKeptCopies(of: key)
             }
             return .unreadable
         }
@@ -1246,6 +1270,35 @@ final class SecureStorageVault {
         counters.duplicatesResolved += removed
     }
 
+    private func noteStaleCopies(of key: String, keeping group: String?) {
+        guard let group = group else { return }
+        if dedicated.copies(of: key).copies.contains(where: { $0.accessGroup != group }) || !standard.copies(of: key).copies.isEmpty {
+            noteKeptCopies(of: key)
+        }
+    }
+
+    private func noteKeptCopies(of key: String) {
+        if keysWithKeptCopies.insert(key).inserted {
+            counters.legacyCopiesKept += 1
+        }
+    }
+
+    private func isSettled(_ key: String) -> Bool {
+        guard let target = resolveAccessGroup()?.targetGroup else { return false }
+        let found = dedicated.copies(of: key)
+        guard found.status == errSecSuccess, found.copies.contains(where: { $0.isMarked }),
+              let winner = rank(found.copies, of: key, in: dedicated, legacy: false, target: target)?.first?.copy,
+              winner.accessGroup == target, winner.accessibility.flatMap(Accessibility.init(attribute:)) != nil else { return false }
+        if configuration.encryptsValues {
+            let read = dedicated.readCopy(winner, of: key)
+            guard read.status == errSecSuccess, isEncodedValue(read.data) else { return false }
+        }
+        if found.copies.count > 1 || !standard.copies(of: key).copies.isEmpty {
+            noteKeptCopies(of: key)
+        }
+        return true
+    }
+
     /// Orders the copies of a key in one service, the winner first. Copies this version wrote (marked) come first, the newest
     /// of them first. When no copy is marked, the copy upstream 0.13.0 read wins, so the first read after the upgrade returns
     /// the value the app has been using: SwiftKeychainWrapper's query without a group and limit one decides, not the
@@ -1369,6 +1422,16 @@ final class SecureStorageVault {
             if let overwritten = overwritten, holdsAnotherValue(overwritten, than: value) {
                 conflicting += 1
             }
+        }
+        guard configuration.deletesLegacyCopies else {
+            counters.conflictingDuplicates += conflicting
+            if !others.isEmpty {
+                noteKeptCopies(of: key)
+            }
+            if needsWrite {
+                logger.notice("settled \(key, privacy: .public) wrote true kept \(others.count, privacy: .public)")
+            }
+            return
         }
         var deleted = 0
         for (index, source) in sources.enumerated() where !isTargetCopy(source) {
@@ -1700,6 +1763,7 @@ final class SecureStorageVault {
             "plaintextFallbacks": counters.plaintextFallbacks,
             "decryptRetries": counters.decryptRetries,
             "conflictingDuplicates": counters.conflictingDuplicates,
+            "legacyCopiesKept": counters.legacyCopiesKept,
             "keyBackend": keyBackend(),
             "accessGroupMode": resolveAccessGroup()?.isExplicit == true ? "explicit" : "default",
         ]
@@ -1715,6 +1779,7 @@ final class SecureStorageVault {
         "plaintextFallbacks": 0,
         "decryptRetries": 0,
         "conflictingDuplicates": 0,
+        "legacyCopiesKept": 0,
         "keyBackend": "none",
         "accessGroupMode": "default",
     ]
