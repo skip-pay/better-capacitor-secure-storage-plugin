@@ -32,9 +32,9 @@
 - Android: `get` rejects with code `NOT_FOUND` for a missing key and `UNREADABLE` for an entry that cannot be decrypted, the message stays `Item with given key does not exist`. `remove` deletes an unreadable entry instead of reporting it missing
 - Android: `getDiagnostics()` with migration and failure counters
 - Android: no keystore work in `load()`, storage calls run in order on one plugin thread per process shared by all plugin instances. The API < 23 code and the SDK16/SDK18 split are removed
-- Android: older builds do not read `cap_sec_v2`. While `cap_sec` is kept, a downgrade finds the values as they were before the upgrade, without later writes
+- Android: older builds do not read `cap_sec_v2`. While `cap_sec` is kept, a downgrade finds the values as they were before the upgrade, without later writes and without keys removed or cleared since
 - `KeychainAccessibility`, `SecureStorageSetOptions`, `SecureStorageDiagnostics` and `SecureStorageErrorCode` types exported, `PluginsConfig` of `@capacitor/cli` augmented with `SecureStoragePlugin`
-- iOS: older builds do not read `cap_sec_v2`. While the legacy items are kept, a downgrade finds the values as they were before the upgrade, without later writes, see the README
+- iOS: older builds do not read `cap_sec_v2`. While the legacy items are kept, a downgrade finds the values as they were before the upgrade, without later writes and without keys removed or cleared since, see the README
 
 - Behaviour change versus upstream on iOS: with the defaults, values are not readable while the device is locked and calls wait until unlock. Apps that must read values in that state set `accessibility` to `afterFirstUnlock`
 - Behaviour change versus upstream on iOS: with the defaults (`whenUnlockedThisDeviceOnly` and a Secure Enclave key), values no longer move to a new iPhone through a backup restore or Quick Start, and an erase-and-restore of the same device loses them, because the Secure Enclave key does not survive it. The app sees missing keys

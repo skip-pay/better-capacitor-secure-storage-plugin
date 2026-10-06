@@ -544,9 +544,9 @@ Phase 1, this release (`false`):
 - A migration writes the `cap_sec_v2` entry and leaves the `cap_sec` entry exactly as it was. It is not deleted, rewritten or re-encrypted, and neither is the RSA key.
 - `set` writes to `cap_sec_v2` only. The `cap_sec` entry of that key keeps its older value.
 - `remove` deletes the key from both files. `clear` empties both files. Both are wipes the app asked for, so the older copies go too, in both phases.
-- Both delete from `cap_sec` first and `cap_sec_v2` last. When a deletion fails they reject with code `STORAGE_ERROR`, message `Remove failed` for `remove` and `error` for `clear`. A failed `cap_sec` deletion keeps the `cap_sec_v2` entry, so a later `get` never returns the older value.
+- Both delete from `cap_sec` first and `cap_sec_v2` last. When a deletion fails they reject with code `STORAGE_ERROR`, message `Remove failed` for `remove` and `error` for `clear`. A failed `cap_sec` deletion keeps the `cap_sec_v2` entry, so a later `get` never returns the older value. A retried `remove` or `clear` deletes from that file again, even though SharedPreferences already dropped the key from memory when the disk write failed.
 - Entries the plugin cannot read, or whose migration was skipped, stay in `cap_sec`.
-- An app version that still reads `cap_sec` finds the values as they were before the upgrade, without later changes.
+- An app version that still reads `cap_sec` finds the values as they were before the upgrade, without later writes and without keys removed or cleared since.
 
 Phase 2, a later release (`true`, planned once most users have migrated):
 
