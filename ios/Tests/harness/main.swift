@@ -1,9 +1,12 @@
 import Foundation
 import Security
 
-let service = "cap_sec"
+let legacyService = "cap_sec"
+let currentService = "cap_sec_v2"
 let upstreamService = "cap_sec_upstream"
+let upstreamCurrentService = "cap_sec_upstream_v2"
 let upstreamStandardService = "harness.standard.upstream"
+let standardService = KeychainWrapper.standard.serviceName
 // entitlements.plist uses a team prefix, an app-ID group, a shared group and a legacy group, as a typical app with an extension
 // would: application-identifier <TEAM>.<bundle id> is the app-ID group the plugin uses as its app-private group, the first
 // keychain-access-groups entry is the shared default group for writes without a group, and the second holds older copies.
@@ -25,24 +28,26 @@ func check(_ name: String, _ condition: Bool, _ detail: String = "") {
 func makeVault(
     _ accessibility: SecureStorageVault.Accessibility = .whenUnlockedThisDeviceOnly,
     encrypts: Bool = true,
-    dedicatedService: String = service,
-    standardService: String = KeychainWrapper.standard.serviceName,
+    deletes: Bool = false,
+    currentName: String = currentService,
+    legacyName: String = legacyService,
+    standardName: String = standardService,
     keyTag: String = "capacitor-secure-storage-plugin.v1",
     bundleIdentifier: String? = harnessBundle,
-    available: @escaping () -> Bool = { true },
-    deletes: Bool = true
+    available: @escaping () -> Bool = { true }
 ) -> SecureStorageVault {
     return SecureStorageVault(
         configuration: SecureStorageVault.Configuration(accessibility: accessibility, encryptsValues: encrypts, deletesLegacyCopies: deletes),
-        dedicatedService: dedicatedService,
-        standardService: standardService,
+        currentService: currentName,
+        legacyService: legacyName,
+        standardService: standardName,
         keyTag: keyTag,
         bundleIdentifier: bundleIdentifier,
         isProtectedDataAvailable: available
     )
 }
 
-func items(account: String? = nil, in itemService: String = service) -> [[String: Any]] {
+func items(account: String? = nil, in itemService: String = currentService) -> [[String: Any]] {
     var query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: itemService, kSecMatchLimit as String: kSecMatchLimitAll, kSecReturnAttributes as String: true, kSecReturnData as String: true]
     if let account = account { query[kSecAttrAccount as String] = Data(account.utf8) }
     var result: CFTypeRef?
@@ -50,33 +55,60 @@ func items(account: String? = nil, in itemService: String = service) -> [[String
     return status == errSecSuccess ? (result as? [[String: Any]] ?? []) : []
 }
 
-func accessible(_ account: String, in itemService: String = service) -> [String] {
+func accessible(_ account: String, in itemService: String = currentService) -> [String] {
     return items(account: account, in: itemService).map { $0[kSecAttrAccessible as String] as? String ?? "nil" }
 }
 
-func storedData(_ account: String, in itemService: String = service) -> [Data] {
+func storedData(_ account: String, in itemService: String = currentService) -> [Data] {
     return items(account: account, in: itemService).compactMap { $0[kSecValueData as String] as? Data }
 }
 
-func modified(_ account: String, in itemService: String = service) -> [Date] {
-    return items(account: account, in: itemService).compactMap { $0[kSecAttrModificationDate as String] as? Date }
-}
-
-func groups(_ account: String, in itemService: String = service) -> [String] {
+func groups(_ account: String, in itemService: String = currentService) -> [String] {
     return items(account: account, in: itemService).map { $0[kSecAttrAccessGroup as String] as? String ?? "nil" }.sorted()
 }
 
-func marked(_ account: String, in itemService: String = service) -> [Bool] {
+func marked(_ account: String, in itemService: String = currentService) -> [Bool] {
     return items(account: account, in: itemService).map { ($0[kSecAttrLabel as String] as? String) == marker }
 }
 
-func encrypted(_ account: String, in itemService: String = service) -> Bool {
+func encrypted(_ account: String, in itemService: String = currentService) -> Bool {
     let data = storedData(account, in: itemService)
     return !data.isEmpty && data.allSatisfy { $0.starts(with: magic) }
 }
 
+func copy(_ account: String, in group: String, service itemService: String = currentService) -> [String: Any]? {
+    return items(account: account, in: itemService).first { ($0[kSecAttrAccessGroup as String] as? String) == group }
+}
+
+func modified(_ account: String, in group: String, service itemService: String = currentService) -> Date? {
+    return copy(account, in: group, service: itemService)?[kSecAttrModificationDate as String] as? Date
+}
+
+func snapshot(_ itemService: String, account: String? = nil) -> [String] {
+    return items(account: account, in: itemService).map { item in
+        let name = (item[kSecAttrAccount as String] as? Data).map { String(decoding: $0, as: UTF8.self) } ?? "nil"
+        let data = (item[kSecValueData as String] as? Data)?.base64EncodedString() ?? "nil"
+        let date = (item[kSecAttrModificationDate as String] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(name)|\(item[kSecAttrAccessGroup as String] ?? "nil")|\(item[kSecAttrAccessible as String] ?? "nil")|\(item[kSecAttrLabel as String] ?? "-")|\(data)|\(date)"
+    }.sorted()
+}
+
+func legacySnapshot() -> [String] {
+    return snapshot(legacyService) + snapshot(standardService)
+}
+
+func everything() -> [String] {
+    return snapshot(currentService) + legacySnapshot()
+}
+
+func currentValue(_ vault: SecureStorageVault, _ account: String, in itemService: String = currentService) -> String {
+    let data = storedData(account, in: itemService)
+    guard data.count == 1 else { return "\(data.count) items" }
+    return describe(vault.decodeValue(data[0]))
+}
+
 /// Adds an item with the SwiftKeychainWrapper shape directly, optionally in a given group.
-func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFString = kSecAttrAccessibleAfterFirstUnlock, in itemService: String = service, label: String? = nil) -> OSStatus {
+func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFString = kSecAttrAccessibleAfterFirstUnlock, in itemService: String = legacyService, label: String? = nil) -> OSStatus {
     let encoded = Data(account.utf8)
     var query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
@@ -92,12 +124,26 @@ func addRaw(_ account: String, _ data: Data, group: String?, accessibility: CFSt
     return SecItemAdd(query as CFDictionary, nil)
 }
 
+func touch(_ account: String, in group: String, _ value: String) -> OSStatus {
+    let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: legacyService, kSecAttrAccount as String: Data(account.utf8), kSecAttrAccessGroup as String: group]
+    return SecItemUpdate(query as CFDictionary, [kSecValueData as String: Data(value.utf8)] as CFDictionary)
+}
+
 func diagnostics(_ vault: SecureStorageVault) -> [String: Any] {
     return vault.queue.sync { vault.diagnostics() }
 }
 
 func counter(_ snapshot: [String: Any], _ name: String) -> Int {
     return snapshot[name] as? Int ?? -1
+}
+
+func delta(_ before: [String: Any], _ after: [String: Any], _ name: String) -> Int {
+    return counter(after, name) - counter(before, name)
+}
+
+func listed(_ vault: SecureStorageVault) -> [String]? {
+    guard case .resolve(let data) = vault.listStoredKeys(), let keys = data["value"] as? [String] else { return nil }
+    return keys.sorted()
 }
 
 /// Fires ticks by hand on the vault queue.
@@ -157,7 +203,7 @@ func deleteService(_ itemService: String) {
 }
 
 func cleanAll() {
-    for itemService in [service, upstreamService, upstreamStandardService, KeychainWrapper.standard.serviceName, otherService] { deleteService(itemService) }
+    for itemService in [currentService, legacyService, upstreamService, upstreamCurrentService, upstreamStandardService, standardService, otherService] { deleteService(itemService) }
     SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: noServiceAccount] as CFDictionary)
     deleteKeys()
 }
@@ -200,7 +246,7 @@ func recordingDecryption(_ codes: @escaping (Int) -> Void) -> (SecKey, SecKeyAlg
 }
 
 func readData(_ vault: SecureStorageVault, _ key: String) -> Data? {
-    let read = vault.dedicated.readItem(key)
+    let read = vault.current.readItem(key)
     return read.status == errSecSuccess ? read.data : nil
 }
 
@@ -210,7 +256,7 @@ func encode(_ vault: SecureStorageVault, _ value: String) -> Data? {
 }
 
 func write(_ vault: SecureStorageVault, _ key: String, _ data: Data, _ accessibility: CFString = kSecAttrAccessibleWhenUnlockedThisDeviceOnly) -> OSStatus {
-    return vault.dedicated.writeItem(key, data: data, accessibility: accessibility)
+    return vault.current.writeItem(key, data: data, accessibility: accessibility, accessGroup: appIdGroup)
 }
 
 func settle(_ vault: SecureStorageVault) {
@@ -238,16 +284,43 @@ final class Flag {
     func write(_ value: Bool) { lock.lock(); storage = value; lock.unlock() }
 }
 
-let legacy = KeychainWrapper(serviceName: service)
-let legacyAppGroup = KeychainWrapper(serviceName: service, accessGroup: appIdGroup)
-let legacyUpstream = KeychainWrapper(serviceName: upstreamService)
-let legacyUpstreamStandard = KeychainWrapper(serviceName: upstreamStandardService)
-let legacyOlderGroup = KeychainWrapper(serviceName: service, accessGroup: olderGroup)
+final class DeletionFaults {
+    private let lock = NSLock()
+    private var statuses: [String: OSStatus] = [:]
+    let log = EventLog()
+    func set(_ itemService: String, _ status: OSStatus?) { lock.lock(); statuses[itemService] = status; lock.unlock() }
+    func hook(_ itemService: String) -> (CFDictionary) -> OSStatus {
+        return { query in
+            self.log.record(itemService)
+            self.lock.lock()
+            let status = self.statuses[itemService]
+            self.lock.unlock()
+            return status ?? SecItemDelete(query)
+        }
+    }
+}
+
+final class Tally {
+    private let lock = NSLock()
+    private var storage = 0
+    func add() { lock.lock(); storage += 1; lock.unlock() }
+    func read() -> Int { lock.lock(); defer { lock.unlock() }; return storage }
+}
+
+let wrapper = KeychainWrapper(serviceName: legacyService)
+let wrapperAppGroup = KeychainWrapper(serviceName: legacyService, accessGroup: appIdGroup)
+let wrapperOlderGroup = KeychainWrapper(serviceName: legacyService, accessGroup: olderGroup)
+let wrapperCurrent = KeychainWrapper(serviceName: currentService)
+let wrapperUpstream = KeychainWrapper(serviceName: upstreamService)
+let wrapperUpstreamStandard = KeychainWrapper(serviceName: upstreamStandardService)
 let phaseTwo = SecureStorageVault.Configuration(deletesLegacyCopies: true)
 
 cleanAll()
 let vault = makeVault()
 let plainVault = makeVault(.afterFirstUnlock, encrypts: false)
+let plainStrictVault = makeVault(.whenUnlockedThisDeviceOnly, encrypts: false)
+
+check("0 the default vault uses cap_sec_v2, cap_sec and the bundle id service and keeps older copies", SecureStorageVault().current.service == currentService && SecureStorageVault().legacy.service == legacyService && SecureStorageVault().standard.service == standardService && !SecureStorageVault().configuration.deletesLegacyCopies)
 
 vault.queue.sync {
     print("--- 1 encrypted round trip")
@@ -262,101 +335,92 @@ vault.queue.sync {
     check("1 storeValue/loadValue outcome", describe(vault.storeValue("__secured_x", forKey: "t1b")) == "resolve true" && describe(vault.loadValue(forKey: "t1b")) == "resolve __secured_x")
     check("1 storeValue overwrites encrypted", describe(vault.storeValue("__secured_y", forKey: "t1b")) == "resolve true" && describe(vault.loadValue(forKey: "t1b")) == "resolve __secured_y")
     check("1 storeValue class is the configured default", accessible("t1b") == ["aku"], "\(accessible("t1b"))")
+    check("1 storeValue writes one labelled cap_sec_v2 item in the app-ID group and nothing into cap_sec", groups("t1b") == [appIdGroup] && marked("t1b") == [true] && items(in: legacyService).isEmpty, "\(groups("t1b"))")
 }
+check("1 the cap_sec_v2 item has the SwiftKeychainWrapper shape", wrapperCurrent.hasValue(forKey: "t1b"))
 
+print("--- 2 a 0.13.0 item in the default group")
+check("2 seed 0.13.0 item with afterFirstUnlock", wrapper.set("__secured_1234", forKey: "pin", withAccessibility: .afterFirstUnlock))
+check("2 seeded class ck in cap_sec", accessible("pin", in: legacyService) == ["ck"])
+let pinLegacy = snapshot(legacyService, account: "pin")
 vault.queue.sync {
-    print("--- 2 legacy default-group item")
-    check("2 seed legacy AfterFirstUnlock", legacy.set("__secured_1234", forKey: "pin", withAccessibility: .afterFirstUnlock))
-    check("2 seeded class ck", accessible("pin") == ["ck"])
-    let stored = readData(vault, "pin")
-    check("2 readItem finds legacy", stored != nil)
-    check("2 decodeValue plaintext", stored.map { describe(vault.decodeValue($0)) } == "plaintext(__secured_1234)")
-    let encoded = encode(vault, "__secured_1234")
-    check("2 writeItem in place", encoded.map { write(vault, "pin", $0) } == errSecSuccess)
-    let after = items(account: "pin")
-    check("2 single item, class aku", after.count == 1 && accessible("pin") == ["aku"], "\(accessible("pin"))")
-    check("2 data starts with MAGIC", (after.first?[kSecValueData as String] as? Data)?.starts(with: magic) == true)
-    check("2 read+decode same string", readData(vault, "pin").map { describe(vault.decodeValue($0)) } == "decrypted(__secured_1234)")
-    check("2 legacy wrapper can no longer read plaintext", legacy.string(forKey: "pin") != "__secured_1234")
-
-    check("2b seed legacy pin2", legacy.set("__secured_5678", forKey: "pin2", withAccessibility: .afterFirstUnlock))
-    check("2b loadValue resolves legacy plaintext", describe(vault.loadValue(forKey: "pin2")) == "resolve __secured_5678")
-    check("2b migration ran inside the get", accessible("pin2") == ["aku"] && storedData("pin2").first?.starts(with: magic) == true, "\(accessible("pin2"))")
-
-    check("2c seed legacy pin3", legacy.set("__secured_old", forKey: "pin3", withAccessibility: .afterFirstUnlock))
-    check("2c storeValue over legacy class", describe(vault.storeValue("__secured_new", forKey: "pin3")) == "resolve true")
-    check("2c pin3 single item aku + decrypts new", accessible("pin3") == ["aku"] && describe(vault.loadValue(forKey: "pin3")) == "resolve __secured_new")
+    check("2 cap_sec_v2 empty before", items(account: "pin").isEmpty)
+    check("2 get returns the 0.13.0 value", describe(vault.loadValue(forKey: "pin")) == "resolve __secured_1234")
+    check("2 the value now sits in cap_sec_v2: app-ID group, aku, encrypted, labelled", groups("pin") == [appIdGroup] && accessible("pin") == ["aku"] && encrypted("pin") && marked("pin") == [true], "\(groups("pin")) \(accessible("pin"))")
+    check("2 the cap_sec_v2 item decodes to the value", currentValue(vault, "pin") == "decrypted(__secured_1234)")
 }
+check("2 the 0.13.0 item is unchanged", pinLegacy.count == 1 && snapshot(legacyService, account: "pin") == pinLegacy)
+check("2 the 0.13.0 wrapper still reads its value", wrapper.string(forKey: "pin") == "__secured_1234")
+let pinCurrent = snapshot(currentService, account: "pin")
 vault.queue.sync {
-    let pin2 = items(account: "pin2")
-    check("2b write-back ran: aku + MAGIC", pin2.count == 1 && accessible("pin2") == ["aku"] && (pin2.first?[kSecValueData as String] as? Data)?.starts(with: magic) == true)
-    check("2b loadValue after write-back", describe(vault.loadValue(forKey: "pin2")) == "resolve __secured_5678")
+    check("2 the next get reads cap_sec_v2 and writes nothing", describe(vault.loadValue(forKey: "pin")) == "resolve __secured_1234" && snapshot(currentService, account: "pin") == pinCurrent)
 }
+check("2b seed 0.13.0 pin3", wrapper.set("__secured_old", forKey: "pin3", withAccessibility: .afterFirstUnlock))
+vault.queue.sync {
+    check("2b set over a 0.13.0 item writes cap_sec_v2", describe(vault.storeValue("__secured_new", forKey: "pin3")) == "resolve true" && accessible("pin3") == ["aku"] && describe(vault.loadValue(forKey: "pin3")) == "resolve __secured_new")
+}
+check("2b the 0.13.0 item keeps its value and class", wrapper.string(forKey: "pin3") == "__secured_old" && accessible("pin3", in: legacyService) == ["ck"])
 
-print("--- 2d get without encryption re-classes but keeps plaintext")
-let plainStrictVault = makeVault(.whenUnlockedThisDeviceOnly, encrypts: false)
-check("2d seed legacy pin4", legacy.set("__secured_p4", forKey: "pin4", withAccessibility: .afterFirstUnlock))
+print("--- 2c get without encryption copies plaintext with a tightened class")
+check("2c seed 0.13.0 pin4", wrapper.set("__secured_p4", forKey: "pin4", withAccessibility: .afterFirstUnlock))
 plainStrictVault.queue.sync {
-    check("2d loadValue resolves", describe(plainStrictVault.loadValue(forKey: "pin4")) == "resolve __secured_p4")
+    check("2c get resolves", describe(plainStrictVault.loadValue(forKey: "pin4")) == "resolve __secured_p4")
+    check("2c cap_sec_v2 holds plaintext with aku", accessible("pin4") == ["aku"] && storedData("pin4") == [Data("__secured_p4".utf8)], "\(accessible("pin4"))")
 }
-settle(plainStrictVault)
-check("2d item tightened to aku, still plaintext", accessible("pin4") == ["aku"] && storedData("pin4") == [Data("__secured_p4".utf8)], "\(accessible("pin4"))")
+check("2c the 0.13.0 item stays ck", accessible("pin4", in: legacyService) == ["ck"] && storedData("pin4", in: legacyService) == [Data("__secured_p4".utf8)])
 
+print("--- 3 copies in two access groups")
+check("3 seed app-ID group", wrapperAppGroup.set("__secured_sig", forKey: "sig", withAccessibility: .afterFirstUnlock))
+check("3 seed default group duplicate", wrapper.set("__secured_sig", forKey: "sig", withAccessibility: .afterFirstUnlock))
+check("3 two cap_sec items in two groups", groups("sig", in: legacyService) == [appIdGroup, sharedGroup], "\(groups("sig", in: legacyService))")
+let sigLegacy = snapshot(legacyService, account: "sig")
 vault.queue.sync {
-    print("--- 3 two access groups")
-    check("3 seed app-ID group", legacyAppGroup.set("__secured_sig", forKey: "sig", withAccessibility: .afterFirstUnlock))
-    check("3 seed default group duplicate", legacy.set("__secured_sig", forKey: "sig", withAccessibility: .afterFirstUnlock))
-    let seeded = items(account: "sig")
-    let groups = Set(seeded.compactMap { $0[kSecAttrAccessGroup as String] as? String })
-    check("3 two items in two groups", seeded.count == 2 && groups.count == 2, "\(groups.sorted())")
-    check("3 readItem finds one", readData(vault, "sig").map { describe(vault.decodeValue($0)) } == "plaintext(__secured_sig)")
-    let keysBefore = vault.dedicated.listKeys().keys
+    let keysBefore = vault.legacy.listKeys().keys
     check("3 listKeys dedupes", keysBefore.filter { $0 == "sig" }.count == 1, "\(keysBefore)")
-    let encoded = encode(vault, "__secured_sig")
-    check("3 writeItem", encoded.map { write(vault, "sig", $0) } == errSecSuccess)
-    let updated = items(account: "sig")
-    check("3 both items updated to aku + MAGIC", updated.count == 2 && updated.allSatisfy { ($0[kSecAttrAccessible as String] as? String) == "aku" && ($0[kSecValueData as String] as? Data)?.starts(with: magic) == true }, "\(updated.map { "\($0[kSecAttrAccessGroup as String] ?? "?"):\($0[kSecAttrAccessible as String] ?? "?")" })")
-    check("3 loadValue decrypts", describe(vault.loadValue(forKey: "sig")) == "resolve __secured_sig")
-    check("3 deleteItem", vault.dedicated.deleteItem("sig") == errSecSuccess)
-    check("3 both deleted", items(account: "sig").isEmpty)
-
-    check("3b seed app-ID group sweep item", legacyAppGroup.set("__secured_dev", forKey: "dev", withAccessibility: .afterFirstUnlock))
-    check("3b seed default group sweep item", legacy.set("__secured_dev", forKey: "dev", withAccessibility: .afterFirstUnlock))
+    check("3 get resolves", describe(vault.loadValue(forKey: "sig")) == "resolve __secured_sig")
+    check("3 one encrypted cap_sec_v2 item", groups("sig") == [appIdGroup] && encrypted("sig"), "\(groups("sig"))")
+}
+check("3 both cap_sec copies unchanged", snapshot(legacyService, account: "sig") == sigLegacy)
+check("3b seed dev in two groups", wrapperAppGroup.set("__secured_dev", forKey: "dev", withAccessibility: .afterFirstUnlock) && wrapper.set("__secured_dev", forKey: "dev", withAccessibility: .afterFirstUnlock))
+let devLegacy = snapshot(legacyService, account: "dev")
+vault.queue.sync {
     check("3b sweep resolves", describe(vault.migrateLegacyValues()) == "resolve -")
-    let swept = items(account: "dev")
-    check("3b sweep collapsed both copies into one encrypted aku item", swept.count == 1 && swept.allSatisfy { ($0[kSecAttrAccessible as String] as? String) == "aku" && ($0[kSecValueData as String] as? Data)?.starts(with: magic) == true })
-    check("3b removeValue", describe(vault.removeValue(forKey: "dev")) == "resolve true" && items(account: "dev").isEmpty)
+    check("3b sweep wrote one encrypted aku cap_sec_v2 item", groups("dev") == [appIdGroup] && accessible("dev") == ["aku"] && encrypted("dev"))
+    check("3b both cap_sec copies unchanged", devLegacy.count == 2 && snapshot(legacyService, account: "dev") == devLegacy)
+    check("3b remove deletes the cap_sec_v2 item and both cap_sec copies", describe(vault.removeValue(forKey: "dev")) == "resolve true" && items(account: "dev").isEmpty && items(account: "dev", in: legacyService).isEmpty)
 }
 plainStrictVault.queue.sync {
-    check("3c seed app-ID group plaintext item", legacyAppGroup.set("__secured_grp", forKey: "grp", withAccessibility: .afterFirstUnlock))
-    check("3c seed default group plaintext item", legacy.set("__secured_grp", forKey: "grp", withAccessibility: .afterFirstUnlock))
+    check("3c seed plaintext in two groups", wrapperAppGroup.set("__secured_grp", forKey: "grp", withAccessibility: .afterFirstUnlock) && wrapper.set("__secured_grp", forKey: "grp", withAccessibility: .afterFirstUnlock))
+    let grpLegacy = snapshot(legacyService, account: "grp")
     check("3c sweep resolves", describe(plainStrictVault.migrateLegacyValues()) == "resolve -")
-    let swept = items(account: "grp")
-    check("3c sweep without encryption collapses the copies, tightens, keeps plaintext", swept.count == 1 && swept.allSatisfy { ($0[kSecAttrAccessible as String] as? String) == "aku" && ($0[kSecValueData as String] as? Data) == Data("__secured_grp".utf8) }, "\(swept.map { "\($0[kSecAttrAccessible as String] ?? "?")" })")
-    _ = plainStrictVault.dedicated.deleteItem("grp")
+    check("3c sweep without encryption copies plaintext with aku", groups("grp") == [appIdGroup] && accessible("grp") == ["aku"] && storedData("grp") == [Data("__secured_grp".utf8)], "\(accessible("grp"))")
+    check("3c both cap_sec copies unchanged", snapshot(legacyService, account: "grp") == grpLegacy)
 }
 
 vault.queue.sync {
-    print("--- 4 listKeys / deleteAll / remove / clear")
-    deleteService(service)
+    print("--- 4 keys, remove and clear")
+    deleteService(currentService)
+    deleteService(legacyService)
     for key in ["a", "b", "c"] { _ = vault.storeValue("__secured_\(key)", forKey: key) }
-    let listed = vault.dedicated.listKeys().keys
-    check("4 listKeys exactly a,b,c", listed.sorted() == ["a", "b", "c"], "\(listed)")
-    check("4 listStoredKeys outcome", describe(vault.listStoredKeys()).hasPrefix("resolve"))
+    let listedKeys = vault.current.listKeys().keys
+    check("4 listKeys exactly a,b,c", listedKeys.sorted() == ["a", "b", "c"], "\(listedKeys)")
+    check("4 keys outcome", listed(vault) == ["a", "b", "c"])
     check("4 remove missing rejects", describe(vault.removeValue(forKey: "zzz")) == "reject Item with given key does not exist")
     check("4 remove existing", describe(vault.removeValue(forKey: "a")) == "resolve true")
     check("4 get removed rejects missing", describe(vault.loadValue(forKey: "a")) == "reject Item with given key does not exist")
-    check("4 deleteAll", vault.dedicated.deleteAll() == errSecSuccess)
-    let emptyList = vault.dedicated.listKeys()
+    check("4 deleteAll", vault.current.deleteAll() == errSecSuccess)
+    let emptyList = vault.current.listKeys()
     check("4 listKeys empty after deleteAll", emptyList.status == errSecSuccess && emptyList.keys.isEmpty)
-    check("4 deleteAll on empty returns notFound", vault.dedicated.deleteAll() == errSecItemNotFound)
+    check("4 deleteAll on empty returns notFound", vault.current.deleteAll() == errSecItemNotFound)
     _ = vault.storeValue("__secured_c", forKey: "c")
     KeychainWrapper.standard.set("__secured_std", forKey: "c")
     KeychainWrapper.standard.set("__secured_only", forKey: "stdOnly")
-    check("4 removeAllValues resolves true", describe(vault.removeAllValues()) == "resolve true")
-    check("4 clear removed dedicated and standard copy", items().isEmpty && !KeychainWrapper.standard.hasValue(forKey: "c"))
-    check("4 clear keeps standard-only keys", KeychainWrapper.standard.string(forKey: "stdOnly") == "__secured_only")
-    check("4 remove deletes a standard-only key", describe(vault.removeValue(forKey: "stdOnly")) == "resolve true" && !KeychainWrapper.standard.hasValue(forKey: "stdOnly"))
+    check("4 seed a cap_sec item that was never read and its bundle id copy", wrapper.set("__secured_l", forKey: "l", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_l_std", forKey: "l"))
+    check("4 keys lists cap_sec_v2 and cap_sec keys", listed(vault) == ["c", "l"])
+    check("4 clear resolves true", describe(vault.removeAllValues()) == "resolve true")
+    check("4 clear removed cap_sec_v2, cap_sec and the bundle id copies of their keys", items().isEmpty && items(in: legacyService).isEmpty && !KeychainWrapper.standard.hasValue(forKey: "c") && !KeychainWrapper.standard.hasValue(forKey: "l"))
+    check("4 clear keeps bundle id items of other keys", KeychainWrapper.standard.string(forKey: "stdOnly") == "__secured_only")
+    check("4 remove deletes a bundle id only key", describe(vault.removeValue(forKey: "stdOnly")) == "resolve true" && !KeychainWrapper.standard.hasValue(forKey: "stdOnly"))
     check("4 clear on empty store resolves", describe(vault.removeAllValues()) == "resolve true")
     check("4 SE key survives clear", keyCount(keyTag) + keyCount(simKeyTag) == 1)
 }
@@ -380,11 +444,15 @@ vault.queue.sync {
     check("5 garbage decrypt while available is invalid", describe(vault.decodeValue(garbage)) == "invalid")
     check("5 short MAGIC-only data invalid", describe(vault.decodeValue(magic)) == "invalid")
     check("5 non-UTF-8 legacy standard value is missing + UNREADABLE", KeychainWrapper.standard.set(Data([0xFF, 0xFE, 0x00]), forKey: "badStd") && describe(vault.loadValue(forKey: "badStd")) == "reject Item with given key does not exist" && code(vault.loadValue(forKey: "badStd")) == "UNREADABLE")
-    check("5 non-UTF-8 plaintext in cap_sec is missing + UNREADABLE", write(vault, "badPlain", Data([0xFF, 0xFE, 0x00])) == errSecSuccess && describe(vault.loadValue(forKey: "badPlain")) == "reject Item with given key does not exist" && code(vault.loadValue(forKey: "badPlain")) == "UNREADABLE")
+    check("5 the unreadable bundle id value is not copied", items(account: "badStd").isEmpty)
+    check("5 non-UTF-8 plaintext in cap_sec_v2 is missing + UNREADABLE", write(vault, "badPlain", Data([0xFF, 0xFE, 0x00])) == errSecSuccess && describe(vault.loadValue(forKey: "badPlain")) == "reject Item with given key does not exist" && code(vault.loadValue(forKey: "badPlain")) == "UNREADABLE")
+    check("5 seed a readable 0.13.0 copy next to the undecryptable cap_sec_v2 item", wrapper.set("__secured_older", forKey: "bad", withAccessibility: .afterFirstUnlock))
+    check("5 an undecryptable cap_sec_v2 item never falls back to cap_sec", code(vault.loadValue(forKey: "bad")) == "UNREADABLE" && wrapper.string(forKey: "bad") == "__secured_older")
     check("5 set overwrites the undecryptable item", describe(vault.storeValue("__secured_fixed", forKey: "bad")) == "resolve true" && describe(vault.loadValue(forKey: "bad")) == "resolve __secured_fixed" && items(account: "bad").count == 1)
     _ = KeychainWrapper.standard.removeObject(forKey: "badStd")
-    _ = vault.dedicated.deleteItem("bad")
-    _ = vault.dedicated.deleteItem("badPlain")
+    _ = wrapper.removeObject(forKey: "bad")
+    _ = vault.current.deleteItem("bad")
+    _ = vault.current.deleteItem("badPlain")
 }
 
 print("--- 6 concurrent first use on one vault")
@@ -453,26 +521,6 @@ freshKeyVault.queue.sync {
     check("7 fresh key created under its tag", keyCount(freshTags.secureEnclave) == 1)
 }
 
-print("--- 8 standard -> dedicated migration")
-let migrationVault = makeVault()
-check("8 default standard service matches KeychainWrapper.standard", SecureStorageVault().standard.service == KeychainWrapper.standard.serviceName, SecureStorageVault().standard.service)
-check("8 seed standard", KeychainWrapper.standard.set("__secured_tok", forKey: "token"))
-migrationVault.queue.sync {
-    check("8 cap_sec empty before", items(account: "token").isEmpty)
-    check("8 loadValue migrates", describe(migrationVault.loadValue(forKey: "token")) == "resolve __secured_tok")
-    let migrated = items(account: "token")
-    check("8 cap_sec has encrypted aku item", migrated.count == 1 && accessible("token") == ["aku"] && (migrated.first?[kSecValueData as String] as? Data)?.starts(with: magic) == true)
-    check("8 standard item gone", !KeychainWrapper.standard.hasValue(forKey: "token"))
-    check("8 second get reads dedicated", describe(migrationVault.loadValue(forKey: "token")) == "resolve __secured_tok")
-    check("8 get missing in both rejects missing", describe(migrationVault.loadValue(forKey: "nothing")) == "reject Item with given key does not exist")
-}
-check("8p seed standard for plaintext vault", KeychainWrapper.standard.set("__secured_ptok", forKey: "plainToken"))
-plainVault.queue.sync {
-    check("8p loadValue migrates", describe(plainVault.loadValue(forKey: "plainToken")) == "resolve __secured_ptok")
-    check("8p cap_sec has plaintext item, stricter legacy class ak kept", accessible("plainToken") == ["ak"] && storedData("plainToken") == [Data("__secured_ptok".utf8)], "\(accessible("plainToken"))")
-    check("8p standard item gone", !KeychainWrapper.standard.hasValue(forKey: "plainToken"))
-}
-
 print("--- 10 protected data unavailable parks without running")
 let protectedFlag = Flag(false)
 let lockVault = makeVault(available: { protectedFlag.read() })
@@ -517,10 +565,10 @@ lockVault.drainParkedOperations()
 lockVault.queue.sync {}
 check("11 completed once", log.events.count == 2)
 
-print("--- 13 parked legacy get + set: set wins over the migration write-back")
+print("--- 13 parked 0.13.0 get + set: the set wins")
 log.reset()
-lockVault.queue.sync { _ = lockVault.dedicated.deleteItem("fifo2") }
-check("13 seed legacy plaintext", legacy.set("__secured_legacy", forKey: "fifo2", withAccessibility: .afterFirstUnlock))
+lockVault.queue.sync { _ = lockVault.current.deleteItem("fifo2") }
+check("13 seed 0.13.0 plaintext", wrapper.set("__secured_legacy", forKey: "fifo2", withAccessibility: .afterFirstUnlock))
 protectedFlag.write(false)
 lockVault.submitOperation(named: "get", key: "fifo2", run: { lockVault.loadValue(forKey: "fifo2") }, completion: { log.record("get \(describe($0))") })
 lockVault.submitOperation(named: "set", key: "fifo2", run: { lockVault.storeValue("__secured_fresh", forKey: "fifo2") }, completion: { log.record("set \(describe($0))") })
@@ -528,10 +576,11 @@ lockVault.queue.sync {}
 protectedFlag.write(true)
 lockVault.drainParkedOperations()
 settle(lockVault)
-check("13 get resolved legacy value, then set", log.events == ["get resolve __secured_legacy", "set resolve true"], "\(log.events)")
+check("13 get resolved the 0.13.0 value, then set", log.events == ["get resolve __secured_legacy", "set resolve true"], "\(log.events)")
 lockVault.queue.sync {
     check("13 final value is the set value, encrypted aku", accessible("fifo2") == ["aku"] && describe(lockVault.loadValue(forKey: "fifo2")) == "resolve __secured_fresh")
 }
+check("13 the 0.13.0 item keeps the value it had", wrapper.string(forKey: "fifo2") == "__secured_legacy")
 
 print("--- 14 key is never deleted")
 let keepTags = tags("harness.14")
@@ -591,65 +640,62 @@ for (accessibility, expected) in expectedClasses {
 
 print("--- 17 sweep")
 cleanAll()
-check("17a seed dedicated legacy s1", legacy.set("__secured_s1", forKey: "s1", withAccessibility: .afterFirstUnlock))
-check("17a seed standard duplicate of s1", KeychainWrapper.standard.set("__secured_stale", forKey: "s1"))
-check("17a seed standard-only s3", KeychainWrapper.standard.set("__secured_s3", forKey: "s3"))
+check("17a seed 0.13.0 s1", wrapper.set("__secured_s1", forKey: "s1", withAccessibility: .afterFirstUnlock))
+check("17a seed bundle id duplicate of s1", KeychainWrapper.standard.set("__secured_stale", forKey: "s1"))
+check("17a seed bundle id only s3", KeychainWrapper.standard.set("__secured_s3", forKey: "s3"))
+let legacyBefore17 = legacySnapshot()
 var s2Before: [Data] = []
 vault.queue.sync {
-    check("17a seed encrypted s2", describe(vault.storeValue("__secured_s2", forKey: "s2", accessibility: .afterFirstUnlock)) == "resolve true")
+    check("17a seed s2 with a per-call ck class", describe(vault.storeValue("__secured_s2", forKey: "s2", accessibility: .afterFirstUnlock)) == "resolve true")
     s2Before = storedData("s2")
     check("17a sweep resolves", describe(vault.migrateLegacyValues()) == "resolve -")
-    check("17a legacy s1 encrypted with the default class", accessible("s1") == ["aku"] && storedData("s1").first?.starts(with: magic) == true && describe(vault.loadValue(forKey: "s1")) == "resolve __secured_s1", "\(accessible("s1"))")
-    check("17a encrypted s2 with a per-call ck class left alone", storedData("s2") == s2Before && accessible("s2") == ["ck"], "\(accessible("s2"))")
-    check("17a standard-only s3 not swept", items(account: "s3").isEmpty && KeychainWrapper.standard.string(forKey: "s3") == "__secured_s3")
-    check("17a standard duplicate of s1 removed after the verified write", !KeychainWrapper.standard.hasValue(forKey: "s1"))
-    let snapshot = items().map { $0[kSecValueData as String] as? Data }
+    check("17a s1 copied into cap_sec_v2, encrypted with the default class", accessible("s1") == ["aku"] && encrypted("s1") && describe(vault.loadValue(forKey: "s1")) == "resolve __secured_s1", "\(accessible("s1"))")
+    check("17a s2 with its per-call ck class left alone", storedData("s2") == s2Before && accessible("s2") == ["ck"], "\(accessible("s2"))")
+    check("17a bundle id only s3 not swept", items(account: "s3").isEmpty)
+    let snapshot17 = everything()
     check("17b second sweep resolves", describe(vault.migrateLegacyValues()) == "resolve -")
-    check("17b second sweep rewrites nothing", items().map { $0[kSecValueData as String] as? Data } == snapshot && snapshot.count == 2, "\(snapshot.count)")
-    check("17a get moves standard-only s3 lazily", describe(vault.loadValue(forKey: "s3")) == "resolve __secured_s3" && accessible("s3") == ["aku"] && storedData("s3").first?.starts(with: magic) == true && !KeychainWrapper.standard.hasValue(forKey: "s3"))
+    check("17b second sweep writes nothing", everything() == snapshot17)
+    check("17a get copies bundle id only s3 lazily", describe(vault.loadValue(forKey: "s3")) == "resolve __secured_s3" && accessible("s3") == ["aku"] && encrypted("s3"))
 }
+check("17a every older copy is unchanged", legacyBefore17.count == 3 && legacySnapshot() == legacyBefore17)
 cleanAll()
 
-check("17c seed plaintext ck r1", legacy.set("__secured_r1", forKey: "r1", withAccessibility: .afterFirstUnlock))
-check("17c seed plaintext aku r2", legacy.set("__secured_r2", forKey: "r2", withAccessibility: .whenUnlockedThisDeviceOnly))
-vault.queue.sync {
-    check("17c seed encrypted ck r3", encode(vault, "__secured_r3").map { write(vault, "r3", $0, kSecAttrAccessibleAfterFirstUnlock) } == errSecSuccess)
-}
-check("17d seed upstream-style ck item", legacyUpstream.set("__secured_u1", forKey: "u1", withAccessibility: .afterFirstUnlock))
-check("17d seed upstream standard item", legacyUpstreamStandard.set("__secured_u2", forKey: "u2"))
-let r1Seeded = modified("r1")
-let r2Seeded = modified("r2")
-let r3Before = storedData("r3")
-let u1Seeded = modified("u1", in: upstreamService)
-Thread.sleep(forTimeInterval: 1.2)
+check("17c seed plaintext ck r1", wrapper.set("__secured_r1", forKey: "r1", withAccessibility: .afterFirstUnlock))
+check("17c seed plaintext aku r2", wrapper.set("__secured_r2", forKey: "r2", withAccessibility: .whenUnlockedThisDeviceOnly))
+let r3Data = vault.queue.sync { encode(vault, "__secured_r3") }
+check("17c seed encrypted ck r3 written by an earlier build of this fork", r3Data.map { addRaw("r3", $0, group: sharedGroup, label: marker) } == errSecSuccess)
+check("17d seed upstream-style ck item", wrapperUpstream.set("__secured_u1", forKey: "u1", withAccessibility: .afterFirstUnlock))
+check("17d seed upstream standard item", wrapperUpstreamStandard.set("__secured_u2", forKey: "u2"))
+let legacyBefore17c = snapshot(legacyService)
 plainStrictVault.queue.sync {
     check("17c sweep without encryption resolves", describe(plainStrictVault.migrateLegacyValues()) == "resolve -")
-    check("17c legacy plaintext r1 tightened to aku, still plaintext", accessible("r1") == ["aku"] && storedData("r1") == [Data("__secured_r1".utf8)] && modified("r1") != r1Seeded && !r1Seeded.isEmpty, "\(accessible("r1"))")
-    check("17c r2 moved into the app-private group, aku and plaintext kept", accessible("r2") == ["aku"] && groups("r2") == [appIdGroup] && storedData("r2") == [Data("__secured_r2".utf8)] && !r2Seeded.isEmpty, "\(groups("r2"))")
-    check("17c encrypted ck r3 written by this version keeps its class and bytes", accessible("r3") == ["ck"] && storedData("r3") == r3Before)
-    let r1Swept = modified("r1")
-    check("17c new write gets the configured default class", describe(plainStrictVault.storeValue("__secured_r1b", forKey: "r1")) == "resolve true" && accessible("r1") == ["aku"] && storedData("r1") == [Data("__secured_r1b".utf8)])
-    check("17c modification date detects the rewrite", modified("r1") != r1Swept)
+    check("17c r1 copied as plaintext, tightened to aku", accessible("r1") == ["aku"] && storedData("r1") == [Data("__secured_r1".utf8)] && groups("r1") == [appIdGroup], "\(accessible("r1"))")
+    check("17c r2 copied into the app-private group, aku and plaintext", accessible("r2") == ["aku"] && groups("r2") == [appIdGroup] && storedData("r2") == [Data("__secured_r2".utf8)], "\(groups("r2"))")
+    check("17c r3 written by an earlier build of this fork keeps its bytes and is tightened to aku", accessible("r3") == ["aku"] && r3Data != nil && storedData("r3") == [r3Data!], "\(accessible("r3"))")
+    check("17c a later set uses the configured class", describe(plainStrictVault.storeValue("__secured_r1b", forKey: "r1")) == "resolve true" && accessible("r1") == ["aku"] && storedData("r1") == [Data("__secured_r1b".utf8)])
 }
-let upstreamVault = makeVault(.afterFirstUnlock, encrypts: false, dedicatedService: upstreamService, standardService: upstreamStandardService)
+check("17c cap_sec is unchanged", legacyBefore17c.count == 3 && snapshot(legacyService) == legacyBefore17c)
+let upstreamVault = makeVault(.afterFirstUnlock, encrypts: false, currentName: upstreamCurrentService, legacyName: upstreamService, standardName: upstreamStandardService)
+let upstreamBefore = snapshot(upstreamService) + snapshot(upstreamStandardService)
 upstreamVault.queue.sync {
     check("17d sweep with upstream defaults resolves", describe(upstreamVault.migrateLegacyValues()) == "resolve -")
-    check("17d upstream item moved into the app-private group, ck and plaintext kept", modified("u1", in: upstreamService) != u1Seeded && !u1Seeded.isEmpty && accessible("u1", in: upstreamService) == ["ck"] && groups("u1", in: upstreamService) == [appIdGroup] && storedData("u1", in: upstreamService) == [Data("__secured_u1".utf8)], "\(groups("u1", in: upstreamService))")
-    check("17d upstream standard item not swept", items(account: "u2", in: upstreamService).isEmpty && legacyUpstreamStandard.string(forKey: "u2") == "__secured_u2")
-    check("17d get moves the standard item as plaintext, stricter legacy class ak kept", describe(upstreamVault.loadValue(forKey: "u2")) == "resolve __secured_u2" && accessible("u2", in: upstreamService) == ["ak"] && storedData("u2", in: upstreamService) == [Data("__secured_u2".utf8)] && items(account: "u2", in: upstreamStandardService).isEmpty)
+    check("17d u1 copied into the app-private group, ck and plaintext kept", accessible("u1", in: upstreamCurrentService) == ["ck"] && groups("u1", in: upstreamCurrentService) == [appIdGroup] && storedData("u1", in: upstreamCurrentService) == [Data("__secured_u1".utf8)], "\(groups("u1", in: upstreamCurrentService))")
+    check("17d upstream standard item not swept", items(account: "u2", in: upstreamCurrentService).isEmpty)
+    check("17d get copies the standard item as plaintext, its stricter class ak kept", describe(upstreamVault.loadValue(forKey: "u2")) == "resolve __secured_u2" && accessible("u2", in: upstreamCurrentService) == ["ak"] && storedData("u2", in: upstreamCurrentService) == [Data("__secured_u2".utf8)])
 }
+check("17d the upstream items are unchanged", upstreamBefore.count == 2 && snapshot(upstreamService) + snapshot(upstreamStandardService) == upstreamBefore)
 cleanAll()
 
 let sweepFlag = Flag(false)
 let sweepVault = makeVault(available: { sweepFlag.read() })
-check("17e seed legacy l1", legacy.set("__secured_l1", forKey: "l1", withAccessibility: .afterFirstUnlock))
+check("17e seed 0.13.0 l1", wrapper.set("__secured_l1", forKey: "l1", withAccessibility: .afterFirstUnlock))
 sweepVault.submitOperation(named: "sweep", key: "*", run: { sweepVault.migrateLegacyValues() })
 settle(sweepVault)
-check("17e sweep parked while protected data is unavailable", accessible("l1") == ["ck"] && storedData("l1") == [Data("__secured_l1".utf8)])
+check("17e sweep parked while protected data is unavailable", items(account: "l1").isEmpty)
 sweepFlag.write(true)
 sweepVault.drainParkedOperations()
 settle(sweepVault)
-check("17e sweep ran after drain", accessible("l1") == ["aku"] && storedData("l1").first?.starts(with: magic) == true)
+check("17e sweep ran after drain", accessible("l1") == ["aku"] && encrypted("l1") && accessible("l1", in: legacyService) == ["ck"])
 cleanAll()
 
 print("--- 18 gate bypass with afterFirstUnlock default")
@@ -660,6 +706,10 @@ bypassVault.submitOperation(named: "get", key: "b1", run: { bypassVault.loadValu
 settle(bypassVault)
 check("18 set and get run while protected data is unavailable", log.events == ["set resolve true", "get resolve __secured_b1"], "\(log.events)")
 check("18 item stored encrypted with ck", accessible("b1") == ["ck"] && storedData("b1").first?.starts(with: magic) == true)
+check("18c seed 0.13.0 item", wrapper.set("__secured_b2", forKey: "b2", withAccessibility: .afterFirstUnlock))
+bypassVault.queue.sync {
+    check("18c a get while protected data is unavailable reads the 0.13.0 item and writes nothing", describe(bypassVault.loadValue(forKey: "b2")) == "resolve __secured_b2" && items(account: "b2").isEmpty)
+}
 
 print("--- 19 plaintext round trip with upstream defaults")
 cleanAll()
@@ -668,7 +718,7 @@ plainVault.queue.sync {
     check("19 stored bytes are the UTF-8 plaintext", storedData("p1") == [Data("__secured_plain".utf8)])
     check("19 class ck", accessible("p1") == ["ck"], "\(accessible("p1"))")
     check("19 loadValue resolves", describe(plainVault.loadValue(forKey: "p1")) == "resolve __secured_plain")
-    check("19 SwiftKeychainWrapper reads the item", legacy.string(forKey: "p1") == "__secured_plain")
+    check("19 SwiftKeychainWrapper reads the cap_sec_v2 item", wrapperCurrent.string(forKey: "p1") == "__secured_plain")
     check("19 overwrite", describe(plainVault.storeValue("__secured_plain2", forKey: "p1")) == "resolve true" && describe(plainVault.loadValue(forKey: "p1")) == "resolve __secured_plain2")
 }
 settle(plainVault)
@@ -711,169 +761,104 @@ reader.queue.sync {
 print("--- 21 migration never loosens the class")
 cleanAll()
 let relaxedEncryptingVault = makeVault(.afterFirstUnlock)
-check("21 seed legacy aku item", legacy.set("__secured_keep1", forKey: "k1", withAccessibility: .whenUnlockedThisDeviceOnly))
-check("21 seed legacy akpu item", legacy.set("__secured_keep2", forKey: "k2", withAccessibility: .whenPasscodeSetThisDeviceOnly))
-check("21 seed standard aku item", KeychainWrapper.standard.set("__secured_keep3", forKey: "k3", withAccessibility: .whenUnlockedThisDeviceOnly))
+check("21 seed 0.13.0 aku item", wrapper.set("__secured_keep1", forKey: "k1", withAccessibility: .whenUnlockedThisDeviceOnly))
+check("21 seed 0.13.0 akpu item", wrapper.set("__secured_keep2", forKey: "k2", withAccessibility: .whenPasscodeSetThisDeviceOnly))
+check("21 seed bundle id aku item", KeychainWrapper.standard.set("__secured_keep3", forKey: "k3", withAccessibility: .whenUnlockedThisDeviceOnly))
 relaxedEncryptingVault.queue.sync {
     check("21 sweep resolves", describe(relaxedEncryptingVault.migrateLegacyValues()) == "resolve -")
-    check("21 sweep encrypts but keeps the stricter aku", accessible("k1") == ["aku"] && storedData("k1").first?.starts(with: magic) == true, "\(accessible("k1"))")
-    check("21 sweep keeps akpu", accessible("k2") == ["akpu"] && storedData("k2").first?.starts(with: magic) == true, "\(accessible("k2"))")
-    check("21 bundle id move keeps aku", describe(relaxedEncryptingVault.loadValue(forKey: "k3")) == "resolve __secured_keep3" && accessible("k3") == ["aku"] && storedData("k3").first?.starts(with: magic) == true, "\(accessible("k3"))")
-    check("21 plain set still uses the configured class", describe(relaxedEncryptingVault.storeValue("__secured_keep1b", forKey: "k1")) == "resolve true" && accessible("k1") == ["ck"])
+    check("21 sweep encrypts but keeps the stricter aku", accessible("k1") == ["aku"] && encrypted("k1"), "\(accessible("k1"))")
+    check("21 sweep keeps akpu", accessible("k2") == ["akpu"] && encrypted("k2"), "\(accessible("k2"))")
+    check("21 the bundle id copy keeps aku", describe(relaxedEncryptingVault.loadValue(forKey: "k3")) == "resolve __secured_keep3" && accessible("k3") == ["aku"] && encrypted("k3"), "\(accessible("k3"))")
+    check("21 plain set uses the configured class", describe(relaxedEncryptingVault.storeValue("__secured_keep1b", forKey: "k1")) == "resolve true" && accessible("k1") == ["ck"])
 }
+check("21 the older items keep their classes", accessible("k1", in: legacyService) == ["aku"] && accessible("k2", in: legacyService) == ["akpu"] && accessible("k3", in: standardService) == ["aku"])
 let lazyKeepVault = makeVault(.afterFirstUnlock)
-check("21 seed legacy akpu item for get", legacy.set("__secured_keep4", forKey: "k4", withAccessibility: .whenPasscodeSetThisDeviceOnly))
+check("21 seed 0.13.0 akpu item for get", wrapper.set("__secured_keep4", forKey: "k4", withAccessibility: .whenPasscodeSetThisDeviceOnly))
 lazyKeepVault.queue.sync {
-    check("21 get resolves legacy akpu", describe(lazyKeepVault.loadValue(forKey: "k4")) == "resolve __secured_keep4")
+    check("21 get resolves 0.13.0 akpu", describe(lazyKeepVault.loadValue(forKey: "k4")) == "resolve __secured_keep4")
 }
-settle(lazyKeepVault)
-check("21 lazy re-encrypt on get keeps akpu", accessible("k4") == ["akpu"] && storedData("k4").first?.starts(with: magic) == true, "\(accessible("k4"))")
+check("21 the copy made by get keeps akpu", accessible("k4") == ["akpu"] && encrypted("k4"), "\(accessible("k4"))")
 let mixedVault = makeVault(.afterFirstUnlockThisDeviceOnly)
-check("21 seed legacy ak item", legacy.set("__secured_mix", forKey: "k5", withAccessibility: .whenUnlocked))
+check("21 seed 0.13.0 ak item", wrapper.set("__secured_mix", forKey: "k5", withAccessibility: .whenUnlocked))
 mixedVault.queue.sync {
     check("21 sweep combines ak and cku into aku", describe(mixedVault.migrateLegacyValues()) == "resolve -" && accessible("k5") == ["aku"], "\(accessible("k5"))")
 }
 let strictVault = makeVault(.whenUnlockedThisDeviceOnly)
-check("21 seed legacy ck item", legacy.set("__secured_tight", forKey: "k6", withAccessibility: .afterFirstUnlock))
+check("21 seed 0.13.0 ck item", wrapper.set("__secured_tight", forKey: "k6", withAccessibility: .afterFirstUnlock))
 strictVault.queue.sync {
-    check("21 sweep tightens ck to aku", describe(strictVault.migrateLegacyValues()) == "resolve -" && accessible("k6") == ["aku"] && storedData("k6").first?.starts(with: magic) == true, "\(accessible("k6"))")
+    check("21 sweep tightens ck to aku", describe(strictVault.migrateLegacyValues()) == "resolve -" && accessible("k6") == ["aku"] && encrypted("k6"), "\(accessible("k6"))")
 }
 
-print("--- 22 copies in two groups with different modification dates")
+print("--- 22 ranking of legacy copies")
 cleanAll()
-let dupVault = makeVault()
-check("22a seed stale copy in the app-ID group (written before the entitlement change)", legacyAppGroup.set("__secured_old", forKey: "d1", withAccessibility: .afterFirstUnlock))
-Thread.sleep(forTimeInterval: 0.05)
-check("22a seed newer copy in the shared group (first add after the change)", legacy.set("__secured_new", forKey: "d1", withAccessibility: .afterFirstUnlock))
-check("22a two copies", groups("d1") == [appIdGroup, sharedGroup], "\(groups("d1"))")
-// What 0.13.0 returned: SwiftKeychainWrapper without a group, limit one, read before the vault touches the key.
-let upstreamD1 = legacy.string(forKey: "d1") ?? "nil"
-dupVault.queue.sync {
-    check("22a get returns the copy upstream 0.13.0 read, not the newest one", describe(dupVault.loadValue(forKey: "d1")) == "resolve \(upstreamD1)", upstreamD1)
-    check("22a one copy left: app-ID group, encrypted, aku, marked", groups("d1") == [appIdGroup] && encrypted("d1") && accessible("d1") == ["aku"] && marked("d1") == [true], "\(groups("d1")) \(accessible("d1"))")
-    check("22a next get returns the same value", describe(dupVault.loadValue(forKey: "d1")) == "resolve \(upstreamD1)")
+let rankVault = makeVault()
+let forkValues = rankVault.queue.sync { [encode(rankVault, "__secured_marked"), encode(rankVault, "__secured_marked_old"), encode(rankVault, "__secured_marked_newer")] }
+check("22a seed a copy an earlier build of this fork wrote in the app-ID group", forkValues[0].map { addRaw("d5", $0, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) } == errSecSuccess)
+Thread.sleep(forTimeInterval: 1.1)
+check("22a seed a newer unmarked 0.13.0 copy in the shared group", wrapper.set("__secured_unmarked", forKey: "d5", withAccessibility: .afterFirstUnlock) && groups("d5", in: legacyService) == [appIdGroup, sharedGroup])
+rankVault.queue.sync {
+    check("22a a copy this fork wrote beats a newer unmarked one", describe(rankVault.loadValue(forKey: "d5")) == "resolve __secured_marked" && currentValue(rankVault, "d5") == "decrypted(__secured_marked)")
 }
-check("22b seed older copy in the shared group", legacy.set("__secured_old2", forKey: "d2", withAccessibility: .afterFirstUnlock))
-Thread.sleep(forTimeInterval: 0.05)
-check("22b seed newer copy in the app-ID group", legacyAppGroup.set("__secured_new2", forKey: "d2", withAccessibility: .afterFirstUnlock))
-let upstreamD2 = legacy.string(forKey: "d2") ?? "nil"
-let conflictsBefore22 = counter(diagnostics(dupVault), "conflictingDuplicates")
-dupVault.queue.sync {
-    check("22b get returns the copy upstream 0.13.0 read", describe(dupVault.loadValue(forKey: "d2")) == "resolve \(upstreamD2)", upstreamD2)
-    check("22b other copy deleted after the verified write", groups("d2") == [appIdGroup] && encrypted("d2"), "\(groups("d2"))")
-    check("22b next get returns the same value", describe(dupVault.loadValue(forKey: "d2")) == "resolve \(upstreamD2)")
+check("22b seed a copy this fork wrote with a per-call ck class in the app-ID group", forkValues[1].map { addRaw("f1", $0, group: appIdGroup, accessibility: kSecAttrAccessibleAfterFirstUnlock, label: marker) } == errSecSuccess)
+Thread.sleep(forTimeInterval: 1.1)
+check("22b seed a newer copy it wrote with ck in the shared group during a fallback", forkValues[2].map { addRaw("f1", $0, group: sharedGroup, accessibility: kSecAttrAccessibleAfterFirstUnlock, label: marker) } == errSecSuccess)
+let before22b = diagnostics(rankVault)
+rankVault.queue.sync {
+    check("22b the newer of two marked copies wins", describe(rankVault.loadValue(forKey: "f1")) == "resolve __secured_marked_newer" && currentValue(rankVault, "f1") == "decrypted(__secured_marked_newer)")
+    check("22b a marked ck copy gets the configured class", accessible("f1") == ["aku"], "\(accessible("f1"))")
 }
-check("22b the copy with the other value counts as a conflicting duplicate", counter(diagnostics(dupVault), "conflictingDuplicates") - conflictsBefore22 == 1)
-check("22ab the upstream read differs from the newest copy at least once, so the rule is exercised", upstreamD1 == "__secured_old" || upstreamD2 == "__secured_old2", "\(upstreamD1) \(upstreamD2)")
-check("22c seed stale app-ID copy", legacyAppGroup.set("__secured_s_old", forKey: "d3", withAccessibility: .afterFirstUnlock))
-Thread.sleep(forTimeInterval: 0.05)
-check("22c seed newer shared copy", legacy.set("__secured_s_new", forKey: "d3", withAccessibility: .afterFirstUnlock))
-Thread.sleep(forTimeInterval: 0.05)
-check("22c seed an even newer bundle id copy", KeychainWrapper.standard.set("__secured_s_std", forKey: "d3"))
-let upstreamD3 = legacy.string(forKey: "d3") ?? "nil"
-let before22 = diagnostics(dupVault)
-dupVault.queue.sync {
-    check("22c sweep resolves", describe(dupVault.migrateLegacyValues()) == "resolve -")
-    check("22c sweep kept the cap_sec copy upstream read, the bundle id copy ranks below cap_sec", describe(dupVault.loadValue(forKey: "d3")) == "resolve \(upstreamD3)", upstreamD3)
-}
-check("22c one copy left and the bundle id copy is gone", groups("d3") == [appIdGroup] && !KeychainWrapper.standard.hasValue(forKey: "d3"), "\(groups("d3"))")
-let after22 = diagnostics(dupVault)
-check("22c diagnostics: one migration, two duplicates resolved, both with another value", counter(after22, "migrated") - counter(before22, "migrated") == 1 && counter(after22, "duplicatesResolved") - counter(before22, "duplicatesResolved") == 2 && counter(after22, "conflictingDuplicates") - counter(before22, "conflictingDuplicates") == 2, "\(before22) \(after22)")
-check("22d seed two copies of d4", legacyAppGroup.set("__secured_a", forKey: "d4", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_b", forKey: "d4", withAccessibility: .afterFirstUnlock))
-dupVault.queue.sync {
-    check("22d set over two copies leaves one fresh copy", describe(dupVault.storeValue("__secured_c", forKey: "d4")) == "resolve true" && groups("d4") == [appIdGroup] && describe(dupVault.loadValue(forKey: "d4")) == "resolve __secured_c", "\(groups("d4"))")
-    check("22e second sweep rewrites nothing", { () -> Bool in
-        let snapshot = items().map { "\($0[kSecAttrAccessGroup as String] ?? "")|\(($0[kSecAttrModificationDate as String] as? Date)?.timeIntervalSince1970 ?? 0)" }.sorted()
-        _ = dupVault.migrateLegacyValues()
-        return snapshot == items().map { "\($0[kSecAttrAccessGroup as String] ?? "")|\(($0[kSecAttrModificationDate as String] as? Date)?.timeIntervalSince1970 ?? 0)" }.sorted() && snapshot.count == 4
-    }())
-}
-check("22f the 0.13.0 query shape (no group, account + generic) still finds migrated items", legacy.hasValue(forKey: "d1") && legacy.hasValue(forKey: "d3") && legacy.hasValue(forKey: "d4"))
-dupVault.queue.sync {
-    check("22g seed a copy written by this version", describe(dupVault.storeValue("__secured_marked", forKey: "d5")) == "resolve true" && marked("d5") == [true])
-}
-Thread.sleep(forTimeInterval: 0.05)
-check("22g seed a newer unmarked copy in the shared group", legacy.set("__secured_unmarked", forKey: "d5", withAccessibility: .afterFirstUnlock) && groups("d5") == [appIdGroup, sharedGroup], "\(groups("d5"))")
-dupVault.queue.sync {
-    check("22g a copy written by this version beats a newer unmarked one", describe(dupVault.loadValue(forKey: "d5")) == "resolve __secured_marked" && groups("d5") == [appIdGroup], "\(groups("d5"))")
-}
-
-print("--- 23 legacy bundle id service item")
-check("23a seed bundle id item", KeychainWrapper.standard.set("__secured_std1", forKey: "std1"))
-dupVault.queue.sync {
-    check("23a get moves it", describe(dupVault.loadValue(forKey: "std1")) == "resolve __secured_std1")
-    check("23a now in cap_sec, app-ID group, encrypted, aku", groups("std1") == [appIdGroup] && encrypted("std1") && accessible("std1") == ["aku"], "\(groups("std1"))")
-}
-check("23a bundle id copy deleted after the verified write", !KeychainWrapper.standard.hasValue(forKey: "std1"))
-check("23b seed cap_sec copy", legacy.set("__secured_cap", forKey: "std2", withAccessibility: .afterFirstUnlock))
-Thread.sleep(forTimeInterval: 0.05)
-check("23b seed newer bundle id copy", KeychainWrapper.standard.set("__secured_newer_std", forKey: "std2"))
-dupVault.queue.sync {
-    check("23b cap_sec copy wins over a newer bundle id copy", describe(dupVault.loadValue(forKey: "std2")) == "resolve __secured_cap")
-}
-check("23b get leaves the bundle id duplicate to the sweep", KeychainWrapper.standard.hasValue(forKey: "std2"))
-dupVault.queue.sync { _ = dupVault.migrateLegacyValues() }
-check("23b sweep removes the bundle id duplicate", !KeychainWrapper.standard.hasValue(forKey: "std2") && groups("std2") == [appIdGroup])
-check("23c bundle id items of other keys stay", KeychainWrapper.standard.set("__secured_foreign", forKey: "foreign") && { dupVault.queue.sync { _ = dupVault.migrateLegacyValues() }; return KeychainWrapper.standard.string(forKey: "foreign") == "__secured_foreign" }())
-_ = KeychainWrapper.standard.removeObject(forKey: "foreign")
+check("22b the older marked copy counts as conflicting", delta(before22b, diagnostics(rankVault), "conflictingDuplicates") == 1)
 
 print("--- 24 mixed plaintext and encrypted items")
 cleanAll()
 let mixVault = makeVault()
-check("24 seed plaintext ck in the shared group", legacy.set("__secured_m1", forKey: "m1", withAccessibility: .afterFirstUnlock))
-check("24 seed plaintext aku in the app-ID group", legacyAppGroup.set("__secured_m2", forKey: "m2", withAccessibility: .whenUnlockedThisDeviceOnly))
+check("24 seed plaintext ck in the shared group", wrapper.set("__secured_m1", forKey: "m1", withAccessibility: .afterFirstUnlock))
+check("24 seed plaintext aku in the app-ID group", wrapperAppGroup.set("__secured_m2", forKey: "m2", withAccessibility: .whenUnlockedThisDeviceOnly))
 var mixBefore: [String: [Data]] = [:]
 mixVault.queue.sync {
     check("24 seed encrypted aku via set", describe(mixVault.storeValue("__secured_m3", forKey: "m3")) == "resolve true")
     check("24 seed encrypted per-call ck via set", describe(mixVault.storeValue("__secured_m4", forKey: "m4", accessibility: .afterFirstUnlock)) == "resolve true")
-    check("24 seed encrypted ck in the shared group", encode(mixVault, "__secured_m5").map { write(mixVault, "m5", $0, kSecAttrAccessibleAfterFirstUnlock) } == errSecSuccess && groups("m5") == [sharedGroup])
-    for key in ["m3", "m4", "m5"] { mixBefore[key] = storedData(key) }
+    check("24 seed an encrypted unmarked ck copy in cap_sec", encode(mixVault, "__secured_m5").map { addRaw("m5", $0, group: sharedGroup) } == errSecSuccess)
+    for key in ["m3", "m4"] { mixBefore[key] = storedData(key) }
     check("24 sweep resolves", describe(mixVault.migrateLegacyValues()) == "resolve -")
 }
-check("24 every item in the app-ID group", ["m1", "m2", "m3", "m4", "m5"].allSatisfy { groups($0) == [appIdGroup] }, "\(["m1", "m2", "m3", "m4", "m5"].map { groups($0) })")
-check("24 every item encrypted", ["m1", "m2", "m3", "m4", "m5"].allSatisfy { encrypted($0) })
-check("24 legacy plaintext tightened to aku", accessible("m1") == ["aku"] && accessible("m2") == ["aku"])
-check("24 items written by this version keep their class and bytes", accessible("m3") == ["aku"] && accessible("m4") == ["ck"] && accessible("m5") == ["ck"] && ["m3", "m4", "m5"].allSatisfy { storedData($0) == mixBefore[$0] }, "\(accessible("m4")) \(accessible("m5"))")
+let mixKeys = ["m1", "m2", "m3", "m4", "m5"]
+check("24 every key has one cap_sec_v2 item in the app-ID group", mixKeys.allSatisfy { groups($0) == [appIdGroup] }, "\(mixKeys.map { groups($0) })")
+check("24 every item encrypted", mixKeys.allSatisfy { encrypted($0) })
+check("24 0.13.0 plaintext tightened to aku", accessible("m1") == ["aku"] && accessible("m2") == ["aku"])
+check("24 an encrypted unmarked copy keeps its bytes and gets at least the configured class", storedData("m5") == storedData("m5", in: legacyService) && accessible("m5") == ["aku"], "\(accessible("m5"))")
+check("24 items set after the upgrade keep their class and bytes", accessible("m3") == ["aku"] && accessible("m4") == ["ck"] && ["m3", "m4"].allSatisfy { storedData($0) == mixBefore[$0] })
 mixVault.queue.sync {
-    check("24 keys lists each key once", { () -> Bool in
-        guard case .resolve(let data) = mixVault.listStoredKeys(), let keys = data["value"] as? [String] else { return false }
-        return keys.sorted() == ["m1", "m2", "m3", "m4", "m5"]
-    }())
-    check("24 every value reads back", ["m1", "m2", "m3", "m4", "m5"].allSatisfy { describe(mixVault.loadValue(forKey: $0)) == "resolve __secured_\($0)" })
+    check("24 keys lists each key once", listed(mixVault) == mixKeys)
+    check("24 every value reads back", mixKeys.allSatisfy { describe(mixVault.loadValue(forKey: $0)) == "resolve __secured_\($0)" })
 }
 
-print("--- 25 ciphertext that cannot be decrypted")
+print("--- 25 a legacy winner that cannot be decrypted")
 cleanAll()
 let badVault = makeVault()
-check("25 seed older plaintext copy in the shared group", legacy.set("__secured_older", forKey: "u1", withAccessibility: .afterFirstUnlock))
-Thread.sleep(forTimeInterval: 0.05)
-check("25 seed newer undecryptable copy in the app-ID group, written by this version", addRaw("u1", magic + Data(repeating: 0x5A, count: 97), group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
-let before25 = diagnostics(badVault)
 let garbage25 = magic + Data(repeating: 0x5A, count: 97)
-func copy(_ account: String, in group: String) -> [String: Any]? {
-    return items(account: account).first { ($0[kSecAttrAccessGroup as String] as? String) == group }
-}
-func copyData(_ account: String, in group: String) -> Data? {
-    return copy(account, in: group)?[kSecValueData as String] as? Data
-}
-func copyClass(_ account: String, in group: String) -> String? {
-    return copy(account, in: group)?[kSecAttrAccessible as String] as? String
-}
-func copyMarked(_ account: String, in group: String) -> Bool {
-    return copy(account, in: group)?[kSecAttrLabel as String] as? String == marker
-}
+check("25 seed an older plaintext copy in the shared group", wrapper.set("__secured_older", forKey: "u1", withAccessibility: .afterFirstUnlock))
+Thread.sleep(forTimeInterval: 0.05)
+check("25 seed a newer undecryptable copy an earlier build of this fork wrote", addRaw("u1", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
+let legacy25 = snapshot(legacyService)
+let before25 = diagnostics(badVault)
 badVault.queue.sync {
     let read = badVault.loadValue(forKey: "u1")
     check("25 get reports missing with code UNREADABLE", describe(read) == "reject Item with given key does not exist" && code(read) == "UNREADABLE", "\(describe(read)) \(code(read))")
-    check("25 nothing deleted, no stale value resurrected", groups("u1") == [appIdGroup, sharedGroup])
-    check("25 the older plaintext copy is encrypted and tightened in place: shared group, aku, still unmarked", copyData("u1", in: sharedGroup)?.starts(with: magic) == true && copyClass("u1", in: sharedGroup) == "aku" && !copyMarked("u1", in: sharedGroup), "\(copyClass("u1", in: sharedGroup) ?? "nil")")
-    check("25 the undecryptable copy is untouched", copyData("u1", in: appIdGroup) == garbage25 && copyMarked("u1", in: appIdGroup))
-    let again = badVault.loadValue(forKey: "u1")
-    check("25 the next get is still UNREADABLE, the rewritten older copy does not win", code(again) == "UNREADABLE", describe(again))
-    check("25 sweep leaves both copies", describe(badVault.migrateLegacyValues()) == "resolve -" && groups("u1") == [appIdGroup, sharedGroup])
-    check("25 set overwrites, one copy left", describe(badVault.storeValue("__secured_fresh", forKey: "u1")) == "resolve true" && describe(badVault.loadValue(forKey: "u1")) == "resolve __secured_fresh" && groups("u1") == [appIdGroup], "\(groups("u1"))")
+    check("25 nothing copied, the stale value is not promoted", items(account: "u1").isEmpty)
+    check("25 the sweep copies nothing either", describe(badVault.migrateLegacyValues()) == "resolve -" && items(account: "u1").isEmpty)
+    check("25 set writes cap_sec_v2", describe(badVault.storeValue("__secured_fresh", forKey: "u1")) == "resolve true" && describe(badVault.loadValue(forKey: "u1")) == "resolve __secured_fresh" && groups("u1") == [appIdGroup])
 }
-check("25 decryptFailures counted for two gets and the sweep", counter(diagnostics(badVault), "decryptFailures") - counter(before25, "decryptFailures") == 3, "\(diagnostics(badVault))")
+check("25 both legacy copies are unchanged, the plaintext copy is not rewritten in place", legacy25.count == 2 && snapshot(legacyService) == legacy25)
+check("25 decryptFailures counted for the get and the sweep", delta(before25, diagnostics(badVault), "decryptFailures") == 2, "\(diagnostics(badVault))")
+check("25b seed an older plaintext copy in the shared group", wrapper.set("__secured_older_b", forKey: "u2", withAccessibility: .afterFirstUnlock))
+Thread.sleep(forTimeInterval: 0.05)
+check("25b seed an undecryptable copy without the label in the app-ID group", addRaw("u2", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly) == errSecSuccess)
+check("25b upstream 0.13.0 reads the undecryptable copy", wrapper.data(forKey: "u2") == garbage25)
+badVault.queue.sync {
+    check("25b get is UNREADABLE and copies nothing", code(badVault.loadValue(forKey: "u2")) == "UNREADABLE" && items(account: "u2").isEmpty)
+}
+check("25b the older plaintext copy stays plaintext", storedData("u2", in: legacyService).contains(Data("__secured_older_b".utf8)))
 let noKeyTags = tags("harness.25.nokey")
 let noKeyVault = makeVault(keyTag: noKeyTags.name)
 noKeyVault.queue.sync {
@@ -881,76 +866,25 @@ noKeyVault.queue.sync {
     check("25 ciphertext of a key that does not exist is UNREADABLE", describe(read) == "reject Item with given key does not exist" && code(read) == "UNREADABLE", describe(read))
     check("25 decrypting never creates a key", keyCount(noKeyTags.secureEnclave) + keyCount(noKeyTags.software) == 0)
 }
-check("25b seed older plaintext copy in the shared group", legacy.set("__secured_older_b", forKey: "u2", withAccessibility: .afterFirstUnlock))
-Thread.sleep(forTimeInterval: 0.05)
-check("25b seed an undecryptable copy without the label in the app-ID group", addRaw("u2", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly) == errSecSuccess)
-check("25b upstream 0.13.0 reads the undecryptable copy", legacy.data(forKey: "u2") == garbage25)
-badVault.queue.sync {
-    check("25b get is UNREADABLE", code(badVault.loadValue(forKey: "u2")) == "UNREADABLE")
-    check("25b the older unlabelled copy is encrypted and tightened in place", copyData("u2", in: sharedGroup)?.starts(with: magic) == true && copyClass("u2", in: sharedGroup) == "aku" && !copyMarked("u2", in: sharedGroup))
-    check("25b the next get still settles on the copy upstream read", code(badVault.loadValue(forKey: "u2")) == "UNREADABLE" && legacy.data(forKey: "u2") == garbage25)
-}
-check("25c seed an older copy that is not UTF-8 in the shared group", addRaw("u3", Data([0xFF, 0xFE, 0x00]), group: sharedGroup) == errSecSuccess)
-Thread.sleep(forTimeInterval: 0.05)
-check("25c seed a newer undecryptable copy written by this version", addRaw("u3", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
-badVault.queue.sync {
-    check("25c get is UNREADABLE", code(badVault.loadValue(forKey: "u3")) == "UNREADABLE")
-    check("25c an older copy that is not readable plaintext stays as it is", copyData("u3", in: sharedGroup) == Data([0xFF, 0xFE, 0x00]) && copyClass("u3", in: sharedGroup) == "ck")
-    check("25c the next set removes it", describe(badVault.storeValue("__secured_u3", forKey: "u3")) == "resolve true" && groups("u3") == [appIdGroup])
-}
 
-print("--- 26 clear and remove only touch cap_sec")
+print("--- 26 clear and remove only touch cap_sec_v2, cap_sec and the bundle id copies of their keys")
 cleanAll()
 let clearTags = tags("harness.26")
 let clearVault = makeVault(keyTag: clearTags.name)
 check("26 seed item under another service", addRaw("o1", Data("__secured_other".utf8), group: nil, in: otherService) == errSecSuccess)
 check("26 seed item without a service (fingerprint-aio __aio_key)", SecItemAdd([kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: noServiceAccount, kSecValueData as String: Data("__secured_aio".utf8)] as CFDictionary, nil) == errSecSuccess && noServiceItemExists())
-check("26 seed cap_sec item in the shared group", legacy.set("__secured_c3", forKey: "c3", withAccessibility: .afterFirstUnlock))
+check("26 seed cap_sec item in the shared group", wrapper.set("__secured_c3", forKey: "c3", withAccessibility: .afterFirstUnlock))
 clearVault.queue.sync {
-    check("26 seed cap_sec items", describe(clearVault.storeValue("__secured_c1", forKey: "c1")) == "resolve true" && describe(clearVault.storeValue("__secured_c2", forKey: "c2")) == "resolve true")
-    check("26 keys ignores other services", { () -> Bool in
-        guard case .resolve(let data) = clearVault.listStoredKeys(), let keys = data["value"] as? [String] else { return false }
-        return keys.sorted() == ["c1", "c2", "c3"]
-    }())
-    check("26 remove of a missing key rejects NOT_FOUND", code(clearVault.removeValue(forKey: "o1")) == "NOT_FOUND" && items(account: "o1", in: otherService).count == 1)
+    check("26 seed cap_sec_v2 items", describe(clearVault.storeValue("__secured_c1", forKey: "c1")) == "resolve true" && describe(clearVault.storeValue("__secured_c2", forKey: "c2")) == "resolve true")
+    check("26 keys ignores other services", listed(clearVault) == ["c1", "c2", "c3"])
+    check("26 remove of a key only another service has rejects NOT_FOUND", code(clearVault.removeValue(forKey: "o1")) == "NOT_FOUND" && items(account: "o1", in: otherService).count == 1)
     check("26 clear resolves", describe(clearVault.removeAllValues()) == "resolve true")
 }
-check("26 cap_sec empty in every group", items().isEmpty)
+check("26 cap_sec_v2 and cap_sec empty in every group", items().isEmpty && items(in: legacyService).isEmpty)
 check("26 other service item survived", storedData("o1", in: otherService) == [Data("__secured_other".utf8)])
 check("26 item without a service survived", noServiceItemExists())
 check("26 Secure Enclave key survived", keyCount(clearTags.secureEnclave) + keyCount(clearTags.software) == 1)
-check("26 no probe items left behind", items(in: service + ".probe").isEmpty)
-
-print("--- 27 explicit group not permitted")
-cleanAll()
-let fallbackTags = tags("harness.27")
-let fallbackVault = makeVault(keyTag: fallbackTags.name, bundleIdentifier: "capacitor-secure-storage-plugin.not-permitted")
-fallbackVault.queue.sync {
-    check("27 falls back to the default group", fallbackVault.resolveAccessGroup() == SecureStorageVault.AccessGroupMode(explicitGroup: nil, defaultGroup: sharedGroup), "\(String(describing: fallbackVault.resolveAccessGroup()))")
-    check("27 set lands in the default group", describe(fallbackVault.storeValue("__secured_fb", forKey: "fb1")) == "resolve true" && groups("fb1") == [sharedGroup], "\(groups("fb1"))")
-    check("27 get works", describe(fallbackVault.loadValue(forKey: "fb1")) == "resolve __secured_fb")
-    check("27 key created in the default group", keyAttributes(fallbackTags.secureEnclave).first?[kSecAttrAccessGroup as String] as? String == sharedGroup)
-}
-check("27 diagnostics accessGroupMode default", diagnostics(fallbackVault)["accessGroupMode"] as? String == "default")
-let noBundleVault = makeVault(bundleIdentifier: nil)
-check("27 no bundle id falls back too", noBundleVault.queue.sync { noBundleVault.resolveAccessGroup() } == SecureStorageVault.AccessGroupMode(explicitGroup: nil, defaultGroup: sharedGroup))
-let explicitTags = tags("harness.27e")
-let explicitVault = makeVault(keyTag: explicitTags.name)
-explicitVault.queue.sync {
-    check("27 explicit mode", explicitVault.resolveAccessGroup() == SecureStorageVault.AccessGroupMode(explicitGroup: appIdGroup, defaultGroup: sharedGroup))
-    check("27 explicit set lands in the app-ID group", describe(explicitVault.storeValue("__secured_ex", forKey: "ex1")) == "resolve true" && groups("ex1") == [appIdGroup])
-    check("27 explicit key created in the app-ID group", keyAttributes(explicitTags.secureEnclave).first?[kSecAttrAccessGroup as String] as? String == appIdGroup)
-}
-let explicitDiagnostics = diagnostics(explicitVault)
-check("27 diagnostics accessGroupMode explicit, keyBackend secureEnclave", explicitDiagnostics["accessGroupMode"] as? String == "explicit" && explicitDiagnostics["keyBackend"] as? String == "secureEnclave", "\(explicitDiagnostics)")
-check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates", "legacyCopiesKept", "keyBackend", "accessGroupMode"], "\(explicitDiagnostics.keys.sorted())")
-fallbackVault.queue.sync {
-    check("27 fallback mode moves an app-ID item into the default group", addRaw("fb2", Data("__secured_fb2".utf8), group: appIdGroup) == errSecSuccess && describe(fallbackVault.loadValue(forKey: "fb2")) == "resolve __secured_fb2" && groups("fb2") == [sharedGroup], "\(groups("fb2"))")
-}
-check("27 an existing key in another group is reused, not duplicated", { () -> Bool in
-    let reuse = makeVault(keyTag: fallbackTags.name)
-    return reuse.queue.sync { encode(reuse, "__secured_reuse").map { describe(reuse.decodeValue($0)) } == "decrypted(__secured_reuse)" } && keyCount(fallbackTags.secureEnclave) + keyCount(fallbackTags.software) == 1
-}())
+check("26 no probe items left behind", items(in: legacyService + ".probe").isEmpty)
 
 print("--- 28 migration never loosens (all 25 pairs, encrypted lazily and plaintext via sweep)")
 cleanAll()
@@ -966,7 +900,7 @@ for encrypts in [true, false] {
         for (configured, _) in wrapperClasses {
             let key = "n.\(encrypts).\(existing.rawValue).\(configured.rawValue)"
             let expected = existing.tightened(toAtLeast: configured).attribute as String
-            let seeded = legacy.set("__secured_n", forKey: key, withAccessibility: wrapperClass)
+            let seeded = wrapper.set("__secured_n", forKey: key, withAccessibility: wrapperClass)
             let matrixVault = makeVault(configured, encrypts: encrypts)
             matrixVault.queue.sync {
                 if encrypts {
@@ -976,7 +910,7 @@ for encrypts in [true, false] {
                 }
             }
             let encodingOK = encrypts ? encrypted(key) : storedData(key) == [Data("__secured_n".utf8)]
-            check("28 \(encrypts ? "get" : "sweep") \(existing.rawValue) + \(configured.rawValue) -> \(expected)", seeded && accessible(key) == [expected] && groups(key) == [appIdGroup] && encodingOK, "\(accessible(key)) \(groups(key))")
+            check("28 \(encrypts ? "get" : "sweep") \(existing.rawValue) + \(configured.rawValue) -> \(expected)", seeded && accessible(key) == [expected] && groups(key) == [appIdGroup] && encodingOK && accessible(key, in: legacyService) == [existing.attribute as String], "\(accessible(key)) \(groups(key))")
         }
     }
 }
@@ -987,7 +921,7 @@ for (perCall, _) in wrapperClasses {
         _ = keepVault.storeValue("__secured_keep", forKey: key, accessibility: perCall)
         _ = keepVault.migrateLegacyValues()
     }
-    check("28 a per-call \(perCall.rawValue) written by this version survives the sweep under a stricter default", accessible(key) == [perCall.attribute as String], "\(accessible(key))")
+    check("28 a per-call \(perCall.rawValue) survives the sweep under a stricter default", accessible(key) == [perCall.attribute as String], "\(accessible(key))")
 }
 
 print("--- 29 Secure Enclave key class follows the configured class")
@@ -1011,55 +945,61 @@ plainFallbackVault.queue.sync {
     check("30 stored as plaintext with at least aku", storedData("pf1") == [Data("__secured_pf".utf8)] && accessible("pf1") == ["aku"] && groups("pf1") == [appIdGroup], "\(accessible("pf1"))")
     check("30 get returns it", describe(plainFallbackVault.loadValue(forKey: "pf1")) == "resolve __secured_pf")
     check("30 a stricter per-call class stays", describe(plainFallbackVault.storeValue("__secured_pf2", forKey: "pf2", accessibility: .whenPasscodeSetThisDeviceOnly)) == "resolve true" && accessible("pf2") == ["akpu"])
-    check("30 seed legacy ck", legacy.set("__secured_pf3", forKey: "pf3", withAccessibility: .afterFirstUnlock))
+    check("30 seed 0.13.0 ck", wrapper.set("__secured_pf3", forKey: "pf3", withAccessibility: .afterFirstUnlock))
     check("30 migration falls back too: plaintext, aku, app-ID group", describe(plainFallbackVault.loadValue(forKey: "pf3")) == "resolve __secured_pf3" && storedData("pf3") == [Data("__secured_pf3".utf8)] && accessible("pf3") == ["aku"] && groups("pf3") == [appIdGroup], "\(accessible("pf3")) \(groups("pf3"))")
     plainFallbackVault.simulatesEncryptionFailure = false
-    check("30 sweep encrypts the fallback items once encryption works, classes kept", describe(plainFallbackVault.migrateLegacyValues()) == "resolve -" && ["pf1", "pf2", "pf3"].allSatisfy { encrypted($0) } && accessible("pf1") == ["aku"] && accessible("pf2") == ["akpu"] && accessible("pf3") == ["aku"])
-    check("30 values still read back", ["pf1": "__secured_pf", "pf2": "__secured_pf2", "pf3": "__secured_pf3"].allSatisfy { describe(plainFallbackVault.loadValue(forKey: $0.key)) == "resolve \($0.value)" })
+    let snapshot30 = snapshot(currentService)
+    check("30 the sweep leaves plaintext cap_sec_v2 items alone", describe(plainFallbackVault.migrateLegacyValues()) == "resolve -" && snapshot(currentService) == snapshot30)
+    let values30 = ["pf1": "__secured_pf", "pf2": "__secured_pf2", "pf3": "__secured_pf3"]
+    check("30 get encrypts them in place once encryption works, classes kept", values30.allSatisfy { describe(plainFallbackVault.loadValue(forKey: $0.key)) == "resolve \($0.value)" } && ["pf1", "pf2", "pf3"].allSatisfy { encrypted($0) } && accessible("pf1") == ["aku"] && accessible("pf2") == ["akpu"] && accessible("pf3") == ["aku"], "\(accessible("pf1")) \(accessible("pf2")) \(accessible("pf3"))")
+    check("30 values still read back", values30.allSatisfy { describe(plainFallbackVault.loadValue(forKey: $0.key)) == "resolve \($0.value)" })
 }
 check("30 diagnostics count three plaintext fallbacks", counter(diagnostics(plainFallbackVault), "plaintextFallbacks") == 3, "\(diagnostics(plainFallbackVault))")
+check("30 the 0.13.0 item stays plaintext ck", storedData("pf3", in: legacyService) == [Data("__secured_pf3".utf8)] && accessible("pf3", in: legacyService) == ["ck"])
 
-print("--- 31 lost items with the real keychain and unlock probe")
+print("--- 31 lost items with the real keychain and unlock probe, phase 2")
 cleanAll()
 let lostTicker = HarnessTicker()
 let lostVault = SecureStorageVault(configuration: phaseTwo, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: lostTicker)
 let lostLog = EventLog()
-check("31 seed two copies of z1", legacyAppGroup.set("__secured_z_old", forKey: "z1", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_z_new", forKey: "z1", withAccessibility: .afterFirstUnlock))
-check("31 seed z2 and z3", legacy.set("__secured_z2", forKey: "z2", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_z3", forKey: "z3", withAccessibility: .afterFirstUnlock))
+check("31 seed two 0.13.0 copies of z1", wrapperAppGroup.set("__secured_z_old", forKey: "z1", withAccessibility: .afterFirstUnlock) && wrapper.set("__secured_z_new", forKey: "z1", withAccessibility: .afterFirstUnlock))
+check("31 seed z2 and z3", wrapper.set("__secured_z2", forKey: "z2", withAccessibility: .afterFirstUnlock) && wrapper.set("__secured_z3", forKey: "z3", withAccessibility: .afterFirstUnlock))
 lostVault.submitOperation(named: "set", key: "z1", run: { .locked }, lost: { lostVault.replaceLostValue("__secured_replaced", forKey: "z1") }, completion: { lostLog.record("set \(describe($0))") })
 lostVault.queue.sync {}
 lostTicker.fire(times: 2)
 check("31 a stuck set waits through two retries", lostLog.events.isEmpty)
 lostTicker.fire()
-check("31 then the lost set replaces every copy with one fresh item", lostLog.events == ["set resolve true"] && groups("z1") == [appIdGroup] && lostVault.queue.sync { describe(lostVault.loadValue(forKey: "z1")) } == "resolve __secured_replaced", "\(lostLog.events) \(groups("z1"))")
+check("31 then the lost set writes a fresh cap_sec_v2 item and phase 2 deletes the legacy copies", lostLog.events == ["set resolve true"] && groups("z1") == [appIdGroup] && items(account: "z1", in: legacyService).isEmpty && lostVault.queue.sync { describe(lostVault.loadValue(forKey: "z1")) } == "resolve __secured_replaced", "\(lostLog.events) \(groups("z1"))")
 lostVault.submitOperation(named: "get", key: "z2", run: { .locked }, lost: { lostVault.lostValue(forKey: "z2") }, completion: { lostLog.record("get \(describe($0)) \(code($0))") })
 lostVault.submitOperation(named: "remove", key: "z2", run: { .locked }, lost: { lostVault.removeLostValue(forKey: "z2") }, completion: { lostLog.record("remove \(describe($0))") })
 lostVault.queue.sync {}
 lostTicker.fire(times: 3)
 check("31 a lost get rejects as missing UNREADABLE", lostLog.events.contains("get reject Item with given key does not exist UNREADABLE"), "\(lostLog.events)")
 lostTicker.fire(times: 3)
-check("31 a lost remove deletes and resolves", lostLog.events.last == "remove resolve true" && items(account: "z2").isEmpty, "\(lostLog.events)")
+check("31 a lost remove deletes every copy and resolves", lostLog.events.last == "remove resolve true" && items(account: "z2").isEmpty && items(account: "z2", in: legacyService).isEmpty, "\(lostLog.events)")
 lostVault.submitOperation(named: "clear", key: "*", run: { .locked }, lost: { lostVault.removeAllLostValues() }, completion: { lostLog.record("clear \(describe($0))") })
 lostVault.queue.sync {}
 lostTicker.fire(times: 3)
-check("31 a lost clear deletes cap_sec and resolves", lostLog.events.last == "clear resolve true" && items().isEmpty)
+check("31 a lost clear deletes cap_sec_v2 and cap_sec and resolves", lostLog.events.last == "clear resolve true" && items().isEmpty && items(in: legacyService).isEmpty)
 check("31 lostItems counted", counter(diagnostics(lostVault), "lostItems") == 4 && counter(diagnostics(lostVault), "parked") == 4, "\(diagnostics(lostVault))")
-check("31 the unlock probe leaves no items behind", items(in: service + ".probe").isEmpty)
+check("31 the unlock probe leaves no items behind", items(in: legacyService + ".probe").isEmpty)
 
-print("--- 32 a parked get waits for the gate, then reads the migrated value")
+print("--- 32 a parked get waits for the gate, then copies the value")
 cleanAll()
 let gateFlag = Flag(false)
 let gateTicker = HarnessTicker()
-let gateVault = SecureStorageVault(configuration: phaseTwo, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { gateFlag.read() }, ticker: gateTicker)
+let gateVault = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { gateFlag.read() }, ticker: gateTicker)
 let gateLog = EventLog()
-check("32 seed legacy pin in the shared group", legacy.set("__secured_1234", forKey: "pin", withAccessibility: .afterFirstUnlock))
+check("32 seed 0.13.0 pin in the shared group", wrapper.set("__secured_1234", forKey: "pin", withAccessibility: .afterFirstUnlock))
+let pin32 = snapshot(legacyService)
 gateVault.submitOperation(named: "get", key: "pin", run: { gateVault.loadValue(forKey: "pin") }, lost: { gateVault.lostValue(forKey: "pin") }, completion: { gateLog.record("get \(describe($0))") })
 gateVault.queue.sync {}
 gateTicker.fire(times: 10)
-check("32 parked while locked, nothing migrated", gateLog.events.isEmpty && groups("pin") == [sharedGroup] && accessible("pin") == ["ck"])
+check("32 parked while locked, nothing copied", gateLog.events.isEmpty && items(account: "pin").isEmpty)
 gateFlag.write(true)
 gateTicker.fire()
-check("32 resolves with the value after unlock, migrated", gateLog.events == ["get resolve __secured_1234"] && groups("pin") == [appIdGroup] && encrypted("pin") && accessible("pin") == ["aku"], "\(gateLog.events)")
+check("32 resolves with the value after unlock, copied into cap_sec_v2", gateLog.events == ["get resolve __secured_1234"] && groups("pin") == [appIdGroup] && encrypted("pin") && accessible("pin") == ["aku"], "\(gateLog.events)")
+check("32 the 0.13.0 item is unchanged", snapshot(legacyService) == pin32)
 
 print("--- 33 decryption failures on an unlocked device")
 cleanAll()
@@ -1094,7 +1034,7 @@ retryVault.queue.sync {
     check("33 nothing was deleted, the value still reads back", describe(retryVault.loadValue(forKey: "r1")) == "resolve __secured_retry" && items(account: "r1").count == 1)
 }
 let parkTicker = HarnessTicker()
-let parkVault = SecureStorageVault(configuration: phaseTwo, keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: parkTicker)
+let parkVault = SecureStorageVault(keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: parkTicker)
 let parkLog = EventLog()
 parkVault.queue.sync {
     parkVault.decryptRetryDelays = [0, 0]
@@ -1120,7 +1060,7 @@ check("33 the key is kept", keyCount(retryTags.secureEnclave) + keyCount(retryTa
 // A failure that only this ciphertext shows: the key still opens fresh ciphertext, so only this call ends, as lost.
 let brokenCiphertext = storedData("r1").first.map { Data($0.dropFirst(magic.count)) }
 let itemTicker = HarnessTicker()
-let itemVault = SecureStorageVault(configuration: phaseTwo, keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: itemTicker)
+let itemVault = SecureStorageVault(keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: itemTicker)
 let itemLog = EventLog()
 itemVault.queue.sync {
     itemVault.decryptRetryDelays = [0, 0]
@@ -1143,7 +1083,7 @@ print("--- 34 a key that keeps refusing with -25308 while unlocked (Quick Start 
 cleanAll()
 let zombieTags = tags("harness.34")
 let zombieTicker = HarnessTicker()
-let zombieVault = SecureStorageVault(configuration: phaseTwo, keyTag: zombieTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: zombieTicker)
+let zombieVault = SecureStorageVault(keyTag: zombieTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: zombieTicker)
 let zombieLog = EventLog()
 zombieVault.queue.sync {
     check("34 seed an encrypted value while the key works", describe(zombieVault.storeValue("__secured_z1", forKey: "zk1")) == "resolve true" && encrypted("zk1"))
@@ -1161,7 +1101,7 @@ check("34 diagnostics: keyBackend unusable, one plaintext fallback, no lost item
 zombieVault.queue.sync {
     let read = zombieVault.loadValue(forKey: "zk1")
     check("34 ciphertext of the refused key reads as missing UNREADABLE right away", code(read) == "UNREADABLE", describe(read))
-    check("34 the plaintext fallback reads back", describe(zombieVault.loadValue(forKey: "zk2")) == "resolve __secured_z2")
+    check("34 the plaintext fallback reads back and stays plaintext", describe(zombieVault.loadValue(forKey: "zk2")) == "resolve __secured_z2" && storedData("zk2") == [Data("__secured_z2".utf8)])
 }
 check("34 the ciphertext item and the key are kept", encrypted("zk1") && items(account: "zk1").count == 1 && keyCount(zombieTags.secureEnclave) + keyCount(zombieTags.software) == 1)
 let zombieReader = makeVault(keyTag: zombieTags.name)
@@ -1188,217 +1128,331 @@ checkVault.queue.sync {
     checkVault.decryptCiphertext = decryptionFailing(after: 0)
     let fallbacksBefore = checkVault.counters.plaintextFallbacks
     check("35 a set whose ciphertext does not decrypt stores plaintext with the strict class", describe(checkVault.storeValue("__secured_c0", forKey: "c0")) == "resolve true" && storedData("c0") == [Data("__secured_c0".utf8)] && accessible("c0") == ["aku"] && checkVault.counters.plaintextFallbacks - fallbacksBefore == 1, "\(accessible("c0"))")
-    check("35 seed legacy plaintext in the shared group", legacy.set("__secured_c1", forKey: "c1", withAccessibility: .afterFirstUnlock))
-    check("35 get of a legacy value whose new ciphertext does not decrypt returns the value", describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1")
-    check("35 that migration fell back to plaintext with the strict class and the value still reads back", storedData("c1") == [Data("__secured_c1".utf8)] && accessible("c1") == ["aku"] && groups("c1") == [appIdGroup] && describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1", "\(accessible("c1")) \(groups("c1"))")
+    check("35 seed 0.13.0 plaintext in the shared group", wrapper.set("__secured_c1", forKey: "c1", withAccessibility: .afterFirstUnlock))
+    check("35 get of a 0.13.0 value whose new ciphertext does not decrypt returns the value", describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1")
+    check("35 that copy fell back to plaintext with the strict class and the value still reads back", storedData("c1") == [Data("__secured_c1".utf8)] && accessible("c1") == ["aku"] && groups("c1") == [appIdGroup] && describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1", "\(accessible("c1")) \(groups("c1"))")
 
-    // The check in memory passes, the read-back after the write does not: the write is undone.
-    check("35 seed legacy plaintext in the app-ID group", legacyAppGroup.set("__secured_c2", forKey: "c2", withAccessibility: .afterFirstUnlock))
+    // The check in memory passes, the read-back after the write does not.
+    check("35 seed 0.13.0 plaintext in the app-ID group", wrapperAppGroup.set("__secured_c2", forKey: "c2", withAccessibility: .afterFirstUnlock))
     checkVault.decryptCiphertext = decryptionFailing(after: 1)
-    check("35 get returns the legacy value although the rewritten copy does not verify", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2")
-    check("35 an update that does not verify is put back: plaintext, ck, unmarked, app-ID group", storedData("c2") == [Data("__secured_c2".utf8)] && accessible("c2") == ["ck"] && marked("c2") == [false] && groups("c2") == [appIdGroup], "\(accessible("c2")) \(marked("c2"))")
-    check("35 seed legacy plaintext in the shared group for an add", legacy.set("__secured_c3", forKey: "c3", withAccessibility: .afterFirstUnlock))
+    check("35 get returns the 0.13.0 value although the new item does not verify", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2")
+    check("35 the unverified cap_sec_v2 item is deleted again", items(account: "c2").isEmpty)
     checkVault.decryptCiphertext = decryptionFailing(after: 1)
-    check("35 get returns the legacy value although the added copy does not verify", describe(checkVault.loadValue(forKey: "c3")) == "resolve __secured_c3")
-    check("35 an add that does not verify is deleted again and the legacy copy stays as it was", groups("c3") == [sharedGroup] && storedData("c3") == [Data("__secured_c3".utf8)] && accessible("c3") == ["ck"], "\(groups("c3"))")
+    check("35 get of a plaintext cap_sec_v2 item whose encryption does not verify returns the value", describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1")
+    check("35 and puts the plaintext back with its class", storedData("c1") == [Data("__secured_c1".utf8)] && accessible("c1") == ["aku"])
     checkVault.decryptCiphertext = SecKeyCreateDecryptedData
-    check("35 once decryption works the sweep migrates them", describe(checkVault.migrateLegacyValues()) == "resolve -" && encrypted("c2") && encrypted("c3") && groups("c3") == [appIdGroup] && accessible("c2") == ["aku"] && accessible("c3") == ["aku"])
-    check("35 the values read back", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2" && describe(checkVault.loadValue(forKey: "c3")) == "resolve __secured_c3")
+    check("35 once decryption works the sweep copies c2", describe(checkVault.migrateLegacyValues()) == "resolve -" && encrypted("c2") && groups("c2") == [appIdGroup] && accessible("c2") == ["aku"])
+    check("35 and get encrypts c1 in place", describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1" && encrypted("c1") && accessible("c1") == ["aku"])
+    check("35 the values read back", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2" && describe(checkVault.loadValue(forKey: "c1")) == "resolve __secured_c1")
 }
+check("35 the 0.13.0 items are unchanged", storedData("c1", in: legacyService) == [Data("__secured_c1".utf8)] && storedData("c2", in: legacyService) == [Data("__secured_c2".utf8)] && accessible("c1", in: legacyService) == ["ck"] && accessible("c2", in: legacyService) == ["ck"])
 
-print("--- 36 phase 1: an upgrade keeps the older copies as they are")
+print("--- A upgrade from 0.13.0 with copies in the app-ID group and the shared group")
 cleanAll()
-func copySnapshot(_ account: String, in group: String) -> String? {
-    guard let item = copy(account, in: group) else { return nil }
-    let data = (item[kSecValueData as String] as? Data)?.base64EncodedString() ?? "nil"
-    let date = (item[kSecAttrModificationDate as String] as? Date)?.timeIntervalSince1970 ?? 0
-    return "\(item[kSecAttrAccessible as String] ?? "nil")|\(item[kSecAttrLabel as String] ?? "-")|\(data)|\(date)"
-}
-func serviceSnapshot(_ itemService: String) -> [String] {
-    return items(in: itemService).map { item in
-        let account = (item[kSecAttrAccount as String] as? Data).map { String(decoding: $0, as: UTF8.self) } ?? "nil"
-        let data = (item[kSecValueData as String] as? Data)?.base64EncodedString() ?? "nil"
-        let date = (item[kSecAttrModificationDate as String] as? Date)?.timeIntervalSince1970 ?? 0
-        return "\(account)|\(item[kSecAttrAccessGroup as String] ?? "nil")|\(item[kSecAttrAccessible as String] ?? "nil")|\(item[kSecAttrLabel as String] ?? "-")|\(data)|\(date)"
-    }.sorted()
-}
-func touch(_ account: String, in group: String, _ value: String) -> OSStatus {
-    let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: Data(account.utf8), kSecAttrAccessGroup as String: group]
-    return SecItemUpdate(query as CFDictionary, [kSecValueData as String: Data(value.utf8)] as CFDictionary)
-}
-func delta(_ before: [String: Any], _ after: [String: Any], _ name: String) -> Int {
-    return counter(after, name) - counter(before, name)
-}
-let standardService = KeychainWrapper.standard.serviceName
-let phaseOne = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true })
-check("36 the default configuration keeps older copies", !phaseOne.configuration.deletesLegacyCopies)
-check("36a seed a 0.13.0 copy in the shared group", legacy.set("__secured_k1_shared", forKey: "k1", withAccessibility: .afterFirstUnlock))
-check("36a seed a 0.13.0 copy in another older group", legacyOlderGroup.set("__secured_k1_older", forKey: "k1", withAccessibility: .afterFirstUnlock) && groups("k1") == [olderGroup, sharedGroup].sorted(), "\(groups("k1"))")
-let upstreamK1 = legacy.string(forKey: "k1") ?? "nil"
-let k1Shared = copySnapshot("k1", in: sharedGroup)
-let k1Older = copySnapshot("k1", in: olderGroup)
-let before36 = diagnostics(phaseOne)
-phaseOne.queue.sync {
-    check("36a get returns the copy upstream 0.13.0 read", describe(phaseOne.loadValue(forKey: "k1")) == "resolve \(upstreamK1)", upstreamK1)
-}
-check("36a both older copies are unchanged: data, class, group, label and date", k1Shared != nil && k1Older != nil && copySnapshot("k1", in: sharedGroup) == k1Shared && copySnapshot("k1", in: olderGroup) == k1Older)
-check("36a a labelled encrypted copy with the configured class sits in the app-ID group", groups("k1") == [appIdGroup, olderGroup, sharedGroup].sorted() && copyMarked("k1", in: appIdGroup) && copyData("k1", in: appIdGroup)?.starts(with: magic) == true && copyClass("k1", in: appIdGroup) == "aku", "\(groups("k1"))")
-let after36 = diagnostics(phaseOne)
-check("36a diagnostics: one migration, nothing deleted, one key with older copies kept", delta(before36, after36, "migrated") == 1 && delta(before36, after36, "duplicatesResolved") == 0 && delta(before36, after36, "conflictingDuplicates") == 0 && delta(before36, after36, "legacyCopiesKept") == 1, "\(after36)")
-let k1Target = copySnapshot("k1", in: appIdGroup)
-phaseOne.queue.sync {
-    check("36a the next get returns the same value and writes nothing", describe(phaseOne.loadValue(forKey: "k1")) == "resolve \(upstreamK1)" && copySnapshot("k1", in: appIdGroup) == k1Target && copySnapshot("k1", in: sharedGroup) == k1Shared && copySnapshot("k1", in: olderGroup) == k1Older)
-}
-check("36a a key counts once in legacyCopiesKept", delta(before36, diagnostics(phaseOne), "legacyCopiesKept") == 1)
-
-check("36b seed a 0.13.0 copy in the app-ID group and one in the shared group", legacyAppGroup.set("__secured_k2_app", forKey: "k2", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_k2_shared", forKey: "k2", withAccessibility: .afterFirstUnlock) && groups("k2") == [appIdGroup, sharedGroup])
-check("36b seed a 0.13.0 copy in the shared group and a bundle id copy", legacy.set("__secured_k3_shared", forKey: "k3", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_k3_std", forKey: "k3"))
-let upstreamK2 = legacy.string(forKey: "k2") ?? "nil"
-let k2Shared = copySnapshot("k2", in: sharedGroup)
-let k3Shared = copySnapshot("k3", in: sharedGroup)
-let standardBefore36 = serviceSnapshot(standardService)
-let before36b = diagnostics(phaseOne)
-phaseOne.queue.sync {
-    check("36b the first sweep resolves", describe(phaseOne.migrateLegacyValues()) == "resolve -")
-}
-check("36b k2: the shared copy is unchanged", k2Shared != nil && copySnapshot("k2", in: sharedGroup) == k2Shared)
-check("36b k2: the 0.13.0 copy in the app-ID group is the place of the new copy, now labelled, encrypted, aku", groups("k2") == [appIdGroup, sharedGroup] && copyMarked("k2", in: appIdGroup) && copyData("k2", in: appIdGroup)?.starts(with: magic) == true && copyClass("k2", in: appIdGroup) == "aku", "\(groups("k2"))")
-check("36b k3: the shared copy and the bundle id copy are unchanged, a new copy sits in the app-ID group", k3Shared != nil && copySnapshot("k3", in: sharedGroup) == k3Shared && serviceSnapshot(standardService) == standardBefore36 && !standardBefore36.isEmpty && groups("k3") == [appIdGroup, sharedGroup] && copyMarked("k3", in: appIdGroup) && copyData("k3", in: appIdGroup)?.starts(with: magic) == true)
-phaseOne.queue.sync {
-    check("36b k2 reads the value upstream read, k3 the cap_sec value", describe(phaseOne.loadValue(forKey: "k2")) == "resolve \(upstreamK2)" && describe(phaseOne.loadValue(forKey: "k3")) == "resolve __secured_k3_shared", upstreamK2)
-}
-let after36b = diagnostics(phaseOne)
-check("36b diagnostics: two migrations, nothing deleted, an overwritten app-ID copy with another value counts as conflicting", delta(before36b, after36b, "migrated") == 2 && delta(before36b, after36b, "duplicatesResolved") == 0 && delta(before36b, after36b, "conflictingDuplicates") == (upstreamK2 == "__secured_k2_shared" ? 1 : 0) && delta(before36b, after36b, "legacyCopiesKept") == 2, "\(after36b)")
-
+let upgrade = makeVault()
+check("A seed pin in the app-ID group", wrapperAppGroup.set("__secured_pin_app", forKey: "pin", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 1.1)
-let secondLaunch = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true })
-let secondLaunchDecryptions = Flag(false)
-let everythingBefore36c = serviceSnapshot(service) + serviceSnapshot(standardService)
-secondLaunch.queue.sync {
-    secondLaunch.decryptCiphertext = { key, algorithm, ciphertext, error in
-        secondLaunchDecryptions.write(true)
+check("A seed pin in the shared group", wrapper.set("__secured_pin_shared", forKey: "pin", withAccessibility: .whenUnlocked))
+Thread.sleep(forTimeInterval: 1.1)
+check("A seed token in the shared group", wrapper.set("__secured_token_shared", forKey: "token", withAccessibility: .afterFirstUnlock))
+Thread.sleep(forTimeInterval: 1.1)
+check("A seed token in the app-ID group", wrapperAppGroup.set("__secured_token_app", forKey: "token", withAccessibility: .afterFirstUnlockThisDeviceOnly))
+let seededA = snapshot(legacyService)
+let datesA = Set(items(in: legacyService).compactMap { $0[kSecAttrModificationDate as String] as? Date })
+check("A four 0.13.0 items with four values and four dates", seededA.count == 4 && datesA.count == 4 && Set(storedData("pin", in: legacyService) + storedData("token", in: legacyService)).count == 4 && groups("pin", in: legacyService) == [appIdGroup, sharedGroup] && groups("token", in: legacyService) == [appIdGroup, sharedGroup])
+let upstreamPin = wrapper.string(forKey: "pin") ?? "nil"
+let upstreamToken = wrapper.string(forKey: "token") ?? "nil"
+check("A the upstream read differs from the newest copy at least once, so the rule is exercised", upstreamPin == "__secured_pin_app" || upstreamToken == "__secured_token_shared", "\(upstreamPin) \(upstreamToken)")
+let beforeA = diagnostics(upgrade)
+upgrade.queue.sync {
+    check("A get returns the value the 0.13.0 query returns", describe(upgrade.loadValue(forKey: "pin")) == "resolve \(upstreamPin)", upstreamPin)
+    check("A after get: one cap_sec_v2 pin in the app-ID group, encrypted, aku, holding that value", groups("pin") == [appIdGroup] && encrypted("pin") && accessible("pin") == ["aku"] && currentValue(upgrade, "pin") == "decrypted(\(upstreamPin))", "\(groups("pin"))")
+    check("A after get: token is not copied yet", items(account: "token").isEmpty)
+}
+check("A after get: the four 0.13.0 items are byte-identical (data, class, group, label, date)", snapshot(legacyService) == seededA)
+upgrade.queue.sync {
+    check("A sweep resolves", describe(upgrade.migrateLegacyValues()) == "resolve -")
+    check("A after the sweep: one cap_sec_v2 token in the app-ID group, encrypted, aku, holding the value the 0.13.0 query returns", groups("token") == [appIdGroup] && encrypted("token") && accessible("token") == ["aku"] && currentValue(upgrade, "token") == "decrypted(\(upstreamToken))", "\(groups("token"))")
+    check("A after the sweep: one cap_sec_v2 item per key", items().count == 2 && groups("pin") == [appIdGroup])
+}
+check("A after the sweep: the four 0.13.0 items are byte-identical", snapshot(legacyService) == seededA)
+let afterA = diagnostics(upgrade)
+check("A diagnostics: two keys migrated, the other copy of each held another value, nothing deleted, two keys with older copies kept", delta(beforeA, afterA, "migrated") == 2 && delta(beforeA, afterA, "conflictingDuplicates") == 2 && delta(beforeA, afterA, "duplicatesResolved") == 0 && delta(beforeA, afterA, "legacyCopiesKept") == 2, "\(afterA)")
+let currentA = snapshot(currentService)
+upgrade.queue.sync {
+    check("A the next gets return the same values and write nothing", describe(upgrade.loadValue(forKey: "pin")) == "resolve \(upstreamPin)" && describe(upgrade.loadValue(forKey: "token")) == "resolve \(upstreamToken)" && snapshot(currentService) == currentA)
+}
+
+print("--- B the sweep of the next launch")
+Thread.sleep(forTimeInterval: 1.1)
+let nextLaunch = makeVault()
+let decryptionsB = Tally()
+let everythingB = everything()
+nextLaunch.queue.sync {
+    nextLaunch.decryptCiphertext = { key, algorithm, ciphertext, error in
+        decryptionsB.add()
         return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
     }
-    check("36c the sweep of the next launch resolves", describe(secondLaunch.migrateLegacyValues()) == "resolve -")
-    secondLaunch.decryptCiphertext = SecKeyCreateDecryptedData
+    check("B the sweep resolves", describe(nextLaunch.migrateLegacyValues()) == "resolve -")
 }
-check("36c it writes nothing and decrypts nothing for keys that have their new copy", serviceSnapshot(service) + serviceSnapshot(standardService) == everythingBefore36c && !secondLaunchDecryptions.read())
-let second36c = diagnostics(secondLaunch)
-check("36c diagnostics of the next launch: no migration, nothing deleted, three keys with older copies kept", counter(second36c, "migrated") == 0 && counter(second36c, "duplicatesResolved") == 0 && counter(second36c, "legacyCopiesKept") == 3, "\(second36c)")
+check("B it writes nothing: every item of cap_sec_v2, cap_sec and the bundle id service is byte-identical with the same date", everythingB.count == 6 && everything() == everythingB)
+check("B it decrypts nothing", decryptionsB.read() == 0, "\(decryptionsB.read())")
+let diagnosticsB = diagnostics(nextLaunch)
+check("B diagnostics: nothing migrated or deleted, two keys with older copies kept", counter(diagnosticsB, "migrated") == 0 && counter(diagnosticsB, "duplicatesResolved") == 0 && counter(diagnosticsB, "conflictingDuplicates") == 0 && counter(diagnosticsB, "legacyCopiesKept") == 2, "\(diagnosticsB)")
+nextLaunch.queue.sync { nextLaunch.decryptCiphertext = SecKeyCreateDecryptedData }
 
-phaseOne.queue.sync {
-    check("36d set resolves", describe(phaseOne.storeValue("__secured_k1_new", forKey: "k1")) == "resolve true")
-    check("36d get returns the new value", describe(phaseOne.loadValue(forKey: "k1")) == "resolve __secured_k1_new")
+print("--- C set after the upgrade, and a downgrade to 0.13.0")
+upgrade.queue.sync {
+    check("C set resolves", describe(upgrade.storeValue("__secured_pin_new", forKey: "pin")) == "resolve true")
+    check("C get returns the new value", describe(upgrade.loadValue(forKey: "pin")) == "resolve __secured_pin_new")
+    check("C set changed the cap_sec_v2 item only", currentValue(upgrade, "pin") == "decrypted(__secured_pin_new)" && groups("pin") == [appIdGroup])
 }
-check("36d set changed only the new copy", copySnapshot("k1", in: appIdGroup) != k1Target && copyMarked("k1", in: appIdGroup) && copySnapshot("k1", in: sharedGroup) == k1Shared && copySnapshot("k1", in: olderGroup) == k1Older)
-
+check("C every 0.13.0 item is still byte-identical", snapshot(legacyService) == seededA)
+check("C the 0.13.0 query still returns the pre-upgrade values", wrapper.string(forKey: "pin") == upstreamPin && wrapper.string(forKey: "token") == upstreamToken)
 Thread.sleep(forTimeInterval: 1.1)
-check("36e an older copy is written again after the migration", touch("k1", in: sharedGroup, "__secured_k1_touched") == errSecSuccess)
-let touchedDate = copy("k1", in: sharedGroup)?[kSecAttrModificationDate as String] as? Date ?? .distantPast
-let newCopyDate = copy("k1", in: appIdGroup)?[kSecAttrModificationDate as String] as? Date ?? .distantFuture
-check("36e the older copy is now newer by date than the new copy", touchedDate > newCopyDate, "\(touchedDate) \(newCopyDate)")
-let k1Touched = copySnapshot("k1", in: sharedGroup)
-let k1NewCopy = copySnapshot("k1", in: appIdGroup)
-phaseOne.queue.sync {
-    check("36e get still returns the value of the new copy", describe(phaseOne.loadValue(forKey: "k1")) == "resolve __secured_k1_new")
-    check("36e the sweep still treats the key as settled", describe(phaseOne.migrateLegacyValues()) == "resolve -")
+check("C a 0.13.0 build writes the shared copy again", touch("pin", in: sharedGroup, "__secured_pin_downgrade") == errSecSuccess)
+check("C that copy is now newer by date than the cap_sec_v2 item", (modified("pin", in: sharedGroup, service: legacyService) ?? .distantPast) > (modified("pin", in: appIdGroup) ?? .distantFuture))
+let currentC = snapshot(currentService)
+upgrade.queue.sync {
+    check("C get still returns the cap_sec_v2 value", describe(upgrade.loadValue(forKey: "pin")) == "resolve __secured_pin_new")
+    check("C the sweep leaves the key alone", describe(upgrade.migrateLegacyValues()) == "resolve -" && snapshot(currentService) == currentC)
 }
-check("36e nothing was written", copySnapshot("k1", in: sharedGroup) == k1Touched && copySnapshot("k1", in: appIdGroup) == k1NewCopy && copySnapshot("k1", in: olderGroup) == k1Older)
 
-let f1Target = phaseOne.queue.sync { encode(phaseOne, "__secured_f1_target") }
-let f1Fallback = phaseOne.queue.sync { encode(phaseOne, "__secured_f1_fallback") }
-check("36f seed a copy this version wrote in the app-ID group", f1Target.map { addRaw("f1", $0, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) } == errSecSuccess)
+print("--- D remove, clear and keys")
+cleanAll()
+let wipe = makeVault()
+check("D seed k1 in two groups", wrapperAppGroup.set("__secured_k1_app", forKey: "k1", withAccessibility: .afterFirstUnlock) && wrapper.set("__secured_k1_shared", forKey: "k1", withAccessibility: .afterFirstUnlock))
+check("D seed k2 in the shared group and the bundle id service", wrapper.set("__secured_k2", forKey: "k2", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_k2_std", forKey: "k2"))
+check("D seed bundle id only k3 and an item of another key", KeychainWrapper.standard.set("__secured_k3", forKey: "k3") && KeychainWrapper.standard.set("__secured_foreign", forKey: "foreign"))
+wipe.queue.sync {
+    check("D seed k4 with set", describe(wipe.storeValue("__secured_k4", forKey: "k4")) == "resolve true")
+    check("D keys before the migration: cap_sec_v2 and cap_sec, each key once, bundle id items not listed", listed(wipe) == ["k1", "k2", "k4"], "\(listed(wipe) ?? [])")
+    check("D get of k1 and k3 and the sweep copy k1, k2 and k3", describe(wipe.loadValue(forKey: "k1")).hasPrefix("resolve __secured_k1_") && describe(wipe.loadValue(forKey: "k3")) == "resolve __secured_k3" && describe(wipe.migrateLegacyValues()) == "resolve -" && ["k1", "k2", "k3", "k4"].allSatisfy { items(account: $0).count == 1 })
+    check("D keys after the migration: the union, each key once", listed(wipe) == ["k1", "k2", "k3", "k4"], "\(listed(wipe) ?? [])")
+    check("D remove deletes the cap_sec_v2 item and both cap_sec copies", describe(wipe.removeValue(forKey: "k1")) == "resolve true" && items(account: "k1").isEmpty && items(account: "k1", in: legacyService).isEmpty)
+    check("D a removed key stays missing, no older copy comes back", code(wipe.loadValue(forKey: "k1")) == "NOT_FOUND")
+    check("D remove deletes the cap_sec_v2 item and the bundle id copy", describe(wipe.removeValue(forKey: "k3")) == "resolve true" && items(account: "k3").isEmpty && !KeychainWrapper.standard.hasValue(forKey: "k3"))
+    check("D seed k5 in cap_sec only", wrapper.set("__secured_k5", forKey: "k5", withAccessibility: .afterFirstUnlock))
+    check("D remove deletes a key that only has a cap_sec copy", describe(wipe.removeValue(forKey: "k5")) == "resolve true" && items(account: "k5", in: legacyService).isEmpty && items(account: "k5").isEmpty)
+    check("D remove of a missing key rejects NOT_FOUND", code(wipe.removeValue(forKey: "k1")) == "NOT_FOUND")
+    check("D seed k6 in cap_sec only", wrapper.set("__secured_k6", forKey: "k6", withAccessibility: .afterFirstUnlock))
+    check("D keys lists k6 before clear", listed(wipe) == ["k2", "k4", "k6"], "\(listed(wipe) ?? [])")
+    check("D clear resolves", describe(wipe.removeAllValues()) == "resolve true")
+    check("D clear wiped cap_sec_v2 and cap_sec in every group", items().isEmpty && items(in: legacyService).isEmpty)
+    check("D clear deleted the bundle id copy of a listed key and kept the bundle id item of another key", !KeychainWrapper.standard.hasValue(forKey: "k2") && KeychainWrapper.standard.string(forKey: "foreign") == "__secured_foreign")
+    check("D keys after clear is empty", listed(wipe) == [])
+}
+_ = KeychainWrapper.standard.removeObject(forKey: "foreign")
+
+print("--- E a bundle id service item (upstream up to 0.4.0)")
+cleanAll()
+let bundleVault = makeVault()
+check("E seed bundle id item", KeychainWrapper.standard.set("__secured_tok", forKey: "token"))
+let tokenStandard = snapshot(standardService)
+bundleVault.queue.sync {
+    check("E keys does not list it and the sweep does not copy it", listed(bundleVault) == [] && describe(bundleVault.migrateLegacyValues()) == "resolve -" && items(account: "token").isEmpty)
+    check("E get copies it into cap_sec_v2", describe(bundleVault.loadValue(forKey: "token")) == "resolve __secured_tok")
+    check("E cap_sec_v2 has one encrypted aku item in the app-ID group, nothing went into cap_sec", groups("token") == [appIdGroup] && accessible("token") == ["aku"] && encrypted("token") && items(in: legacyService).isEmpty, "\(groups("token"))")
+    check("E keys lists it now", listed(bundleVault) == ["token"])
+    check("E the second get reads cap_sec_v2", describe(bundleVault.loadValue(forKey: "token")) == "resolve __secured_tok")
+    check("E get of a key missing everywhere rejects NOT_FOUND", code(bundleVault.loadValue(forKey: "nothing")) == "NOT_FOUND")
+    check("E the sweep keeps the bundle id item", describe(bundleVault.migrateLegacyValues()) == "resolve -")
+}
+check("E the bundle id item stays as it was", tokenStandard.count == 1 && snapshot(standardService) == tokenStandard && KeychainWrapper.standard.string(forKey: "token") == "__secured_tok")
+check("E diagnostics: one key migrated, one key with an older copy kept", counter(diagnostics(bundleVault), "migrated") == 1 && counter(diagnostics(bundleVault), "legacyCopiesKept") == 1, "\(diagnostics(bundleVault))")
+check("E seed bundle id item for the plaintext vault", KeychainWrapper.standard.set("__secured_ptok", forKey: "plainToken"))
+plainVault.queue.sync {
+    check("E get copies it without encryption", describe(plainVault.loadValue(forKey: "plainToken")) == "resolve __secured_ptok")
+    check("E cap_sec_v2 has plaintext, the stricter bundle id class ak kept", accessible("plainToken") == ["ak"] && storedData("plainToken") == [Data("__secured_ptok".utf8)], "\(accessible("plainToken"))")
+}
+check("E that bundle id item stays too", KeychainWrapper.standard.string(forKey: "plainToken") == "__secured_ptok")
+check("E seed a cap_sec copy", wrapper.set("__secured_cap", forKey: "std2", withAccessibility: .afterFirstUnlock))
 Thread.sleep(forTimeInterval: 1.1)
-check("36f seed a newer copy this version wrote in the shared group during a fallback to the default group", f1Fallback.map { addRaw("f1", $0, group: sharedGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) } == errSecSuccess)
-let f1Shared = copySnapshot("f1", in: sharedGroup)
-let before36f = diagnostics(phaseOne)
-phaseOne.queue.sync {
-    check("36f get returns the newer value, the older copy in the app-ID group does not shadow it", describe(phaseOne.loadValue(forKey: "f1")) == "resolve __secured_f1_fallback")
-    check("36f the copy in the app-ID group now holds that value, the shared copy is unchanged", copyData("f1", in: appIdGroup).map { describe(phaseOne.decodeValue($0)) } == "decrypted(__secured_f1_fallback)" && copyMarked("f1", in: appIdGroup) && copySnapshot("f1", in: sharedGroup) == f1Shared)
-    check("36f the next get reads the copy in the app-ID group", describe(phaseOne.loadValue(forKey: "f1")) == "resolve __secured_f1_fallback" && copySnapshot("f1", in: sharedGroup) == f1Shared)
+check("E seed a newer bundle id copy", KeychainWrapper.standard.set("__secured_newer_std", forKey: "std2"))
+bundleVault.queue.sync {
+    check("E the cap_sec copy wins over a newer bundle id copy", describe(bundleVault.loadValue(forKey: "std2")) == "resolve __secured_cap" && currentValue(bundleVault, "std2") == "decrypted(__secured_cap)")
 }
-let after36f = diagnostics(phaseOne)
-check("36f diagnostics: the overwritten copy with another value counts as conflicting, nothing deleted", delta(before36f, after36f, "migrated") == 1 && delta(before36f, after36f, "conflictingDuplicates") == 1 && delta(before36f, after36f, "duplicatesResolved") == 0 && delta(before36f, after36f, "legacyCopiesKept") == 1, "\(after36f)")
+check("E both older copies stay", wrapper.string(forKey: "std2") == "__secured_cap" && KeychainWrapper.standard.string(forKey: "std2") == "__secured_newer_std")
 
-print("--- 37 phase 1: a lost set writes a fresh new copy and keeps the older ones")
+print("--- F phase 2 deletes the legacy copies")
 cleanAll()
-let keepTicker = HarnessTicker()
-let keepLostVault = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: keepTicker)
-let keepLostLog = EventLog()
-check("37 seed two 0.13.0 copies of z1", legacyAppGroup.set("__secured_z_old", forKey: "z1", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_z_new", forKey: "z1", withAccessibility: .afterFirstUnlock))
-let z1Shared = copySnapshot("z1", in: sharedGroup)
-keepLostVault.submitOperation(named: "set", key: "z1", run: { .locked }, lost: { keepLostVault.replaceLostValue("__secured_replaced", forKey: "z1") }, completion: { keepLostLog.record("set \(describe($0))") })
-keepLostVault.queue.sync {}
-keepTicker.fire(times: 2)
-check("37 a stuck set waits through two retries", keepLostLog.events.isEmpty)
-keepTicker.fire()
-check("37 then the lost set replaces the copy in the app-ID group with a fresh one", keepLostLog.events == ["set resolve true"] && copyMarked("z1", in: appIdGroup) && copyData("z1", in: appIdGroup)?.starts(with: magic) == true && keepLostVault.queue.sync { describe(keepLostVault.loadValue(forKey: "z1")) } == "resolve __secured_replaced", "\(keepLostLog.events)")
-check("37 and keeps the older copy in the shared group", z1Shared != nil && copySnapshot("z1", in: sharedGroup) == z1Shared && groups("z1") == [appIdGroup, sharedGroup], "\(groups("z1"))")
-let lost37 = diagnostics(keepLostVault)
-check("37 diagnostics: one lost item, nothing deleted, one key with older copies kept", counter(lost37, "lostItems") == 1 && counter(lost37, "duplicatesResolved") == 0 && counter(lost37, "legacyCopiesKept") == 1, "\(lost37)")
+let earlier = makeVault()
+check("F seed n1 in two groups and the bundle id service", wrapper.set("__secured_n1_shared", forKey: "n1", withAccessibility: .afterFirstUnlock) && wrapperOlderGroup.set("__secured_n1_older", forKey: "n1", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_n1_std", forKey: "n1"))
+check("F seed bundle id only n6", KeychainWrapper.standard.set("__secured_n6", forKey: "n6"))
+let upstreamN1 = wrapper.string(forKey: "n1") ?? "nil"
+earlier.queue.sync {
+    check("F phase 1 copies n1 and n6 and keeps their older copies", describe(earlier.loadValue(forKey: "n1")) == "resolve \(upstreamN1)" && describe(earlier.loadValue(forKey: "n6")) == "resolve __secured_n6" && items(account: "n1", in: legacyService).count == 2 && KeychainWrapper.standard.hasValue(forKey: "n1") && KeychainWrapper.standard.hasValue(forKey: "n6"))
+}
+let n1Current = snapshot(currentService, account: "n1")
+let n6Current = snapshot(currentService, account: "n6")
+check("F seed n2 in two groups with two values", wrapperAppGroup.set("__secured_n2_app", forKey: "n2", withAccessibility: .afterFirstUnlock) && wrapper.set("__secured_n2_shared", forKey: "n2", withAccessibility: .afterFirstUnlock))
+check("F seed bundle id only n3", KeychainWrapper.standard.set("__secured_n3", forKey: "n3"))
+check("F seed n4 in two groups with two values", wrapperAppGroup.set("__secured_n4_app", forKey: "n4", withAccessibility: .afterFirstUnlock) && wrapper.set("__secured_n4_shared", forKey: "n4", withAccessibility: .afterFirstUnlock))
+check("F seed n5 in cap_sec and the bundle id service", wrapper.set("__secured_n5_old", forKey: "n5", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_n5_std", forKey: "n5"))
+check("F seed a bundle id item of another key", KeychainWrapper.standard.set("__secured_foreign", forKey: "foreign"))
+let upstreamN2 = wrapper.string(forKey: "n2") ?? "nil"
+let upstreamN4 = wrapper.string(forKey: "n4") ?? "nil"
+let phaseTwoVault = SecureStorageVault(configuration: phaseTwo, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true })
+check("F the configuration switches the deletion on", phaseTwoVault.configuration.deletesLegacyCopies)
+var stepF = diagnostics(phaseTwoVault)
+phaseTwoVault.queue.sync {
+    check("F get copies n2 and returns the 0.13.0 value", describe(phaseTwoVault.loadValue(forKey: "n2")) == "resolve \(upstreamN2)" && currentValue(phaseTwoVault, "n2") == "decrypted(\(upstreamN2))")
+}
+check("F after the verified write both cap_sec copies of n2 are deleted", items(account: "n2", in: legacyService).isEmpty && groups("n2") == [appIdGroup])
+var nowF = diagnostics(phaseTwoVault)
+check("F duplicatesResolved counts two deletions, conflictingDuplicates the copy with another value", delta(stepF, nowF, "duplicatesResolved") == 2 && delta(stepF, nowF, "conflictingDuplicates") == 1 && delta(stepF, nowF, "migrated") == 1, "\(nowF)")
+stepF = nowF
+phaseTwoVault.queue.sync {
+    check("F get copies bundle id only n3", describe(phaseTwoVault.loadValue(forKey: "n3")) == "resolve __secured_n3" && encrypted("n3"))
+}
+check("F and deletes its bundle id item", !KeychainWrapper.standard.hasValue(forKey: "n3"))
+nowF = diagnostics(phaseTwoVault)
+check("F one deletion counted", delta(stepF, nowF, "duplicatesResolved") == 1 && delta(stepF, nowF, "migrated") == 1, "\(nowF)")
+stepF = nowF
+phaseTwoVault.queue.sync {
+    check("F set writes n5 and deletes its older copies", describe(phaseTwoVault.storeValue("__secured_n5_new", forKey: "n5")) == "resolve true" && items(account: "n5", in: legacyService).isEmpty && !KeychainWrapper.standard.hasValue(forKey: "n5") && currentValue(phaseTwoVault, "n5") == "decrypted(__secured_n5_new)")
+}
+nowF = diagnostics(phaseTwoVault)
+check("F two deletions counted for the set, no migration", delta(stepF, nowF, "duplicatesResolved") == 2 && delta(stepF, nowF, "migrated") == 0, "\(nowF)")
+stepF = nowF
+phaseTwoVault.queue.sync {
+    check("F the sweep resolves", describe(phaseTwoVault.migrateLegacyValues()) == "resolve -")
+}
+check("F the sweep deleted the copies phase 1 kept of n1 and n6, their cap_sec_v2 items are byte-identical", items(account: "n1", in: legacyService).isEmpty && !KeychainWrapper.standard.hasValue(forKey: "n1") && !KeychainWrapper.standard.hasValue(forKey: "n6") && !n1Current.isEmpty && snapshot(currentService, account: "n1") == n1Current && !n6Current.isEmpty && snapshot(currentService, account: "n6") == n6Current)
+check("F the sweep copied n4 and deleted both its cap_sec copies", items(account: "n4", in: legacyService).isEmpty && phaseTwoVault.queue.sync { currentValue(phaseTwoVault, "n4") } == "decrypted(\(upstreamN4))")
+check("F cap_sec is empty, the bundle id item of another key stays", items(in: legacyService).isEmpty && KeychainWrapper.standard.string(forKey: "foreign") == "__secured_foreign")
+nowF = diagnostics(phaseTwoVault)
+check("F sweep diagnostics: three copies of n1, one of n6 and two of n4 deleted, one migration, one conflict, nothing kept", delta(stepF, nowF, "duplicatesResolved") == 6 && delta(stepF, nowF, "migrated") == 1 && delta(stepF, nowF, "conflictingDuplicates") == 1 && counter(nowF, "legacyCopiesKept") == 0, "\(nowF)")
+let everythingF = everything()
+phaseTwoVault.queue.sync { _ = phaseTwoVault.migrateLegacyValues() }
+check("F a second sweep changes nothing", everything() == everythingF)
+let valuesF = ["n1": upstreamN1, "n2": upstreamN2, "n3": "__secured_n3", "n4": upstreamN4, "n5": "__secured_n5_new", "n6": "__secured_n6"]
+check("F every value reads back", phaseTwoVault.queue.sync { valuesF.allSatisfy { describe(phaseTwoVault.loadValue(forKey: $0.key)) == "resolve \($0.value)" } })
+_ = KeychainWrapper.standard.removeObject(forKey: "foreign")
 
-print("--- 38 phase 1: an undecryptable new copy leaves older plaintext copies as they are")
+print("--- G a lost cap_sec_v2 item")
 cleanAll()
-check("38 seed an older plaintext copy in the shared group", legacy.set("__secured_older", forKey: "u1", withAccessibility: .afterFirstUnlock))
-Thread.sleep(forTimeInterval: 0.05)
-check("38 seed a newer undecryptable copy written by this version", addRaw("u1", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
-let u1Shared = copySnapshot("u1", in: sharedGroup)
-let before38 = diagnostics(phaseOne)
-phaseOne.queue.sync {
-    check("38 get is UNREADABLE", code(phaseOne.loadValue(forKey: "u1")) == "UNREADABLE")
-    check("38 the older plaintext copy is not encrypted or tightened in place", u1Shared != nil && copySnapshot("u1", in: sharedGroup) == u1Shared)
-    check("38 the sweep skips the key and leaves both copies", describe(phaseOne.migrateLegacyValues()) == "resolve -" && copySnapshot("u1", in: sharedGroup) == u1Shared && copyData("u1", in: appIdGroup) == garbage25)
+let lostTickerG = HarnessTicker()
+let lostVaultG = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: lostTickerG)
+let lostLogG = EventLog()
+check("G seed z1 in two groups", wrapperAppGroup.set("__secured_z_app", forKey: "z1", withAccessibility: .afterFirstUnlock) && wrapper.set("__secured_z_shared", forKey: "z1", withAccessibility: .afterFirstUnlock))
+lostVaultG.queue.sync {
+    check("G get copies z1 into cap_sec_v2", describe(lostVaultG.loadValue(forKey: "z1")).hasPrefix("resolve __secured_z_") && items(account: "z1").count == 1)
 }
-let after38 = diagnostics(phaseOne)
-check("38 only the get counted a decrypt failure, nothing migrated", delta(before38, after38, "decryptFailures") == 1 && delta(before38, after38, "migrated") == 0, "\(after38)")
-phaseOne.queue.sync {
-    check("38 set overwrites the new copy and keeps the older one", describe(phaseOne.storeValue("__secured_fresh", forKey: "u1")) == "resolve true" && describe(phaseOne.loadValue(forKey: "u1")) == "resolve __secured_fresh" && copySnapshot("u1", in: sharedGroup) == u1Shared && groups("u1") == [appIdGroup, sharedGroup])
-}
+let legacyG = legacySnapshot()
+lostVaultG.submitOperation(named: "set", key: "z1", run: { .locked }, lost: { lostVaultG.replaceLostValue("__secured_replaced", forKey: "z1") }, completion: { lostLogG.record("set \(describe($0))") })
+lostVaultG.queue.sync {}
+lostTickerG.fire(times: 2)
+check("G a stuck set waits through two retries", lostLogG.events.isEmpty)
+lostTickerG.fire()
+check("G then the lost set replaces the cap_sec_v2 item with a fresh one", lostLogG.events == ["set resolve true"] && groups("z1") == [appIdGroup] && lostVaultG.queue.sync { describe(lostVaultG.loadValue(forKey: "z1")) } == "resolve __secured_replaced", "\(lostLogG.events)")
+check("G the legacy copies are untouched", legacyG.count == 2 && legacySnapshot() == legacyG)
+let diagnosticsG = diagnostics(lostVaultG)
+check("G diagnostics: one lost item, nothing deleted", counter(diagnosticsG, "lostItems") == 1 && counter(diagnosticsG, "duplicatesResolved") == 0, "\(diagnosticsG)")
 
-print("--- 39 phase 1: the sweep still encrypts a new copy that was stored as plaintext")
-check("39 seed a 0.13.0 copy in the shared group", legacy.set("__secured_pf", forKey: "pf1", withAccessibility: .afterFirstUnlock))
-let pf1Shared = copySnapshot("pf1", in: sharedGroup)
-phaseOne.queue.sync {
-    phaseOne.simulatesEncryptionFailure = true
-    check("39 get writes a plaintext new copy with the strict class", describe(phaseOne.loadValue(forKey: "pf1")) == "resolve __secured_pf" && copyData("pf1", in: appIdGroup) == Data("__secured_pf".utf8) && copyClass("pf1", in: appIdGroup) == "aku" && copyMarked("pf1", in: appIdGroup))
-    phaseOne.simulatesEncryptionFailure = false
-    check("39 the sweep encrypts the new copy once encryption works, class kept", describe(phaseOne.migrateLegacyValues()) == "resolve -" && copyData("pf1", in: appIdGroup)?.starts(with: magic) == true && copyClass("pf1", in: appIdGroup) == "aku")
-    check("39 the value reads back", describe(phaseOne.loadValue(forKey: "pf1")) == "resolve __secured_pf")
-}
-check("39 the older copy stays as it was", pf1Shared != nil && copySnapshot("pf1", in: sharedGroup) == pf1Shared)
-
-print("--- 40 phase 1: remove and clear still delete every copy")
-check("40 seed rm1 in two older groups and the bundle id service", legacy.set("__secured_rm1", forKey: "rm1", withAccessibility: .afterFirstUnlock) && legacyOlderGroup.set("__secured_rm1_older", forKey: "rm1", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_rm1_std", forKey: "rm1"))
-phaseOne.queue.sync {
-    check("40 get settles rm1 and keeps the older copies", describe(phaseOne.loadValue(forKey: "rm1")).hasPrefix("resolve __secured_rm1") && groups("rm1") == [appIdGroup, olderGroup, sharedGroup].sorted() && KeychainWrapper.standard.hasValue(forKey: "rm1"), "\(groups("rm1"))")
-    check("40 remove deletes the new copy, the older copies and the bundle id copy", describe(phaseOne.removeValue(forKey: "rm1")) == "resolve true" && items(account: "rm1").isEmpty && !KeychainWrapper.standard.hasValue(forKey: "rm1"))
-}
-check("40 seed cl1 in two older groups and the bundle id service", legacy.set("__secured_cl1", forKey: "cl1", withAccessibility: .afterFirstUnlock) && legacyOlderGroup.set("__secured_cl1_older", forKey: "cl1", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_cl1_std", forKey: "cl1"))
-phaseOne.queue.sync {
-    check("40 get settles cl1", describe(phaseOne.loadValue(forKey: "cl1")).hasPrefix("resolve __secured_cl1") && groups("cl1").count == 3)
-    check("40 clear deletes every cap_sec copy in every group and the bundle id copy of the key", describe(phaseOne.removeAllValues()) == "resolve true" && items().isEmpty && !KeychainWrapper.standard.hasValue(forKey: "cl1"))
-}
-check("36-40 phase 1 never counted a deleted duplicate", counter(diagnostics(phaseOne), "duplicatesResolved") == 0 && counter(diagnostics(secondLaunch), "duplicatesResolved") == 0)
-
-print("--- 41 phase 2 after phase 1: the next app version deletes the older copies")
+print("--- H explicit group not permitted")
 cleanAll()
-check("41 seed n1 in two older groups and the bundle id service", legacy.set("__secured_n1_shared", forKey: "n1", withAccessibility: .afterFirstUnlock) && legacyOlderGroup.set("__secured_n1_older", forKey: "n1", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_n1_std", forKey: "n1"))
-let upstreamN1 = legacy.string(forKey: "n1") ?? "nil"
-phaseOne.queue.sync {
-    check("41 phase 1 settles n1 and keeps the older copies", describe(phaseOne.loadValue(forKey: "n1")) == "resolve \(upstreamN1)" && groups("n1").count == 3 && KeychainWrapper.standard.hasValue(forKey: "n1"))
+let fallbackTags = tags("harness.27")
+let fallbackVault = makeVault(keyTag: fallbackTags.name, bundleIdentifier: "capacitor-secure-storage-plugin.not-permitted")
+fallbackVault.queue.sync {
+    check("H falls back to the default group", fallbackVault.resolveAccessGroup() == SecureStorageVault.AccessGroupMode(explicitGroup: nil, defaultGroup: sharedGroup), "\(String(describing: fallbackVault.resolveAccessGroup()))")
+    check("H set lands in cap_sec_v2 in the default group", describe(fallbackVault.storeValue("__secured_fb", forKey: "fb1")) == "resolve true" && groups("fb1") == [sharedGroup], "\(groups("fb1"))")
+    check("H get works", describe(fallbackVault.loadValue(forKey: "fb1")) == "resolve __secured_fb")
+    check("H key created in the default group", keyAttributes(fallbackTags.secureEnclave).first?[kSecAttrAccessGroup as String] as? String == sharedGroup)
+    check("H seed a 0.13.0 item in the app-ID group", wrapperAppGroup.set("__secured_fb2", forKey: "fb2", withAccessibility: .afterFirstUnlock))
+    check("H get copies it into cap_sec_v2 in the default group", describe(fallbackVault.loadValue(forKey: "fb2")) == "resolve __secured_fb2" && groups("fb2") == [sharedGroup] && encrypted("fb2"), "\(groups("fb2"))")
+    check("H the 0.13.0 item stays in the app-ID group", groups("fb2", in: legacyService) == [appIdGroup] && storedData("fb2", in: legacyService) == [Data("__secured_fb2".utf8)])
+    check("H seed a 0.13.0 item for the sweep", wrapper.set("__secured_fb3", forKey: "fb3", withAccessibility: .afterFirstUnlock))
+    check("H the sweep copies it into the default group", describe(fallbackVault.migrateLegacyValues()) == "resolve -" && groups("fb3") == [sharedGroup] && encrypted("fb3"), "\(groups("fb3"))")
+    check("H keys lists every key once", listed(fallbackVault) == ["fb1", "fb2", "fb3"])
 }
-let n1NewCopy = copySnapshot("n1", in: appIdGroup)
-let nextVersion = makeVault()
-let before41 = diagnostics(nextVersion)
-nextVersion.queue.sync {
-    check("41 the phase 2 sweep resolves", describe(nextVersion.migrateLegacyValues()) == "resolve -")
-    check("41 the value stays", describe(nextVersion.loadValue(forKey: "n1")) == "resolve \(upstreamN1)")
+check("H diagnostics accessGroupMode default", diagnostics(fallbackVault)["accessGroupMode"] as? String == "default")
+let noBundleVault = makeVault(bundleIdentifier: nil)
+check("H no bundle id falls back too", noBundleVault.queue.sync { noBundleVault.resolveAccessGroup() } == SecureStorageVault.AccessGroupMode(explicitGroup: nil, defaultGroup: sharedGroup))
+let explicitTags = tags("harness.27e")
+let explicitVault = makeVault(keyTag: explicitTags.name)
+explicitVault.queue.sync {
+    check("H explicit mode", explicitVault.resolveAccessGroup() == SecureStorageVault.AccessGroupMode(explicitGroup: appIdGroup, defaultGroup: sharedGroup))
+    check("H explicit set lands in cap_sec_v2 in the app-ID group", describe(explicitVault.storeValue("__secured_ex", forKey: "ex1")) == "resolve true" && groups("ex1") == [appIdGroup])
+    check("H explicit key created in the app-ID group", keyAttributes(explicitTags.secureEnclave).first?[kSecAttrAccessGroup as String] as? String == appIdGroup)
 }
-check("41 only the new copy is left, unchanged, and the bundle id copy is gone", groups("n1") == [appIdGroup] && n1NewCopy != nil && copySnapshot("n1", in: appIdGroup) == n1NewCopy && !KeychainWrapper.standard.hasValue(forKey: "n1"), "\(groups("n1"))")
-let after41 = diagnostics(nextVersion)
-check("41 diagnostics: three copies deleted, two with another value, no rewrite, nothing kept", delta(before41, after41, "duplicatesResolved") == 3 && delta(before41, after41, "conflictingDuplicates") == 2 && delta(before41, after41, "migrated") == 0 && delta(before41, after41, "legacyCopiesKept") == 0, "\(after41)")
+let explicitDiagnostics = diagnostics(explicitVault)
+check("H diagnostics accessGroupMode explicit, keyBackend secureEnclave", explicitDiagnostics["accessGroupMode"] as? String == "explicit" && explicitDiagnostics["keyBackend"] as? String == "secureEnclave", "\(explicitDiagnostics)")
+check("H diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates", "legacyCopiesKept", "keyBackend", "accessGroupMode"], "\(explicitDiagnostics.keys.sorted())")
+let explicitSameKey = makeVault(keyTag: fallbackTags.name)
+explicitSameKey.queue.sync {
+    check("H a later process in explicit mode still reads the cap_sec_v2 item of the default group", describe(explicitSameKey.loadValue(forKey: "fb1")) == "resolve __secured_fb")
+    check("H its set writes the app-ID group, which wins from then on", describe(explicitSameKey.storeValue("__secured_fb_new", forKey: "fb1")) == "resolve true" && groups("fb1") == [appIdGroup, sharedGroup] && describe(explicitSameKey.loadValue(forKey: "fb1")) == "resolve __secured_fb_new")
+}
+check("H an existing key in another group is reused, not duplicated", keyCount(fallbackTags.secureEnclave) + keyCount(fallbackTags.software) == 1)
+
+print("--- I a failed legacy deletion keeps the newer cap_sec_v2 value")
+cleanAll()
+let partial = makeVault()
+let faults = DeletionFaults()
+partial.queue.sync {
+    partial.current.deleteMatching = faults.hook(currentService)
+    partial.legacy.deleteMatching = faults.hook(legacyService)
+    partial.standard.deleteMatching = faults.hook(standardService)
+}
+check("I seed a 0.13.0 token and a bundle id only std", wrapper.set("__secured_t0", forKey: "token", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_s0", forKey: "std"))
+partial.queue.sync {
+    check("I get copies both, then set writes newer values into cap_sec_v2", describe(partial.loadValue(forKey: "token")) == "resolve __secured_t0" && describe(partial.loadValue(forKey: "std")) == "resolve __secured_s0" && describe(partial.storeValue("__secured_t1", forKey: "token")) == "resolve true" && describe(partial.storeValue("__secured_s1", forKey: "std")) == "resolve true")
+}
+faults.set(legacyService, errSecIO)
+partial.queue.sync {
+    faults.log.reset()
+    let removed = partial.removeValue(forKey: "token")
+    check("I remove rejects STORAGE_ERROR when the cap_sec deletion fails and leaves cap_sec_v2 alone", describe(removed) == "reject Remove failed" && code(removed) == "STORAGE_ERROR" && faults.log.events == [legacyService, standardService], "\(faults.log.events)")
+    check("I get then returns the newer value, the older cap_sec value does not come back", describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1" && currentValue(partial, "token") == "decrypted(__secured_t1)" && storedData("token", in: legacyService) == [Data("__secured_t0".utf8)])
+}
+faults.set(legacyService, nil)
+faults.set(standardService, errSecIO)
+partial.queue.sync {
+    faults.log.reset()
+    let removed = partial.removeValue(forKey: "std")
+    check("I remove rejects when the bundle id deletion fails and leaves cap_sec_v2 alone", describe(removed) == "reject Remove failed" && !faults.log.events.contains(currentService), "\(faults.log.events)")
+    check("I get then returns the newer value, the bundle id value does not come back", describe(partial.loadValue(forKey: "std")) == "resolve __secured_s1" && KeychainWrapper.standard.string(forKey: "std") == "__secured_s0")
+}
+faults.set(standardService, nil)
+faults.set(legacyService, errSecIO)
+partial.queue.sync {
+    faults.log.reset()
+    let cleared = partial.removeAllValues()
+    check("I clear rejects when the cap_sec deletion fails and leaves cap_sec_v2 alone", describe(cleared) == "reject error" && code(cleared) == "STORAGE_ERROR" && faults.log.events.last == legacyService && !faults.log.events.contains(currentService), "\(faults.log.events)")
+    check("I every newer value still reads back", describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1" && describe(partial.loadValue(forKey: "std")) == "resolve __secured_s1")
+    faults.log.reset()
+    let lostRemoved = partial.removeLostValue(forKey: "token")
+    check("I a lost remove rejects STORAGE_ERROR and keeps the cap_sec_v2 item when the cap_sec deletion fails", describe(lostRemoved) == "reject Remove failed" && code(lostRemoved) == "STORAGE_ERROR" && !faults.log.events.contains(currentService) && describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1", "\(faults.log.events)")
+    faults.log.reset()
+    let lostCleared = partial.removeAllLostValues()
+    check("I a lost clear rejects STORAGE_ERROR and keeps cap_sec_v2 when the cap_sec deletion fails", describe(lostCleared) == "reject error" && code(lostCleared) == "STORAGE_ERROR" && !faults.log.events.contains(currentService) && listed(partial) == ["std", "token"], "\(faults.log.events) \(listed(partial) ?? [])")
+}
+faults.set(legacyService, errSecInteractionNotAllowed)
+partial.queue.sync {
+    check("I a lost remove whose cap_sec deletion is refused still deletes the cap_sec_v2 item", describe(partial.removeLostValue(forKey: "token")) == "resolve true" && items(account: "token").isEmpty && items(account: "token", in: legacyService).count == 1)
+}
+faults.set(legacyService, nil)
+faults.set(currentService, errSecIO)
+partial.queue.sync {
+    let lostRemoved = partial.removeLostValue(forKey: "std")
+    check("I a lost remove rejects STORAGE_ERROR when the cap_sec_v2 deletion fails", describe(lostRemoved) == "reject Remove failed" && code(lostRemoved) == "STORAGE_ERROR" && describe(partial.loadValue(forKey: "std")) == "resolve __secured_s1")
+    let lostCleared = partial.removeAllLostValues()
+    check("I a lost clear rejects STORAGE_ERROR when the cap_sec_v2 deletion fails", describe(lostCleared) == "reject error" && code(lostCleared) == "STORAGE_ERROR" && items(in: legacyService).isEmpty && listed(partial) == ["std"], "\(listed(partial) ?? [])")
+}
+faults.set(currentService, nil)
+partial.queue.sync {
+    check("I seed r", describe(partial.storeValue("__secured_r", forKey: "r")) == "resolve true")
+    faults.log.reset()
+    check("I remove deletes cap_sec, then the bundle id copy, then cap_sec_v2", describe(partial.removeValue(forKey: "r")) == "resolve true" && faults.log.events == [legacyService, standardService, currentService], "\(faults.log.events)")
+    faults.log.reset()
+    check("I clear deletes cap_sec_v2 last and resolves", describe(partial.removeAllValues()) == "resolve true" && faults.log.events.last == currentService && faults.log.events.dropLast().last == legacyService, "\(faults.log.events)")
+    check("I clear left nothing behind", items().isEmpty && items(in: legacyService).isEmpty && !KeychainWrapper.standard.hasValue(forKey: "std") && code(partial.loadValue(forKey: "token")) == "NOT_FOUND")
+}
+
+check("phase 1 vaults never deleted a legacy copy", [vault, upgrade, nextLaunch, wipe, bundleVault, earlier, lostVaultG, badVault, mixVault, partial].allSatisfy { counter(diagnostics($0), "duplicatesResolved") == 0 })
 
 cleanAll()
-check("cleanup items", items().isEmpty && allKeyCount() == 0)
+check("cleanup items", items().isEmpty && items(in: legacyService).isEmpty && allKeyCount() == 0)
 print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
 exit(failures == 0 ? 0 : 1)

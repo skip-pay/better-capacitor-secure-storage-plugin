@@ -264,6 +264,13 @@ final class SecureStorageConfigurationTests: XCTestCase {
         XCTAssertEqual(vault.queue.sync { vault.diagnostics()["legacyCopiesKept"] as? Int }, 0)
     }
 
+    func testNewItemsGoToTheirOwnServiceNextToTheLegacyOnes() {
+        let vault = SecureStorageVault(bundleIdentifier: nil, ticker: ManualTicker())
+        XCTAssertEqual(vault.current.service, "cap_sec_v2")
+        XCTAssertEqual(vault.legacy.service, "cap_sec")
+        XCTAssertEqual(vault.standard.service, Bundle.main.bundleIdentifier ?? "SwiftKeychainWrapper")
+    }
+
     func testDeletionOfOlderCopiesCanBeSwitchedOnThroughTheConfiguration() {
         let configuration = SecureStorageVault.Configuration(deletesLegacyCopies: true)
         XCTAssertTrue(configuration.deletesLegacyCopies)
