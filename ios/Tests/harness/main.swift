@@ -4,9 +4,9 @@ import Security
 let service = "cap_sec"
 let upstreamService = "cap_sec_upstream"
 let upstreamStandardService = "harness.standard.upstream"
-// entitlements.plist mirrors the Skip Pay app: application-identifier <TEAM>.<bundle id> (the app-ID group, which the plugin
-// now uses as its app-private group) and a first keychain-access-groups entry that is the default group for writes without a
-// group (the widget-shared group in the app). Its second entry is one more group for older copies.
+// entitlements.plist uses a team prefix, an app-ID group, a shared group and a legacy group, as a typical app with an extension
+// would: application-identifier <TEAM>.<bundle id> is the app-ID group the plugin uses as its app-private group, the first
+// keychain-access-groups entry is the shared default group for writes without a group, and the second holds older copies.
 let appIdGroup = "ABCDE12345.capacitor-secure-storage-plugin.harness"
 let sharedGroup = appIdGroup + ".shared"
 let olderGroup = appIdGroup + ".legacy"
@@ -456,14 +456,14 @@ freshKeyVault.queue.sync {
 print("--- 8 standard -> dedicated migration")
 let migrationVault = makeVault()
 check("8 default standard service matches KeychainWrapper.standard", SecureStorageVault().standard.service == KeychainWrapper.standard.serviceName, SecureStorageVault().standard.service)
-check("8 seed standard", KeychainWrapper.standard.set("__secured_tok", forKey: "mobileToken"))
+check("8 seed standard", KeychainWrapper.standard.set("__secured_tok", forKey: "token"))
 migrationVault.queue.sync {
-    check("8 cap_sec empty before", items(account: "mobileToken").isEmpty)
-    check("8 loadValue migrates", describe(migrationVault.loadValue(forKey: "mobileToken")) == "resolve __secured_tok")
-    let migrated = items(account: "mobileToken")
-    check("8 cap_sec has encrypted aku item", migrated.count == 1 && accessible("mobileToken") == ["aku"] && (migrated.first?[kSecValueData as String] as? Data)?.starts(with: magic) == true)
-    check("8 standard item gone", !KeychainWrapper.standard.hasValue(forKey: "mobileToken"))
-    check("8 second get reads dedicated", describe(migrationVault.loadValue(forKey: "mobileToken")) == "resolve __secured_tok")
+    check("8 cap_sec empty before", items(account: "token").isEmpty)
+    check("8 loadValue migrates", describe(migrationVault.loadValue(forKey: "token")) == "resolve __secured_tok")
+    let migrated = items(account: "token")
+    check("8 cap_sec has encrypted aku item", migrated.count == 1 && accessible("token") == ["aku"] && (migrated.first?[kSecValueData as String] as? Data)?.starts(with: magic) == true)
+    check("8 standard item gone", !KeychainWrapper.standard.hasValue(forKey: "token"))
+    check("8 second get reads dedicated", describe(migrationVault.loadValue(forKey: "token")) == "resolve __secured_tok")
     check("8 get missing in both rejects missing", describe(migrationVault.loadValue(forKey: "nothing")) == "reject Item with given key does not exist")
 }
 check("8p seed standard for plaintext vault", KeychainWrapper.standard.set("__secured_ptok", forKey: "plainToken"))

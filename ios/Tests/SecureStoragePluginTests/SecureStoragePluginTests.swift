@@ -365,16 +365,16 @@ final class SecureStorageConfigurationTests: XCTestCase {
 
 final class SecureStorageAccessGroupTests: XCTestCase {
     func testAppPrivateGroupUsesTheTeamPrefixOfTheDefaultGroup() {
-        XCTAssertEqual(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.group.cz.mallpay.widget", bundleIdentifier: "cz.mallpay"), "ABCDE12345.cz.mallpay")
-        XCTAssertEqual(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.cz.mallpay", bundleIdentifier: "cz.mallpay"), "ABCDE12345.cz.mallpay")
+        XCTAssertEqual(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.group.com.example.shared", bundleIdentifier: "com.example.app"), "ABCDE12345.com.example.app")
+        XCTAssertEqual(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.com.example.app", bundleIdentifier: "com.example.app"), "ABCDE12345.com.example.app")
         XCTAssertEqual(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.capacitor-secure-storage-plugin.harness.shared", bundleIdentifier: "capacitor-secure-storage-plugin.harness"), "ABCDE12345.capacitor-secure-storage-plugin.harness")
     }
 
     func testAppPrivateGroupNeedsATeamPrefixAndABundleIdentifier() {
-        XCTAssertNil(SecureStorageVault.appPrivateGroup(defaultGroup: "nodot", bundleIdentifier: "cz.mallpay"))
-        XCTAssertNil(SecureStorageVault.appPrivateGroup(defaultGroup: ".leading", bundleIdentifier: "cz.mallpay"))
-        XCTAssertNil(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.cz.mallpay", bundleIdentifier: nil))
-        XCTAssertNil(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.cz.mallpay", bundleIdentifier: ""))
+        XCTAssertNil(SecureStorageVault.appPrivateGroup(defaultGroup: "nodot", bundleIdentifier: "com.example.app"))
+        XCTAssertNil(SecureStorageVault.appPrivateGroup(defaultGroup: ".leading", bundleIdentifier: "com.example.app"))
+        XCTAssertNil(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.com.example.app", bundleIdentifier: nil))
+        XCTAssertNil(SecureStorageVault.appPrivateGroup(defaultGroup: "ABCDE12345.com.example.app", bundleIdentifier: ""))
     }
 
     func testAccessGroupModeTargetsTheExplicitGroupFirst() {

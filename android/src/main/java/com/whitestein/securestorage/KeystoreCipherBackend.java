@@ -21,8 +21,8 @@ import javax.crypto.spec.GCMParameterSpec;
  *
  * <p>Nothing is latched: every call opens the keystore again, so a keystore that failed once is
  * tried again on the next operation. No lock-bound flags are set on the AES key (no user
- * authentication, no unlocked-device requirement, no StrongBox), because the app reads values
- * from background JavaScript while the screen is locked.
+ * authentication, no unlocked-device requirement, no StrongBox), because apps that read values
+ * from background JavaScript while the screen is locked would break.
  */
 final class KeystoreCipherBackend implements CipherBackend {
 

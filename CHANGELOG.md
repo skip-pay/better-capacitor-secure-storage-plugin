@@ -37,8 +37,8 @@
 - Do not downgrade to a build without this fork after values were written with encryption on, see the README
 
 - Behaviour change versus upstream on iOS: with the defaults, values are not readable while the device is locked and calls wait until unlock. Apps that must read values in that state set `accessibility` to `afterFirstUnlock`
-- Behaviour change versus upstream on iOS: with the defaults (`whenUnlockedThisDeviceOnly` and a Secure Enclave key), values no longer move to a new iPhone through a backup restore or Quick Start, and an erase-and-restore of the same device loses them, because the Secure Enclave key does not survive it. The app sees missing keys, and the user logs in and sets up the PIN again. The Skip Pay app already forces a logout on a device change through its device-signature check, so in practice the only difference there is that the "device verification failed" message no longer appears
-- Accepted exception on Android to the no-user-visible-change rule, by product owner decision: writes stay fail-closed. Only on devices whose AndroidKeyStore cannot create or use the AES key, `set` rejects with `error` / code `STORAGE_ERROR` where upstream stored the value as plaintext base64. Reads of existing entries are not affected
+- Behaviour change versus upstream on iOS: with the defaults (`whenUnlockedThisDeviceOnly` and a Secure Enclave key), values no longer move to a new iPhone through a backup restore or Quick Start, and an erase-and-restore of the same device loses them, because the Secure Enclave key does not survive it. The app sees missing keys
+- Accepted exception on Android to the no-user-visible-change rule: writes intentionally stay fail-closed. Only on devices whose AndroidKeyStore cannot create or use the AES key, `set` rejects with `error` / code `STORAGE_ERROR` where upstream stored the value as plaintext base64. Reads of existing entries are not affected
 
 ## Upstream history (capacitor-secure-storage-plugin)
 
