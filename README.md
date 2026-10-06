@@ -448,7 +448,7 @@ A build without this fork cannot read encrypted items. Its writes land in the de
 
 The iOS tests come in two parts.
 
-The unit tests in `ios/Tests/SecureStoragePluginTests` cover configuration parsing, the accessibility mapping, the class combination rule for all 25 pairs, the locked-device queue, the retry timer, the lost-item escape, the sweep scheduling and its wait for a quiet period after the app's calls, the decryption retries and which failures are final, the unusable key, the ciphertext check before a write, the app-private group name, the rejection codes and `getDiagnostics`. They inject the protected-data signal, the unlock probe, the timer, the key lookup and the decryption, use in-memory keys, and need no keychain. CI runs them. Set `SIMULATOR_ID` to the UDID of an available simulator (`xcrun simctl list devices available`) and run them from the repository root:
+The unit tests in `ios/Tests/SecureStoragePluginTests` cover configuration parsing, the accessibility mapping, the class combination rule for all 25 pairs, the locked-device queue, the retry timer, the lost-item escape, the sweep scheduling and its wait for a quiet period after the app's calls, the decryption retries and which failures are final, the unusable key, the ciphertext check before a write, the app-private group name, the rejection codes and `getDiagnostics`. They inject the protected-data signal, the unlock probe, the timer, the key lookup and the decryption, use in-memory keys, and need no keychain. Set `SIMULATOR_ID` to the UDID of an available simulator (`xcrun simctl list devices available`) and run them from the repository root:
 
 ```bash
 xcodebuild test -scheme BetterCapacitorSecureStoragePlugin -destination "id=$SIMULATOR_ID"
@@ -575,39 +575,15 @@ There is no secure storage in browser (not because it is not implemented by this
 
 ## Releasing
 
-Pushing a tag `vX.Y.Z` publishes the package to npm through `.github/workflows/release.yml`. The workflow first runs the CI checks (web build and lint, iOS unit tests and keychain harness, Android unit tests). Then it publishes with npm trusted publishing and a provenance attestation, and creates a GitHub release from the CHANGELOG section of the version.
-
-1. Set the version: `npm version X.Y.Z --no-git-tag-version` updates `package.json` and `package-lock.json`.
-2. In `CHANGELOG.md`, rename the `## X.Y.Z (unreleased)` heading to `## X.Y.Z`. The GitHub release notes are the lines under that heading.
-3. Run `npm run release:check` and read the tarball list it prints.
-4. Commit, tag and push the tag:
+Publishing is manual. Run the tests, bump the version, publish.
 
 ```bash
-git commit -am "chore: release X.Y.Z"
-git tag vX.Y.Z
-git push origin master vX.Y.Z
-```
-
-The publish job fails when the tag is not `v` followed by the `package.json` version. Fix the version, move the tag and push it again.
-
-### First publish and trusted publisher setup
-
-npm can configure a trusted publisher only for a package that already exists. A maintainer therefore publishes the first version by hand. `prepublishOnly` builds `dist` first:
-
-```bash
-npm login
+npm run build
+cd android && ./gradlew test && cd ..
+xcodebuild test -scheme BetterCapacitorSecureStoragePlugin -destination "id=$SIMULATOR_ID"
+npm version X.Y.Z
 npm publish --access public
+git push origin master --tags
 ```
 
-If you push the tag of that version afterwards, its publish job fails because the version is already on npm. Expect that failure once.
-
-Then open the package on npmjs.com, go to Settings, Trusted publishing, and add GitHub Actions with these values:
-
-- Organization or user: `skip-pay`
-- Repository: `better-capacitor-secure-storage-plugin`
-- Workflow filename: `release.yml` (file name only, case-sensitive)
-- Environment: empty
-
-Configurations created after 3 September 2026 allow only `npm stage publish` by default. Allow direct publishing with `npm publish` as well, because the workflow runs `npm publish`. npm does not validate the configuration when you save it, so a typo shows up only as a failed publish.
-
-From then on every `v*` tag publishes on its own. The workflow uses no npm token. Trusted publishing needs a GitHub-hosted runner, npm 11.5.1 or later and Node 22.14.0 or later. The workflow installs the latest npm before it publishes. The `repository.url` in `package.json` has to point at this GitHub repository.
+`npm version` updates `package.json` and `package-lock.json`, commits and tags. `prepublishOnly` rebuilds `dist` before the publish. Rename the `## X.Y.Z (unreleased)` heading in `CHANGELOG.md` to `## X.Y.Z` before you run it.

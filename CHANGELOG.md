@@ -33,7 +33,6 @@
 - Android: do not downgrade after values were written or migrated, older builds cannot read the `v2:` format
 - `KeychainAccessibility`, `SecureStorageSetOptions`, `SecureStorageDiagnostics` and `SecureStorageErrorCode` types exported, `PluginsConfig` of `@capacitor/cli` augmented with `SecureStoragePlugin`
 - Do not downgrade to a build without this fork after values were written with encryption on, see the README
-- CI runs the Android unit tests, the Java prettier check and the iOS keychain harness on a simulator. A `v*` tag publishes to npm with trusted publishing and provenance, see Releasing in the README
 
 - Behaviour change versus upstream on iOS: with the defaults, values are not readable while the device is locked and calls wait until unlock. Apps that must read values in that state set `accessibility` to `afterFirstUnlock`
 - Behaviour change versus upstream on iOS: with the defaults (`whenUnlockedThisDeviceOnly` and a Secure Enclave key), values no longer move to a new iPhone through a backup restore or Quick Start, and an erase-and-restore of the same device loses them, because the Secure Enclave key does not survive it. The app sees missing keys, and the user logs in and sets up the PIN again. The Skip Pay app already forces a logout on a device change through its device-signature check, so in practice the only difference there is that the "device verification failed" message no longer appears
