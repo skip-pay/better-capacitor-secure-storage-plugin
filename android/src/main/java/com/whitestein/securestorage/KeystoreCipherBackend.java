@@ -45,7 +45,7 @@ final class KeystoreCipherBackend implements CipherBackend {
         return packageName + "_cap_sec_aes_v2";
     }
 
-    /** Alias of the RSA key pair written by upstream versions. Read only, never generated. */
+    /** Alias of the RSA key pair written by upstream versions. Never generated. */
     static String rsaAlias(String packageName) {
         return packageName + "_cap_sec";
     }
@@ -106,6 +106,11 @@ final class KeystoreCipherBackend implements CipherBackend {
             out.write(block, 0, block.length);
         }
         return out.toByteArray();
+    }
+
+    @Override
+    public synchronized void deleteRsaKey() throws GeneralSecurityException {
+        openKeyStore().deleteEntry(rsaAlias);
     }
 
     /**

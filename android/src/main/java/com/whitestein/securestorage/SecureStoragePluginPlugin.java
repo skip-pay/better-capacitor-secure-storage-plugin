@@ -74,7 +74,9 @@ public class SecureStoragePluginPlugin extends Plugin {
 
     private static SecureStore createStore(Context context) {
         return new SecureStore(
-            new SharedPreferencesKeyValueStore(context),
+            new SharedPreferencesKeyValueStore(context, SharedPreferencesKeyValueStore.PREFERENCES_FILE),
+            new SharedPreferencesKeyValueStore(context, SharedPreferencesKeyValueStore.LEGACY_PREFERENCES_FILE),
+            SecureStore.DELETE_LEGACY_STORAGE,
             new KeystoreCipherBackend(context.getPackageName()),
             Base64Codec.ANDROID,
             SWEEP_EXECUTOR,
@@ -167,8 +169,10 @@ public class SecureStoragePluginPlugin extends Plugin {
 
     /**
      * Counters of this process since the plugin loaded. Fields that only apply to iOS are always 0
-     * or "n/a" on Android. lostItems, decryptFailures and migrationSkipped count distinct keys.
-     * migrationSkipped is Android only: legacy entries still stored whose migration was skipped.
+     * or "n/a" on Android. lostItems, decryptFailures, migrationSkipped and legacyEntriesKept count
+     * distinct keys. migrationSkipped is Android only: legacy entries still stored whose migration
+     * was skipped. legacyEntriesKept is Android only: legacy entries still stored after their
+     * migration.
      */
     @PluginMethod
     public void getDiagnostics(PluginCall call) {
@@ -229,6 +233,7 @@ public class SecureStoragePluginPlugin extends Plugin {
         ret.put("lostItems", diagnostics.lostItems);
         ret.put("decryptFailures", diagnostics.decryptFailures);
         ret.put("migrationSkipped", diagnostics.migrationSkipped);
+        ret.put("legacyEntriesKept", diagnostics.legacyEntriesKept);
         ret.put("plaintextFallbacks", 0);
         ret.put("keyBackend", diagnostics.keyBackend);
         ret.put("accessGroupMode", "n/a");

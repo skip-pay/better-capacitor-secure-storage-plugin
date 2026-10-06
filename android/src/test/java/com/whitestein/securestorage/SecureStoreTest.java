@@ -11,6 +11,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyStoreException;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashMap;
+import java.util.Map;
 import javax.crypto.AEADBadTagException;
 import javax.crypto.BadPaddingException;
 import javax.crypto.IllegalBlockSizeException;
@@ -20,6 +22,7 @@ import org.junit.Test;
 public class SecureStoreTest {
 
     private Fakes.MapStore store;
+    private Fakes.MapStore legacyStore;
     private Fakes.FakeBackend backend;
     private Fakes.ManualExecutor sweepExecutor;
     private Fakes.RecordingSleeper sleeper;
@@ -28,10 +31,28 @@ public class SecureStoreTest {
     @Before
     public void setUp() {
         store = new Fakes.MapStore();
+        legacyStore = new Fakes.MapStore();
         backend = new Fakes.FakeBackend();
         sweepExecutor = new Fakes.ManualExecutor();
         sleeper = new Fakes.RecordingSleeper();
-        secureStore = new SecureStore(store, backend, Fakes.BASE64, sweepExecutor, sleeper, SecureStore.Logger.NONE);
+        secureStore = newSecureStore(false);
+    }
+
+    private SecureStore newSecureStore(boolean deleteLegacyStorage) {
+        return new SecureStore(
+            store,
+            legacyStore,
+            deleteLegacyStorage,
+            backend,
+            Fakes.BASE64,
+            sweepExecutor,
+            sleeper,
+            SecureStore.Logger.NONE
+        );
+    }
+
+    private void deleteLegacyStorage() {
+        secureStore = newSecureStore(true);
     }
 
     private static byte[] utf8(String value) {
@@ -159,7 +180,7 @@ public class SecureStoreTest {
     @Test
     public void legacyRsaSingleBlockIsReadAndMigrated() throws Exception {
         backend.createRsaKey();
-        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        legacyStore.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
 
         assertEquals("1234", getString("pin"));
         assertTrue(store.map.get("pin").startsWith("v2:"));
@@ -171,7 +192,7 @@ public class SecureStoreTest {
     public void legacyRsaMultiBlockIsReadAndMigrated() throws Exception {
         backend.createRsaKey();
         String value = repeat("token-", 120);
-        store.map.put("token", backend.upstreamRsaEncrypt(utf8(value)));
+        legacyStore.map.put("token", backend.upstreamRsaEncrypt(utf8(value)));
 
         assertEquals(value, getString("token"));
         assertTrue(store.map.get("token").startsWith("v2:"));
@@ -181,7 +202,7 @@ public class SecureStoreTest {
     @Test
     public void legacyRsaEmptyValueIsRead() throws Exception {
         backend.createRsaKey();
-        store.map.put("empty", backend.upstreamRsaEncrypt(new byte[0]));
+        legacyStore.map.put("empty", backend.upstreamRsaEncrypt(new byte[0]));
 
         assertEquals("", getString("empty"));
     }
@@ -191,10 +212,10 @@ public class SecureStoreTest {
         backend.createRsaKey();
         String legacy = backend.upstreamRsaEncrypt(utf8("1234"));
         backend.rsaKey = null;
-        store.map.put("pin", legacy);
+        legacyStore.map.put("pin", legacy);
 
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
-        assertEquals(legacy, store.map.get("pin"));
+        assertEquals(legacy, legacyStore.map.get("pin"));
         assertEquals(1, secureStore.diagnostics().decryptFailures);
     }
 
@@ -203,16 +224,16 @@ public class SecureStoreTest {
         backend.createRsaKey();
         String legacy = backend.upstreamRsaEncrypt(utf8("1234"));
         backend.createRsaKey();
-        store.map.put("pin", legacy);
+        legacyStore.map.put("pin", legacy);
 
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
-        assertEquals(legacy, store.map.get("pin"));
+        assertEquals(legacy, legacyStore.map.get("pin"));
         assertEquals(1, secureStore.diagnostics().lostItems);
     }
 
     @Test
     public void legacyPlaintextIsReadAndMigrated() throws Exception {
-        store.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
 
         assertEquals("1234", getString("pin"));
         assertTrue(store.map.get("pin").startsWith("v2:"));
@@ -223,7 +244,7 @@ public class SecureStoreTest {
 
     @Test
     public void legacyPlaintextEmptyValueIsRead() {
-        store.map.put("empty", "");
+        legacyStore.map.put("empty", "");
         assertEquals("", getString("empty"));
     }
 
@@ -231,29 +252,29 @@ public class SecureStoreTest {
     public void legacyPlaintextOf256BytesIsReadWhenRsaKeyExists() throws Exception {
         backend.createRsaKey();
         String value = repeat("a", 256);
-        store.map.put("long", Fakes.androidDefaultBase64(utf8(value)));
+        legacyStore.map.put("long", Fakes.androidDefaultBase64(utf8(value)));
 
         assertEquals(value, getString("long"));
     }
 
     @Test
     public void legacyNonUtf8IsUndecodable() {
-        store.map.put("bin", Fakes.androidDefaultBase64(new byte[] { (byte) 0xff, (byte) 0xfe, 0x00 }));
+        legacyStore.map.put("bin", Fakes.androidDefaultBase64(new byte[] { (byte) 0xff, (byte) 0xfe, 0x00 }));
         // android.util.Base64 decodes "%%%" to zero bytes without throwing, like the fake now does,
         // so this holds on a device only because the reader rejects non-base64 text itself.
-        store.map.put("notBase64", "%%%");
+        legacyStore.map.put("notBase64", "%%%");
 
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("bin").status);
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("notBase64").status);
-        assertEquals("%%%", store.map.get("notBase64"));
+        assertEquals("%%%", legacyStore.map.get("notBase64"));
         assertEquals(2, secureStore.diagnostics().decryptFailures);
     }
 
     @Test
     public void legacyWithCharactersOutsideBase64IsUndecodable() {
         // On a device "QUJD%" decodes to "ABC" and "\n" to nothing.
-        store.map.put("junk", Fakes.androidDefaultBase64(utf8("ABC")).trim() + "%");
-        store.map.put("blank", "\n");
+        legacyStore.map.put("junk", Fakes.androidDefaultBase64(utf8("ABC")).trim() + "%");
+        legacyStore.map.put("blank", "\n");
 
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("junk").status);
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("blank").status);
@@ -289,13 +310,13 @@ public class SecureStoreTest {
     public void legacyReadSucceedsWhenAesKeyCannotBeCreated() throws Exception {
         backend.createRsaKey();
         String legacy = backend.upstreamRsaEncrypt(utf8("1234"));
-        store.map.put("pin", legacy);
-        store.map.put("plain", Fakes.androidDefaultBase64(utf8("abc")));
+        legacyStore.map.put("pin", legacy);
+        legacyStore.map.put("plain", Fakes.androidDefaultBase64(utf8("abc")));
         backend.aesCreatable = false;
 
         assertEquals("1234", getString("pin"));
         assertEquals("abc", getString("plain"));
-        assertEquals("legacy entry kept", legacy, store.map.get("pin"));
+        assertEquals("legacy entry kept", legacy, legacyStore.map.get("pin"));
         assertEquals(0, secureStore.diagnostics().migrated);
         assertEquals(2, secureStore.diagnostics().migrationSkipped);
 
@@ -309,9 +330,9 @@ public class SecureStoreTest {
 
     @Test
     public void migrationSkippedForgetsKeysThatSetRemoveOrClearReplaced() throws Exception {
-        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
-        store.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
-        store.map.put("c", Fakes.androidDefaultBase64(utf8("3")));
+        legacyStore.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        legacyStore.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        legacyStore.map.put("c", Fakes.androidDefaultBase64(utf8("3")));
         store.failWrites = true;
         assertEquals("1", getString("a"));
         assertEquals("2", getString("b"));
@@ -329,7 +350,7 @@ public class SecureStoreTest {
 
     @Test
     public void failedSetKeepsTheKeyInMigrationSkipped() throws Exception {
-        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        legacyStore.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
         store.failWrites = true;
         assertEquals("1", getString("a"));
         try {
@@ -343,11 +364,11 @@ public class SecureStoreTest {
     @Test
     public void legacyReadSucceedsWhenWriteBackFails() throws Exception {
         String legacy = Fakes.androidDefaultBase64(utf8("1234"));
-        store.map.put("pin", legacy);
+        legacyStore.map.put("pin", legacy);
         store.failWrites = true;
 
         assertEquals("1234", getString("pin"));
-        assertEquals(legacy, store.map.get("pin"));
+        assertEquals(legacy, legacyStore.map.get("pin"));
         assertEquals(0, secureStore.diagnostics().migrated);
         assertEquals(1, secureStore.diagnostics().migrationSkipped);
     }
@@ -370,15 +391,15 @@ public class SecureStoreTest {
         backend.createRsaKey();
         String rsa = backend.upstreamRsaEncrypt(utf8("1234"));
         String plain = Fakes.androidDefaultBase64(utf8("abc"));
-        store.map.put("pin", rsa);
-        store.map.put("plain", plain);
+        legacyStore.map.put("pin", rsa);
+        legacyStore.map.put("plain", plain);
         backend.aesDecryptAlwaysThrows = new AEADBadTagException("Tag mismatch");
 
         assertEquals("1234", getString("pin"));
         assertEquals("abc", getString("plain"));
         sweepExecutor.runAll();
-        assertEquals("legacy entry unchanged", rsa, store.map.get("pin"));
-        assertEquals("legacy entry unchanged", plain, store.map.get("plain"));
+        assertEquals("legacy entry unchanged", rsa, legacyStore.map.get("pin"));
+        assertEquals("legacy entry unchanged", plain, legacyStore.map.get("plain"));
         assertEquals("still readable", "1234", getString("pin"));
         assertEquals("still readable", "abc", getString("plain"));
 
@@ -392,12 +413,12 @@ public class SecureStoreTest {
     @Test
     public void legacyEntryIsKeptWhenItsNewBlobDoesNotDecrypt() throws Exception {
         String legacy = Fakes.androidDefaultBase64(utf8("1234"));
-        store.map.put("pin", legacy);
-        store.map.put("other", Fakes.androidDefaultBase64(utf8("5678")));
+        legacyStore.map.put("pin", legacy);
+        legacyStore.map.put("other", Fakes.androidDefaultBase64(utf8("5678")));
         backend.aesDecryptBadTagForAad = SecureStore.aad("pin");
 
         assertEquals("1234", getString("pin"));
-        assertEquals(legacy, store.map.get("pin"));
+        assertEquals(legacy, legacyStore.map.get("pin"));
         assertEquals("1234", getString("pin"));
         assertEquals("5678", getString("other"));
         assertTrue("self-test passed, other keys migrate", store.map.get("other").startsWith("v2:"));
@@ -435,20 +456,20 @@ public class SecureStoreTest {
     @Test
     public void legacyEntryIsKeptWhenItsNewBlobDecryptsToOtherBytes() throws Exception {
         String legacy = Fakes.androidDefaultBase64(utf8("1234"));
-        store.map.put("pin", legacy);
+        legacyStore.map.put("pin", legacy);
         backend.aesDecryptCorruptsForAad = SecureStore.aad("pin");
 
         assertEquals("1234", getString("pin"));
-        assertEquals(legacy, store.map.get("pin"));
+        assertEquals(legacy, legacyStore.map.get("pin"));
         assertEquals(0, secureStore.diagnostics().migrated);
         assertEquals(1, secureStore.diagnostics().migrationSkipped);
     }
 
     @Test
     public void selfTestRunsOnceBeforeTheFirstMigrationWrite() throws Exception {
-        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
-        store.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
-        store.map.put("c", Fakes.androidDefaultBase64(utf8("3")));
+        legacyStore.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        legacyStore.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        legacyStore.map.put("c", Fakes.androidDefaultBase64(utf8("3")));
 
         assertEquals("1", getString("a"));
         assertEquals(new String(SecureStore.SELF_TEST_AAD, StandardCharsets.UTF_8), backend.aesEncryptAads.get(0));
@@ -469,15 +490,15 @@ public class SecureStoreTest {
     public void failedSelfTestStopsTheSweepAndIsRetriedLater() throws Exception {
         String a = Fakes.androidDefaultBase64(utf8("1"));
         String b = Fakes.androidDefaultBase64(utf8("2"));
-        store.map.put("a", a);
-        store.map.put("b", b);
+        legacyStore.map.put("a", a);
+        legacyStore.map.put("b", b);
         backend.aesDecryptAlwaysThrows = new AEADBadTagException("Tag mismatch");
 
         secureStore.contains("a");
         sweepExecutor.runAll();
         assertEquals("sweep stops after the first failed self-test", 1, selfTestEncryptions());
-        assertEquals(a, store.map.get("a"));
-        assertEquals(b, store.map.get("b"));
+        assertEquals(a, legacyStore.map.get("a"));
+        assertEquals(b, legacyStore.map.get("b"));
 
         try {
             secureStore.set("c", utf8("3"));
@@ -499,7 +520,7 @@ public class SecureStoreTest {
     public void setFailsClosedWhenAesKeyCannotBeCreated() throws Exception {
         backend.createRsaKey();
         String legacy = backend.upstreamRsaEncrypt(utf8("old"));
-        store.map.put("pin", legacy);
+        legacyStore.map.put("pin", legacy);
         backend.aesCreatable = false;
 
         try {
@@ -511,7 +532,7 @@ public class SecureStoreTest {
             fail("set must throw");
         } catch (StorageException expected) {}
 
-        assertEquals("previous value untouched", legacy, store.map.get("pin"));
+        assertEquals("previous value untouched", legacy, legacyStore.map.get("pin"));
         assertFalse("nothing stored in plaintext or RSA", store.map.containsKey("other"));
     }
 
@@ -621,7 +642,7 @@ public class SecureStoreTest {
     public void rsaIllegalBlockSizeStaysPermanentAndFallsThroughToPlaintext() throws Exception {
         backend.createRsaKey();
         String value = repeat("a", 256);
-        store.map.put("long", Fakes.androidDefaultBase64(utf8(value)));
+        legacyStore.map.put("long", Fakes.androidDefaultBase64(utf8(value)));
         backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
 
         assertEquals(value, getString("long"));
@@ -631,7 +652,7 @@ public class SecureStoreTest {
     @Test
     public void rsaIllegalBlockSizeWithTransientKeystoreCauseIsRetried() throws Exception {
         backend.createRsaKey();
-        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        legacyStore.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
         backend.rsaDecryptErrors.add(Fakes.withTransientCause(new IllegalBlockSizeException()));
 
         assertEquals("1234", getString("pin"));
@@ -641,7 +662,7 @@ public class SecureStoreTest {
     @Test
     public void rsaIllegalBlockSizeOnCiphertextIsRetried() throws Exception {
         backend.createRsaKey();
-        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        legacyStore.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
         backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
 
         assertEquals("1234", getString("pin"));
@@ -657,14 +678,14 @@ public class SecureStoreTest {
     public void rsaIllegalBlockSizeOnCiphertextAfterAllRetriesIsUnreadableNotLost() throws Exception {
         backend.createRsaKey();
         String legacy = backend.upstreamRsaEncrypt(utf8("1234"));
-        store.map.put("pin", legacy);
+        legacyStore.map.put("pin", legacy);
         for (int i = 0; i < 3; i++) {
             backend.rsaDecryptErrors.add(new IllegalBlockSizeException());
         }
 
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
         assertEquals(Arrays.asList(50L, 200L), sleeper.sleeps);
-        assertEquals("entry kept", legacy, store.map.get("pin"));
+        assertEquals("entry kept", legacy, legacyStore.map.get("pin"));
         SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
         assertEquals(1, diagnostics.decryptFailures);
         assertEquals(0, diagnostics.lostItems);
@@ -674,7 +695,7 @@ public class SecureStoreTest {
     @Test
     public void rsaBadPaddingOnCiphertextIsLostWithoutRetry() throws Exception {
         backend.createRsaKey();
-        store.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        legacyStore.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
         backend.rsaDecryptErrors.add(new BadPaddingException());
 
         assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
@@ -687,8 +708,8 @@ public class SecureStoreTest {
 
     @Test
     public void brokenKeystoreAddsRetrySleepsToOneLegacyGetOnly() throws Exception {
-        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
-        store.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        legacyStore.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        legacyStore.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
         backend.aesCreatable = false;
 
         assertEquals("1", getString("a"));
@@ -714,8 +735,8 @@ public class SecureStoreTest {
         backend.createRsaKey();
         String rsa = backend.upstreamRsaEncrypt(utf8("one"));
         String plain = Fakes.androidDefaultBase64(utf8("two"));
-        store.map.put("rsa", rsa);
-        store.map.put("plain", plain);
+        legacyStore.map.put("rsa", rsa);
+        legacyStore.map.put("plain", plain);
         backend.aesCreatable = false;
         try {
             secureStore.set("x", utf8("3"));
@@ -727,8 +748,8 @@ public class SecureStoreTest {
         sweepExecutor.runAll();
 
         assertTrue("no retry sleeps in the sweep", sleeper.sleeps.isEmpty());
-        assertEquals(rsa, store.map.get("rsa"));
-        assertEquals(plain, store.map.get("plain"));
+        assertEquals(rsa, legacyStore.map.get("rsa"));
+        assertEquals(plain, legacyStore.map.get("plain"));
     }
 
     private void failSetSoTheAesPathIsFailing() {
@@ -744,14 +765,14 @@ public class SecureStoreTest {
     public void singleAttemptSweepDoesNotCountATransientRsaDecryptFailure() throws Exception {
         backend.createRsaKey();
         String rsa = backend.upstreamRsaEncrypt(utf8("one"));
-        store.map.put("rsa", rsa);
+        legacyStore.map.put("rsa", rsa);
         failSetSoTheAesPathIsFailing();
 
         backend.rsaDecryptErrors.add(new KeyStoreException("Keystore busy"));
         sweepExecutor.runAll();
 
         assertTrue("no retry sleeps in the sweep", sleeper.sleeps.isEmpty());
-        assertEquals(rsa, store.map.get("rsa"));
+        assertEquals(rsa, legacyStore.map.get("rsa"));
         assertEquals(0, secureStore.diagnostics().decryptFailures);
         assertEquals("a later get reads the key", "one", getString("rsa"));
         assertEquals(0, secureStore.diagnostics().decryptFailures);
@@ -761,7 +782,7 @@ public class SecureStoreTest {
     @Test
     public void singleAttemptSweepDoesNotCountATransientRsaKeyLookupFailure() throws Exception {
         backend.createRsaKey();
-        store.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
+        legacyStore.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
         failSetSoTheAesPathIsFailing();
 
         backend.transientFailures = 1;
@@ -776,7 +797,7 @@ public class SecureStoreTest {
     @Test
     public void singleAttemptSweepStillCountsAPermanentRsaFailure() throws Exception {
         backend.createRsaKey();
-        store.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
+        legacyStore.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
         failSetSoTheAesPathIsFailing();
 
         backend.rsaDecryptErrors.add(new BadPaddingException());
@@ -787,7 +808,7 @@ public class SecureStoreTest {
 
     @Test
     public void successfulSetRestoresRetriesForMigration() throws Exception {
-        store.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        legacyStore.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
         backend.aesCreatable = false;
         try {
             secureStore.set("x", utf8("3"));
@@ -808,20 +829,20 @@ public class SecureStoreTest {
     @Test
     public void sweepMigratesAllLegacyEntriesOnceInTheBackground() throws Exception {
         backend.createRsaKey();
-        store.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
-        store.map.put("plain", Fakes.androidDefaultBase64(utf8("two")));
-        store.map.put("garbage", "%%%");
+        legacyStore.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
+        legacyStore.map.put("plain", Fakes.androidDefaultBase64(utf8("two")));
+        legacyStore.map.put("garbage", "%%%");
         secureStore.set("v2", utf8("three"));
         String v2 = store.map.get("v2");
 
         assertEquals("sweep is queued, not run inline", 1, sweepExecutor.tasks.size());
-        assertFalse(store.map.get("rsa").startsWith("v2:"));
+        assertFalse(store.map.containsKey("rsa"));
         sweepExecutor.runAll();
 
         assertTrue(store.map.get("rsa").startsWith("v2:"));
         assertTrue(store.map.get("plain").startsWith("v2:"));
         assertEquals("v2 entries untouched", v2, store.map.get("v2"));
-        assertEquals("garbage kept", "%%%", store.map.get("garbage"));
+        assertEquals("garbage kept", "%%%", legacyStore.map.get("garbage"));
         assertEquals(2, secureStore.diagnostics().migrated);
         assertEquals("one", getString("rsa"));
         assertEquals("two", getString("plain"));
@@ -832,7 +853,7 @@ public class SecureStoreTest {
 
     @Test
     public void sweepDoesNotOverwriteNewerValue() throws Exception {
-        store.map.put("pin", Fakes.androidDefaultBase64(utf8("old")));
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("old")));
         secureStore.set("pin", utf8("new"));
         sweepExecutor.runAll();
 
@@ -883,5 +904,358 @@ public class SecureStoreTest {
         assertTrue(SecureStore.isValidUtf8(utf8("žluťoučký")));
         assertTrue(SecureStore.isValidUtf8(new byte[0]));
         assertFalse(SecureStore.isValidUtf8(new byte[] { (byte) 0xc3 }));
+    }
+
+    @Test
+    public void legacyRsaEntryMigratesIntoV2AndStaysInTheLegacyFileUnchanged() throws Exception {
+        backend.createRsaKey();
+        String rsa = backend.upstreamRsaEncrypt(utf8("1234"));
+        legacyStore.map.put("pin", rsa);
+
+        assertEquals("1234", getString("pin"));
+        assertEquals("1234", getString("pin"));
+
+        assertTrue(store.map.get("pin").startsWith("v2:"));
+        assertEquals("legacy entry unchanged", rsa, legacyStore.map.get("pin"));
+        assertEquals(0, legacyStore.writes);
+        assertEquals(0, legacyStore.removes);
+        assertEquals(0, legacyStore.fileDeletions);
+        assertTrue("RSA key kept", backend.hasRsaKey());
+        assertEquals(0, backend.rsaKeysDeleted);
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(1, diagnostics.migrated);
+        assertEquals("distinct keys", 1, diagnostics.legacyEntriesKept);
+    }
+
+    @Test
+    public void setWritesOnlyTheV2File() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("old")));
+        Map<String, String> legacyBefore = new HashMap<>(legacyStore.map);
+
+        secureStore.set("pin", utf8("new"));
+        secureStore.set("other", utf8("value"));
+
+        assertEquals(legacyBefore, legacyStore.map);
+        assertEquals(0, legacyStore.writes);
+        assertEquals(0, legacyStore.removes);
+        assertTrue(store.map.get("pin").startsWith("v2:"));
+        assertTrue(store.map.get("other").startsWith("v2:"));
+        assertEquals("new", getString("pin"));
+        assertEquals(0, secureStore.diagnostics().migrated);
+        assertEquals(0, secureStore.diagnostics().legacyEntriesKept);
+    }
+
+    @Test
+    public void getAfterMigrationReadsV2EvenIfTheLegacyEntryChanges() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("old")));
+        assertEquals("old", getString("pin"));
+
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("changed")));
+        assertEquals("old", getString("pin"));
+
+        legacyStore.map.remove("pin");
+        assertEquals("old", getString("pin"));
+        assertEquals(1, secureStore.diagnostics().migrated);
+    }
+
+    @Test
+    public void unreadableV2EntryDoesNotFallBackToTheLegacyEntry() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("old")));
+        store.map.put("pin", "v2:" + Base64.getEncoder().encodeToString(new byte[40]));
+
+        assertEquals(SecureStore.Status.UNREADABLE, secureStore.get("pin").status);
+        assertEquals(0, secureStore.diagnostics().migrated);
+    }
+
+    @Test
+    public void v2EntryInTheLegacyFileFromAnEarlierBuildIsMigrated() throws Exception {
+        secureStore.set("pin", utf8("1234"));
+        String earlier = store.map.remove("pin");
+        legacyStore.map.put("pin", earlier);
+
+        assertEquals("1234", getString("pin"));
+        assertTrue(store.map.get("pin").startsWith("v2:"));
+        assertEquals(earlier, legacyStore.map.get("pin"));
+        assertEquals(1, secureStore.diagnostics().migrated);
+    }
+
+    @Test
+    public void removeDeletesTheKeyFromBothFiles() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
+        legacyStore.map.put("legacyOnly", Fakes.androidDefaultBase64(utf8("abc")));
+        secureStore.set("v2Only", utf8("xyz"));
+        assertEquals("1234", getString("pin"));
+        assertEquals(1, secureStore.diagnostics().legacyEntriesKept);
+
+        assertTrue(secureStore.remove("pin"));
+        assertTrue(secureStore.remove("legacyOnly"));
+        assertTrue(secureStore.remove("v2Only"));
+
+        assertTrue(store.map.isEmpty());
+        assertTrue(legacyStore.map.isEmpty());
+        assertFalse(secureStore.contains("pin"));
+        assertEquals(SecureStore.Status.NOT_FOUND, secureStore.get("pin").status);
+        assertEquals(0, secureStore.diagnostics().legacyEntriesKept);
+        assertEquals("the legacy file is not deleted", 0, legacyStore.fileDeletions);
+        assertEquals("the RSA alias is not deleted", 0, backend.rsaKeysDeleted);
+    }
+
+    @Test
+    public void removeReportsAFailedLegacyDelete() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
+        store.failWrites = true;
+        assertEquals("1234", getString("pin"));
+        assertEquals(1, secureStore.diagnostics().migrationSkipped);
+        legacyStore.failRemoves = true;
+
+        assertFalse(secureStore.remove("pin"));
+        assertEquals("legacy entry still stored", 1, secureStore.diagnostics().migrationSkipped);
+    }
+
+    @Test
+    public void clearClearsBothFilesAndKeepsTheKeys() throws Exception {
+        backend.createRsaKey();
+        legacyStore.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
+        legacyStore.map.put("plain", Fakes.androidDefaultBase64(utf8("two")));
+        assertEquals("one", getString("rsa"));
+        secureStore.set("v2", utf8("three"));
+
+        assertTrue(secureStore.clear());
+
+        assertTrue(store.map.isEmpty());
+        assertTrue(legacyStore.map.isEmpty());
+        assertEquals(0, secureStore.keys().length);
+        assertEquals(0, secureStore.diagnostics().legacyEntriesKept);
+        assertTrue(backend.hasAesKey());
+        assertTrue(backend.hasRsaKey());
+        assertEquals(0, legacyStore.fileDeletions);
+    }
+
+    @Test
+    public void clearDoesNotTouchAnEmptyLegacyFile() throws Exception {
+        secureStore.set("a", utf8("1"));
+        assertTrue(secureStore.clear());
+        assertEquals(0, legacyStore.clears);
+        assertEquals(1, store.clears);
+    }
+
+    @Test
+    public void keysAndContainsCoverBothFiles() throws Exception {
+        legacyStore.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        legacyStore.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        secureStore.set("b", utf8("2"));
+        secureStore.set("c", utf8("3"));
+
+        String[] keys = secureStore.keys();
+        Arrays.sort(keys);
+        assertArrayEquals(new String[] { "a", "b", "c" }, keys);
+        assertTrue(secureStore.contains("a"));
+        assertTrue(secureStore.contains("c"));
+        assertFalse(secureStore.contains("d"));
+    }
+
+    @Test
+    public void sweepMigratesIntoV2AndLeavesTheLegacyFileIntact() throws Exception {
+        backend.createRsaKey();
+        String lost = backend.upstreamRsaEncrypt(utf8("lost"));
+        backend.createRsaKey();
+        legacyStore.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
+        legacyStore.map.put("plain", Fakes.androidDefaultBase64(utf8("two")));
+        legacyStore.map.put("garbage", "%%%");
+        legacyStore.map.put("lost", lost);
+        Map<String, String> legacyBefore = new HashMap<>(legacyStore.map);
+
+        secureStore.contains("x");
+        sweepExecutor.runAll();
+
+        assertEquals(legacyBefore, legacyStore.map);
+        assertEquals(0, legacyStore.writes);
+        assertEquals(0, legacyStore.removes);
+        assertEquals(0, legacyStore.fileDeletions);
+        assertEquals(0, backend.rsaKeysDeleted);
+        assertTrue(store.map.get("rsa").startsWith("v2:"));
+        assertTrue(store.map.get("plain").startsWith("v2:"));
+        assertFalse(store.map.containsKey("garbage"));
+        assertFalse(store.map.containsKey("lost"));
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(2, diagnostics.migrated);
+        assertEquals(2, diagnostics.legacyEntriesKept);
+        assertEquals(1, diagnostics.lostItems);
+        assertEquals(1, diagnostics.decryptFailures);
+    }
+
+    @Test
+    public void sweepSkipsLegacyEntriesThatAlreadyHaveAV2Entry() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("old")));
+        assertEquals("old", getString("pin"));
+        int encryptions = backend.aesEncryptCalls;
+
+        sweepExecutor.runAll();
+
+        assertEquals(encryptions, backend.aesEncryptCalls);
+        assertEquals(1, secureStore.diagnostics().migrated);
+    }
+
+    @Test
+    public void deletionOnDeletesTheLegacyEntryAndThenTheRsaKeyAndTheLegacyFile() throws Exception {
+        deleteLegacyStorage();
+        backend.createRsaKey();
+        legacyStore.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        legacyStore.map.put("other", Fakes.androidDefaultBase64(utf8("abc")));
+
+        assertEquals("1234", getString("pin"));
+        assertFalse(legacyStore.map.containsKey("pin"));
+        assertTrue("other legacy entries need the RSA key", backend.hasRsaKey());
+        assertEquals(0, legacyStore.fileDeletions);
+
+        assertEquals("abc", getString("other"));
+        assertTrue(legacyStore.map.isEmpty());
+        assertFalse(backend.hasRsaKey());
+        assertEquals(1, backend.rsaKeysDeleted);
+        assertEquals(1, legacyStore.fileDeletions);
+
+        assertEquals("1234", getString("pin"));
+        assertEquals("abc", getString("other"));
+        assertTrue(secureStore.remove("pin"));
+        sweepExecutor.runAll();
+        assertEquals("deleted once", 1, legacyStore.fileDeletions);
+        SecureStore.Diagnostics diagnostics = secureStore.diagnostics();
+        assertEquals(2, diagnostics.migrated);
+        assertEquals(0, diagnostics.legacyEntriesKept);
+    }
+
+    @Test
+    public void deletionOnKeepsLegacyEntriesThatWereNotMigrated() throws Exception {
+        deleteLegacyStorage();
+        backend.createRsaKey();
+        String lost = backend.upstreamRsaEncrypt(utf8("lost"));
+        backend.createRsaKey();
+        String skipped = Fakes.androidDefaultBase64(utf8("1234"));
+        legacyStore.map.put("lost", lost);
+        legacyStore.map.put("garbage", "%%%");
+        legacyStore.map.put("skipped", skipped);
+        backend.aesDecryptBadTagForAad = SecureStore.aad("skipped");
+
+        secureStore.contains("x");
+        sweepExecutor.runAll();
+        assertEquals("1234", getString("skipped"));
+
+        assertEquals(lost, legacyStore.map.get("lost"));
+        assertEquals("%%%", legacyStore.map.get("garbage"));
+        assertEquals(skipped, legacyStore.map.get("skipped"));
+        assertTrue(backend.hasRsaKey());
+        assertEquals(0, backend.rsaKeysDeleted);
+        assertEquals(0, legacyStore.fileDeletions);
+        assertEquals(1, secureStore.diagnostics().migrationSkipped);
+    }
+
+    @Test
+    public void deletionOnSetDeletesTheLegacyEntry() throws Exception {
+        deleteLegacyStorage();
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("old")));
+
+        secureStore.set("pin", utf8("new"));
+
+        assertTrue(legacyStore.map.isEmpty());
+        assertEquals(1, legacyStore.fileDeletions);
+        assertEquals("new", getString("pin"));
+    }
+
+    @Test
+    public void deletionOnCleansUpWhatTheMigrationReleaseKept() throws Exception {
+        backend.createRsaKey();
+        legacyStore.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
+        legacyStore.map.put("plain", Fakes.androidDefaultBase64(utf8("two")));
+        legacyStore.map.put("stale", Fakes.androidDefaultBase64(utf8("old")));
+        secureStore.contains("x");
+        sweepExecutor.runAll();
+        secureStore.set("stale", utf8("new"));
+        assertEquals(3, legacyStore.map.size());
+
+        deleteLegacyStorage();
+        secureStore.contains("x");
+        sweepExecutor.runAll();
+
+        assertTrue(legacyStore.map.isEmpty());
+        assertFalse(backend.hasRsaKey());
+        assertEquals(1, legacyStore.fileDeletions);
+        assertEquals("one", getString("rsa"));
+        assertEquals("two", getString("plain"));
+        assertEquals("new", getString("stale"));
+    }
+
+    @Test
+    public void deletionOnGetOfAV2EntryDeletesItsLegacyCopy() throws Exception {
+        legacyStore.map.put("a", Fakes.androidDefaultBase64(utf8("1")));
+        legacyStore.map.put("b", Fakes.androidDefaultBase64(utf8("2")));
+        assertEquals("1", getString("a"));
+
+        deleteLegacyStorage();
+        assertEquals("1", getString("a"));
+
+        assertFalse(legacyStore.map.containsKey("a"));
+        assertTrue(legacyStore.map.containsKey("b"));
+        assertEquals(0, legacyStore.fileDeletions);
+    }
+
+    @Test
+    public void deletionOnKeepsCountingALegacyEntryWhoseDeleteFailed() throws Exception {
+        deleteLegacyStorage();
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
+        legacyStore.failRemoves = true;
+
+        assertEquals("1234", getString("pin"));
+
+        assertTrue(legacyStore.map.containsKey("pin"));
+        assertEquals(1, secureStore.diagnostics().legacyEntriesKept);
+        assertEquals(0, legacyStore.fileDeletions);
+
+        legacyStore.failRemoves = false;
+        assertEquals("1234", getString("pin"));
+        assertEquals(0, secureStore.diagnostics().legacyEntriesKept);
+        assertEquals(1, legacyStore.fileDeletions);
+    }
+
+    @Test
+    public void deletionOnKeepsTheLegacyFileWhenTheRsaKeyCannotBeDeleted() throws Exception {
+        deleteLegacyStorage();
+        backend.createRsaKey();
+        legacyStore.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        backend.deleteRsaKeyThrows = new KeyStoreException("Keystore busy");
+
+        assertEquals("1234", getString("pin"));
+        assertTrue(legacyStore.map.isEmpty());
+        assertTrue(backend.hasRsaKey());
+        assertEquals(0, legacyStore.fileDeletions);
+
+        backend.deleteRsaKeyThrows = null;
+        sweepExecutor.runAll();
+        assertFalse(backend.hasRsaKey());
+        assertEquals(1, legacyStore.fileDeletions);
+    }
+
+    @Test
+    public void deletionOnWithoutLegacyDataOnlyDeletesTheEmptyLegacyFile() throws Exception {
+        deleteLegacyStorage();
+        secureStore.set("a", utf8("1"));
+        sweepExecutor.runAll();
+
+        assertEquals(1, legacyStore.fileDeletions);
+        assertEquals(0, backend.rsaKeysDeleted);
+        assertEquals("1", getString("a"));
+    }
+
+    @Test
+    public void productionConfigurationKeepsTheLegacyStorage() throws Exception {
+        backend.createRsaKey();
+        legacyStore.map.put("pin", backend.upstreamRsaEncrypt(utf8("1234")));
+        secureStore = newSecureStore(SecureStore.DELETE_LEGACY_STORAGE);
+
+        assertEquals("1234", getString("pin"));
+        sweepExecutor.runAll();
+
+        assertTrue(legacyStore.map.containsKey("pin"));
+        assertTrue(backend.hasRsaKey());
+        assertEquals(0, legacyStore.fileDeletions);
     }
 }

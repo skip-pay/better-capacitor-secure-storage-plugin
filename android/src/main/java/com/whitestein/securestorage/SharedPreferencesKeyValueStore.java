@@ -7,12 +7,17 @@ import java.util.Set;
 
 final class SharedPreferencesKeyValueStore implements KeyValueStore {
 
-    static final String PREFERENCES_FILE = "cap_sec";
+    static final String PREFERENCES_FILE = "cap_sec_v2";
+    static final String LEGACY_PREFERENCES_FILE = "cap_sec";
 
+    private final Context context;
+    private final String fileName;
     private final SharedPreferences preferences;
 
-    SharedPreferencesKeyValueStore(Context context) {
-        this.preferences = context.getSharedPreferences(PREFERENCES_FILE, Context.MODE_PRIVATE);
+    SharedPreferencesKeyValueStore(Context context, String fileName) {
+        this.context = context;
+        this.fileName = fileName;
+        this.preferences = context.getSharedPreferences(fileName, Context.MODE_PRIVATE);
     }
 
     @Override
@@ -43,5 +48,10 @@ final class SharedPreferencesKeyValueStore implements KeyValueStore {
     @Override
     public boolean clear() {
         return preferences.edit().clear().commit();
+    }
+
+    @Override
+    public boolean deleteFile() {
+        return context.deleteSharedPreferences(fileName);
     }
 }
