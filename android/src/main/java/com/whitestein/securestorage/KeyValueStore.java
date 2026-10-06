@@ -10,7 +10,11 @@ interface KeyValueStore {
 
     Set<String> keys();
 
-    /** Writes synchronously. Returns false when the write did not reach disk. */
+    /**
+     * Writes synchronously. Returns false when the write did not reach disk. The change can still be
+     * applied in memory then, so the file and what this store reports differ until the next write
+     * succeeds. The same holds for {@link #remove} and {@link #clear}.
+     */
     boolean putString(String key, String value);
 
     boolean remove(String key);

@@ -145,6 +145,15 @@ final class SecureStore {
     private final Set<String> undecodableKeys = new HashSet<>();
     private final Set<String> migrationSkippedKeys = new HashSet<>();
     private final Set<String> legacyEntriesKeptKeys = new HashSet<>();
+
+    /**
+     * Keys whose delete from the file reported failure. A SharedPreferences commit removes the key
+     * from memory before the disk write and keeps it on disk when that write fails, so the file can
+     * still hold them although the store no longer lists them. The next successful write to the
+     * same file writes the whole in-memory content and empties the set.
+     */
+    private final Set<String> unconfirmedDeletes = new HashSet<>();
+    private final Set<String> unconfirmedLegacyDeletes = new HashSet<>();
     private int migrated = 0;
     private boolean legacyStorageDeleted = false;
 
@@ -217,15 +226,19 @@ final class SecureStore {
         if (!store.putString(key, encoded)) {
             throw new StorageException("Could not write value", null);
         }
+        unconfirmedDeletes.clear();
         migrationSkippedKeys.remove(key);
         if (deleteLegacyStorage) {
             removeLegacyEntry(key);
         }
     }
 
+    /** Also true for a key whose delete failed, so that {@code remove} can be retried. */
     synchronized boolean contains(String key) {
         startSweepOnce();
-        return store.contains(key) || legacyStore.contains(key);
+        return (
+            store.contains(key) || legacyStore.contains(key) || unconfirmedDeletes.contains(key) || unconfirmedLegacyDeletes.contains(key)
+        );
     }
 
     /**
@@ -237,7 +250,7 @@ final class SecureStore {
         if (!removeLegacyEntry(key)) {
             return false;
         }
-        return store.remove(key);
+        return delete(store, unconfirmedDeletes, key);
     }
 
     /**
@@ -246,13 +259,14 @@ final class SecureStore {
      */
     synchronized boolean clear() {
         startSweepOnce();
-        if (!legacyStore.keys().isEmpty() && !legacyStore.clear()) {
+        boolean legacyFileHoldsKeys = !legacyStore.keys().isEmpty() || !unconfirmedLegacyDeletes.isEmpty();
+        if (legacyFileHoldsKeys && !clear(legacyStore, unconfirmedLegacyDeletes)) {
             return false;
         }
         migrationSkippedKeys.clear();
         legacyEntriesKeptKeys.clear();
         deleteLegacyStorageIfEmpty();
-        return store.clear();
+        return clear(store, unconfirmedDeletes);
     }
 
     synchronized String[] keys() {
@@ -362,9 +376,28 @@ final class SecureStore {
         return legacy;
     }
 
+    private static boolean delete(KeyValueStore target, Set<String> unconfirmed, String key) {
+        if (!target.remove(key)) {
+            unconfirmed.add(key);
+            return false;
+        }
+        unconfirmed.clear();
+        return true;
+    }
+
+    private static boolean clear(KeyValueStore target, Set<String> unconfirmed) {
+        Set<String> keys = target.keys();
+        if (!target.clear()) {
+            unconfirmed.addAll(keys);
+            return false;
+        }
+        unconfirmed.clear();
+        return true;
+    }
+
     private boolean removeLegacyEntry(String key) {
-        boolean present = legacyStore.contains(key);
-        if (present && !legacyStore.remove(key)) {
+        boolean present = legacyStore.contains(key) || unconfirmedLegacyDeletes.contains(key);
+        if (present && !delete(legacyStore, unconfirmedLegacyDeletes, key)) {
             logger.warn("Could not delete legacy entry", null);
             return false;
         }
@@ -396,6 +429,7 @@ final class SecureStore {
         }
         if (legacyStore.deleteFile()) {
             legacyStorageDeleted = true;
+            unconfirmedLegacyDeletes.clear();
         } else {
             logger.warn("Could not delete legacy preferences file", null);
         }
@@ -525,6 +559,7 @@ final class SecureStore {
         }
         aesFailing = false;
         if (store.putString(key, encoded)) {
+            unconfirmedDeletes.clear();
             migrated++;
             migrationSkippedKeys.remove(key);
             if (!deleteLegacyStorage || !removeLegacyEntry(key)) {

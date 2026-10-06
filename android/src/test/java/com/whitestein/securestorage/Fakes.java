@@ -161,10 +161,45 @@ final class Fakes {
         boolean failWrites = false;
         boolean failRemoves = false;
         boolean failClears = false;
+        /**
+         * Makes writes fail like a SharedPreferences commit whose disk write fails: the map
+         * changes, the call returns false and {@link #restart} brings back what the file held.
+         */
+        boolean failDiskWrites = false;
         int writes = 0;
         int removes = 0;
         int clears = 0;
         int fileDeletions = 0;
+
+        /** The file content while it differs from the map, null when both match. */
+        private Map<String, String> disk = null;
+
+        /** Reloads the map from the file, as a new process does. */
+        void restart() {
+            if (disk != null) {
+                map.clear();
+                map.putAll(disk);
+                disk = null;
+            }
+        }
+
+        /**
+         * A successful commit writes the whole map. A commit that changes nothing and finds the
+         * file up to date writes nothing and succeeds, also when the disk is failing.
+         */
+        private boolean commit(Map<String, String> before) {
+            if (!failDiskWrites) {
+                disk = null;
+                return true;
+            }
+            if (disk == null) {
+                if (before.equals(map)) {
+                    return true;
+                }
+                disk = before;
+            }
+            return false;
+        }
 
         @Override
         public String getString(String key) {
@@ -187,8 +222,9 @@ final class Fakes {
             if (failWrites) {
                 return false;
             }
+            Map<String, String> before = new HashMap<>(map);
             map.put(key, value);
-            return true;
+            return commit(before);
         }
 
         @Override
@@ -197,8 +233,9 @@ final class Fakes {
             if (failRemoves) {
                 return false;
             }
+            Map<String, String> before = new HashMap<>(map);
             map.remove(key);
-            return true;
+            return commit(before);
         }
 
         @Override
@@ -207,14 +244,16 @@ final class Fakes {
             if (failClears) {
                 return false;
             }
+            Map<String, String> before = new HashMap<>(map);
             map.clear();
-            return true;
+            return commit(before);
         }
 
         @Override
         public boolean deleteFile() {
             fileDeletions++;
             map.clear();
+            disk = null;
             return true;
         }
     }
