@@ -34,8 +34,9 @@ import javax.crypto.IllegalBlockSizeException;
  *
  * <p>A migration writes the v2 entry of a readable legacy entry only after the new v2 blob was
  * decrypted again and gave back the same bytes, and only once an AES round-trip self-test passed
- * in this process. Otherwise nothing is written and the legacy entry keeps being served. The legacy
- * entry is deleted only when {@code deleteLegacyStorage} is set.
+ * in this process. Otherwise nothing is written and the legacy entry keeps being served. A
+ * migrated legacy entry is deleted only when {@code deleteLegacyStorage} is set. {@code remove} and
+ * {@code clear} always delete it.
  *
  * <p>All public operations hold one lock, so the background sweep and calls from JavaScript never
  * interleave on the same entry.
@@ -144,6 +145,15 @@ final class SecureStore {
     private final Set<String> undecodableKeys = new HashSet<>();
     private final Set<String> migrationSkippedKeys = new HashSet<>();
     private final Set<String> legacyEntriesKeptKeys = new HashSet<>();
+
+    /**
+     * Keys whose delete from the file reported failure. A SharedPreferences commit removes the key
+     * from memory before the disk write and keeps it on disk when that write fails, so the file can
+     * still hold them although the store no longer lists them. The next successful write to the
+     * same file writes the whole in-memory content and empties the set.
+     */
+    private final Set<String> unconfirmedDeletes = new HashSet<>();
+    private final Set<String> unconfirmedLegacyDeletes = new HashSet<>();
     private int migrated = 0;
     private boolean legacyStorageDeleted = false;
 
@@ -216,34 +226,47 @@ final class SecureStore {
         if (!store.putString(key, encoded)) {
             throw new StorageException("Could not write value", null);
         }
+        unconfirmedDeletes.clear();
         migrationSkippedKeys.remove(key);
         if (deleteLegacyStorage) {
             removeLegacyEntry(key);
         }
     }
 
+    /** Also true for a key whose delete failed, so that {@code remove} can be retried. */
     synchronized boolean contains(String key) {
         startSweepOnce();
-        return store.contains(key) || legacyStore.contains(key);
+        return (
+            store.contains(key) || legacyStore.contains(key) || unconfirmedDeletes.contains(key) || unconfirmedLegacyDeletes.contains(key)
+        );
     }
 
+    /**
+     * Deletes the legacy entry first and the v2 entry last. When the legacy delete fails the v2
+     * entry stays, so a failed remove never leaves only the legacy value behind for the next read.
+     */
     synchronized boolean remove(String key) {
         startSweepOnce();
-        boolean removed = store.remove(key);
-        return removeLegacyEntry(key) && removed;
+        if (!removeLegacyEntry(key)) {
+            return false;
+        }
+        return delete(store, unconfirmedDeletes, key);
     }
 
-    /** Clears both preferences files. Keystore keys are kept. */
+    /**
+     * Clears the legacy file first and the v2 file last, for the same reason as {@link #remove}.
+     * Keystore keys are kept.
+     */
     synchronized boolean clear() {
         startSweepOnce();
-        boolean cleared = store.clear();
-        boolean legacyCleared = legacyStore.keys().isEmpty() || legacyStore.clear();
-        if (legacyCleared) {
-            migrationSkippedKeys.clear();
-            legacyEntriesKeptKeys.clear();
-            deleteLegacyStorageIfEmpty();
+        boolean legacyFileHoldsKeys = !legacyStore.keys().isEmpty() || !unconfirmedLegacyDeletes.isEmpty();
+        if (legacyFileHoldsKeys && !clear(legacyStore, unconfirmedLegacyDeletes)) {
+            return false;
         }
-        return cleared && legacyCleared;
+        migrationSkippedKeys.clear();
+        legacyEntriesKeptKeys.clear();
+        deleteLegacyStorageIfEmpty();
+        return clear(store, unconfirmedDeletes);
     }
 
     synchronized String[] keys() {
@@ -353,9 +376,28 @@ final class SecureStore {
         return legacy;
     }
 
+    private static boolean delete(KeyValueStore target, Set<String> unconfirmed, String key) {
+        if (!target.remove(key)) {
+            unconfirmed.add(key);
+            return false;
+        }
+        unconfirmed.clear();
+        return true;
+    }
+
+    private static boolean clear(KeyValueStore target, Set<String> unconfirmed) {
+        Set<String> keys = target.keys();
+        if (!target.clear()) {
+            unconfirmed.addAll(keys);
+            return false;
+        }
+        unconfirmed.clear();
+        return true;
+    }
+
     private boolean removeLegacyEntry(String key) {
-        boolean present = legacyStore.contains(key);
-        if (present && !legacyStore.remove(key)) {
+        boolean present = legacyStore.contains(key) || unconfirmedLegacyDeletes.contains(key);
+        if (present && !delete(legacyStore, unconfirmedLegacyDeletes, key)) {
             logger.warn("Could not delete legacy entry", null);
             return false;
         }
@@ -387,6 +429,7 @@ final class SecureStore {
         }
         if (legacyStore.deleteFile()) {
             legacyStorageDeleted = true;
+            unconfirmedLegacyDeletes.clear();
         } else {
             logger.warn("Could not delete legacy preferences file", null);
         }
@@ -516,6 +559,7 @@ final class SecureStore {
         }
         aesFailing = false;
         if (store.putString(key, encoded)) {
+            unconfirmedDeletes.clear();
             migrated++;
             migrationSkippedKeys.remove(key);
             if (!deleteLegacyStorage || !removeLegacyEntry(key)) {
