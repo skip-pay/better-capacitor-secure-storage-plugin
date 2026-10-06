@@ -72,12 +72,13 @@ export interface SecureStorageDiagnostics {
    */
   parked: number;
   /**
-   * Keys rewritten by a migration: moved into the app-private access group, re-encrypted or given a stricter class.
-   * On Android entries rewritten from RSA or plaintext to AES-GCM.
+   * On iOS keys copied from the legacy keychain service `cap_sec` or the bundle id service into `cap_sec_v2` and verified
+   * by a read-back. On Android entries rewritten from RSA or plaintext to AES-GCM.
    */
   migrated: number;
   /**
-   * Extra copies of a key deleted after the surviving copy was written and verified. Always `0` on Android.
+   * Legacy copies deleted once their key had a verified `cap_sec_v2` item: `cap_sec` items in any access group and bundle id
+   * service items. Stays `0` until the deletion of older copies is switched on. Always `0` on Android.
    */
   duplicatesResolved: number;
   /**
@@ -103,16 +104,16 @@ export interface SecureStorageDiagnostics {
    */
   decryptRetries?: number;
   /**
-   * Copies a migration deleted or overwrote whose value differed from the copy that won (iOS, web resolves `0`).
-   * Optional because Android does not report it.
+   * Legacy copies whose value differed from the copy that won when their key was copied into `cap_sec_v2` (iOS, web
+   * resolves `0`). Optional because Android does not report it.
    *
    * @since 1.0.0
    */
   conflictingDuplicates?: number;
   /**
-   * Keys whose older copies (in another access group or the bundle id service) the plugin found and left in place,
-   * because the deletion of older copies is not switched on yet. Each key counts once per process (iOS, web resolves `0`).
-   * Optional because Android does not report it.
+   * Keys that have their `cap_sec_v2` item while legacy copies (`cap_sec` in any access group or the bundle id service) are
+   * still stored, because the deletion of older copies is not switched on yet or a delete failed. Each key counts once per
+   * process (iOS, web resolves `0`). Optional because Android does not report it.
    *
    * @since 1.0.0
    */
@@ -142,7 +143,7 @@ export interface SecureStorageDiagnostics {
    */
   keyBackend: 'secureEnclave' | 'software' | 'unusable' | 'keystoreAes' | 'keystoreRsaLegacy' | 'none';
   /**
-   * `explicit` when items live in the app-private `<team id>.<bundle id>` keychain access group, `default` when the plugin
+   * `explicit` when new items go to the app-private `<team id>.<bundle id>` keychain access group, `default` when the plugin
    * fell back to the app's default access group or could not determine it yet. `n/a` on Android.
    */
   accessGroupMode: 'explicit' | 'default' | 'n/a';
@@ -157,6 +158,7 @@ declare module '@capacitor/cli' {
       /**
        * Default keychain accessibility class for items written by the plugin (iOS only).
        * `afterFirstUnlock` is available as an explicit opt-out, for example when the app must read values while the device is locked.
+       * A legacy item copied into `cap_sec_v2` gets this class or its own, whichever is stricter.
        * An unknown value makes every storage call reject with
        * `Unsupported accessibility value in plugin configuration`. Only `getPlatform` still resolves.
        *
@@ -167,12 +169,12 @@ declare module '@capacitor/cli' {
       accessibility?: KeychainAccessibility;
       /**
        * Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default. Set `false` to opt out.
-       * A sweep writes an encrypted copy of plaintext items in the plugin's `cap_sec` keychain service once per app launch, in the foreground,
-       * after about 1.5 s without app calls once the first call has completed (or about five seconds after load when the app makes no call).
-       * The first `get` of a key also writes the encrypted copy.
-       * Items in the app bundle id service are copied into `cap_sec` when `get` reads them.
-       * Older copies stay in place until the deletion of older copies is switched on (SS-12183).
-       * A migrated item keeps its keychain class when that class is stricter than the configured default.
+       * The plugin writes into the keychain service `cap_sec_v2`. Items of upstream versions in `cap_sec` are copied into it, encrypted,
+       * by the first `get` of a key and by a sweep once per app launch, in the foreground, after about 1.5 s without app calls once the
+       * first call has completed (or about five seconds after load when the app makes no call).
+       * Items in the app bundle id service are copied when `get` reads them.
+       * The items in `cap_sec` and the bundle id service stay as they were until the deletion of older copies is switched on (SS-12183).
+       * A `cap_sec_v2` item that holds plaintext is encrypted by its next `get` once encryption works.
        * Android always encrypts with AndroidKeyStore, web ignores the option.
        *
        * @since 1.0.0
@@ -203,23 +205,26 @@ export interface SecureStoragePluginPlugin {
   set(options: SecureStorageSetOptions): Promise<{ value: boolean }>;
   /**
    * Remove a stored value.
+   * On iOS it deletes the `cap_sec_v2` item and every legacy copy of the key, in `cap_sec` in any access group and in the
+   * bundle id service.
    *
    * @param options The key to remove.
    * @returns `true` on success. Rejects with `Item with given key does not exist` when the key is missing.
    */
   remove(options: { key: string }): Promise<{ value: boolean }>;
   /**
-   * Remove all values in the plugin's keychain service plus the legacy bundle id copies of those keys.
-   * On iOS a bundle id copy is removed only for a key that also exists in the plugin's service. Legacy items left only in
-   * the bundle id service are kept and `get` can still return them, so an app that needs a hard wipe also calls `remove`
-   * for each key it knows.
+   * Remove all values in the plugin's keychain services plus the legacy bundle id copies of those keys.
+   * On iOS it deletes every item in `cap_sec_v2` and `cap_sec`, in any access group. A bundle id copy is removed only for a
+   * key that also exists in one of those services. Legacy items left only in the bundle id service are kept and `get` can
+   * still return them, so an app that needs a hard wipe also calls `remove` for each key it knows.
    *
    * @returns `true` on success, otherwise the promise rejects.
    */
   clear(): Promise<{ value: boolean }>;
   /**
-   * List the keys of all values in the plugin's keychain service.
-   * On iOS legacy items in the bundle id service are not listed.
+   * List the keys of all values in the plugin's keychain services.
+   * On iOS the keys of `cap_sec_v2` and of the legacy `cap_sec` service, each once. Legacy items in the bundle id service are
+   * not listed until `get` copied them.
    *
    * @returns The stored keys.
    */
