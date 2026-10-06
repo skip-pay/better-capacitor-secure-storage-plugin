@@ -19,6 +19,7 @@ public class SecureStoragePluginPlugin extends Plugin {
 
     static final String MESSAGE_NOT_FOUND = "Item with given key does not exist";
     static final String MESSAGE_ERROR = "error";
+    static final String MESSAGE_REMOVE_FAILED = "Remove failed";
     static final String CODE_NOT_FOUND = "NOT_FOUND";
     static final String CODE_UNREADABLE = "UNREADABLE";
     static final String CODE_STORAGE_ERROR = "STORAGE_ERROR";
@@ -145,6 +146,8 @@ public class SecureStoragePluginPlugin extends Plugin {
                 } else {
                     call.reject(MESSAGE_NOT_FOUND, CODE_NOT_FOUND);
                 }
+            } catch (StorageException e) {
+                call.reject(MESSAGE_REMOVE_FAILED, CODE_STORAGE_ERROR, e);
             } catch (Exception e) {
                 call.reject(MESSAGE_ERROR, CODE_STORAGE_ERROR, e);
             }
@@ -208,15 +211,17 @@ public class SecureStoragePluginPlugin extends Plugin {
         return ret;
     }
 
-    public JSObject _remove(String key) {
-        // The preferences keep the change in memory even when the disk write fails, so this
-        // resolves like upstream did.
-        store().remove(key);
+    public JSObject _remove(String key) throws StorageException {
+        if (!store().remove(key)) {
+            throw new StorageException(MESSAGE_REMOVE_FAILED, null);
+        }
         return booleanResult(true);
     }
 
-    public JSObject _clear() {
-        store().clear();
+    public JSObject _clear() throws StorageException {
+        if (!store().clear()) {
+            throw new StorageException(MESSAGE_ERROR, null);
+        }
         return booleanResult(true);
     }
 

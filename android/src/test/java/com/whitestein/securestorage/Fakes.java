@@ -160,6 +160,7 @@ final class Fakes {
         final Map<String, String> map = new HashMap<>();
         boolean failWrites = false;
         boolean failRemoves = false;
+        boolean failClears = false;
         int writes = 0;
         int removes = 0;
         int clears = 0;
@@ -203,6 +204,9 @@ final class Fakes {
         @Override
         public boolean clear() {
             clears++;
+            if (failClears) {
+                return false;
+            }
             map.clear();
             return true;
         }

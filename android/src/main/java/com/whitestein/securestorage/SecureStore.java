@@ -34,8 +34,9 @@ import javax.crypto.IllegalBlockSizeException;
  *
  * <p>A migration writes the v2 entry of a readable legacy entry only after the new v2 blob was
  * decrypted again and gave back the same bytes, and only once an AES round-trip self-test passed
- * in this process. Otherwise nothing is written and the legacy entry keeps being served. The legacy
- * entry is deleted only when {@code deleteLegacyStorage} is set.
+ * in this process. Otherwise nothing is written and the legacy entry keeps being served. A
+ * migrated legacy entry is deleted only when {@code deleteLegacyStorage} is set. {@code remove} and
+ * {@code clear} always delete it.
  *
  * <p>All public operations hold one lock, so the background sweep and calls from JavaScript never
  * interleave on the same entry.
@@ -227,23 +228,31 @@ final class SecureStore {
         return store.contains(key) || legacyStore.contains(key);
     }
 
+    /**
+     * Deletes the legacy entry first and the v2 entry last. When the legacy delete fails the v2
+     * entry stays, so a failed remove never leaves only the legacy value behind for the next read.
+     */
     synchronized boolean remove(String key) {
         startSweepOnce();
-        boolean removed = store.remove(key);
-        return removeLegacyEntry(key) && removed;
+        if (!removeLegacyEntry(key)) {
+            return false;
+        }
+        return store.remove(key);
     }
 
-    /** Clears both preferences files. Keystore keys are kept. */
+    /**
+     * Clears the legacy file first and the v2 file last, for the same reason as {@link #remove}.
+     * Keystore keys are kept.
+     */
     synchronized boolean clear() {
         startSweepOnce();
-        boolean cleared = store.clear();
-        boolean legacyCleared = legacyStore.keys().isEmpty() || legacyStore.clear();
-        if (legacyCleared) {
-            migrationSkippedKeys.clear();
-            legacyEntriesKeptKeys.clear();
-            deleteLegacyStorageIfEmpty();
+        if (!legacyStore.keys().isEmpty() && !legacyStore.clear()) {
+            return false;
         }
-        return cleared && legacyCleared;
+        migrationSkippedKeys.clear();
+        legacyEntriesKeptKeys.clear();
+        deleteLegacyStorageIfEmpty();
+        return store.clear();
     }
 
     synchronized String[] keys() {

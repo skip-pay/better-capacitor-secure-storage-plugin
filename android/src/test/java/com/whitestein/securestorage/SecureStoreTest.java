@@ -1013,6 +1013,65 @@ public class SecureStoreTest {
     }
 
     @Test
+    public void removeKeepsTheV2EntryWhenTheLegacyDeleteFails() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
+        assertEquals("1234", getString("pin"));
+        assertTrue(store.map.containsKey("pin"));
+        legacyStore.failRemoves = true;
+
+        assertFalse(secureStore.remove("pin"));
+
+        assertEquals("the legacy delete ran first", 1, legacyStore.removes);
+        assertEquals("the v2 entry was not touched", 0, store.removes);
+        assertTrue(store.map.containsKey("pin"));
+        assertTrue(legacyStore.map.containsKey("pin"));
+        assertEquals("1234", getString("pin"));
+        assertEquals(1, secureStore.diagnostics().legacyEntriesKept);
+    }
+
+    @Test
+    public void removeReportsAFailedV2Delete() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
+        assertEquals("1234", getString("pin"));
+        store.failRemoves = true;
+
+        assertFalse(secureStore.remove("pin"));
+
+        assertFalse("the legacy entry is gone", legacyStore.map.containsKey("pin"));
+        assertEquals(1, store.removes);
+        assertEquals(0, secureStore.diagnostics().legacyEntriesKept);
+    }
+
+    @Test
+    public void clearKeepsTheV2FileWhenTheLegacyClearFails() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
+        assertEquals("1234", getString("pin"));
+        secureStore.set("v2Only", utf8("xyz"));
+        legacyStore.failClears = true;
+
+        assertFalse(secureStore.clear());
+
+        assertEquals(1, legacyStore.clears);
+        assertEquals("the v2 file was not touched", 0, store.clears);
+        assertEquals("1234", getString("pin"));
+        assertEquals("xyz", getString("v2Only"));
+        assertEquals(1, secureStore.diagnostics().legacyEntriesKept);
+    }
+
+    @Test
+    public void clearReportsAFailedV2Clear() throws Exception {
+        legacyStore.map.put("pin", Fakes.androidDefaultBase64(utf8("1234")));
+        assertEquals("1234", getString("pin"));
+        store.failClears = true;
+
+        assertFalse(secureStore.clear());
+
+        assertTrue("the legacy file was cleared", legacyStore.map.isEmpty());
+        assertEquals(1, store.clears);
+        assertEquals(0, secureStore.diagnostics().legacyEntriesKept);
+    }
+
+    @Test
     public void clearClearsBothFilesAndKeepsTheKeys() throws Exception {
         backend.createRsaKey();
         legacyStore.map.put("rsa", backend.upstreamRsaEncrypt(utf8("one")));
