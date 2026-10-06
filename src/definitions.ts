@@ -120,11 +120,20 @@ export interface SecureStorageDiagnostics {
   /**
    * Android only: legacy entries still stored whose migration was skipped because the re-encrypted value did not
    * decrypt back to the same bytes, could not be encrypted, or could not be written. A key leaves the count once a later
-   * migration, `set`, `remove` or `clear` replaced its legacy entry. Optional because iOS and web do not report it.
+   * migration or `set` wrote its `cap_sec_v2` entry, or `remove` or `clear` deleted it. Optional because iOS and web do
+   * not report it.
    *
    * @since 1.0.0
    */
   migrationSkipped?: number;
+  /**
+   * Android only: keys whose `cap_sec` entry is still stored after its migration to `cap_sec_v2` in this process,
+   * because the deletion of the older storage is not switched on yet or the delete failed. A key leaves the count once
+   * `remove` or `clear` deletes the entry. Optional because iOS and web do not report it.
+   *
+   * @since 1.0.0
+   */
+  legacyEntriesKept?: number;
   /**
    * Key that encrypts values. On iOS `secureEnclave`, `software` (the simulator fallback), or `unusable` once the key kept
    * refusing on an unlocked device and values fall back to plaintext for the rest of the process. On Android
@@ -158,10 +167,11 @@ declare module '@capacitor/cli' {
       accessibility?: KeychainAccessibility;
       /**
        * Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default. Set `false` to opt out.
-       * A sweep encrypts plaintext items in the plugin's `cap_sec` keychain service once per app launch, in the foreground,
+       * A sweep writes an encrypted copy of plaintext items in the plugin's `cap_sec` keychain service once per app launch, in the foreground,
        * after about 1.5 s without app calls once the first call has completed (or about five seconds after load when the app makes no call).
-       * The first `get` of a key also encrypts it.
-       * Items in the app bundle id service move into `cap_sec`, and `get` encrypts them lazily when it reads them.
+       * The first `get` of a key also writes the encrypted copy.
+       * Items in the app bundle id service are copied into `cap_sec` when `get` reads them.
+       * Older copies stay in place until the deletion of older copies is switched on (SS-12183).
        * A migrated item keeps its keychain class when that class is stricter than the configured default.
        * Android always encrypts with AndroidKeyStore, web ignores the option.
        *

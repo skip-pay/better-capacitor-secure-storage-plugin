@@ -56,6 +56,7 @@ export class SecureStoragePluginWeb extends WebPlugin implements SecureStoragePl
       conflictingDuplicates: 0,
       legacyCopiesKept: 0,
       migrationSkipped: 0,
+      legacyEntriesKept: 0,
       keyBackend: 'none',
       accessGroupMode: 'default',
     });
