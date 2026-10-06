@@ -17,11 +17,13 @@ import javax.crypto.IllegalBlockSizeException;
 /**
  * Storage logic of the plugin, free of Android types so it runs in plain JVM tests.
  *
- * <p>Stored string formats, detected per entry in this order:
+ * <p>{@code store} holds only {@code "v2:" + base64(iv || ciphertext || tag)} entries: AES-256-GCM,
+ * AAD {@code "v2:" + key}. {@code legacyStore} holds entries of older versions, detected per entry
+ * in this order:
  *
  * <ol>
- *   <li>{@code "v2:" + base64(iv || ciphertext || tag)}: AES-256-GCM, AAD {@code "v2:" + key}.
- *       {@code ':'} is not in the base64 alphabet, so no legacy entry starts with the prefix.
+ *   <li>the v2 format, written into the legacy file by earlier builds of this fork. {@code ':'} is
+ *       not in the base64 alphabet, so no other legacy entry starts with the prefix.
  *   <li>base64 of RSA/ECB/PKCS1Padding blocks (upstream format), when the RSA key exists and the
  *       decoded length is a non-zero multiple of 256.
  *   <li>base64 of the UTF-8 value (upstream plaintext fallback when the keystore failed).
@@ -30,14 +32,18 @@ import javax.crypto.IllegalBlockSizeException;
  * Reads fail open: a legacy value is returned even when it cannot be migrated. Writes fail
  * closed: only the v2 format is ever written, and a write that cannot be encrypted throws.
  *
- * <p>A migration replaces a readable legacy entry only after the new v2 blob was decrypted again
- * and gave back the same bytes, and only once an AES round-trip self-test passed in this process.
- * Otherwise the legacy entry stays as it is and keeps being served.
+ * <p>A migration writes the v2 entry of a readable legacy entry only after the new v2 blob was
+ * decrypted again and gave back the same bytes, and only once an AES round-trip self-test passed
+ * in this process. Otherwise nothing is written and the legacy entry keeps being served. The legacy
+ * entry is deleted only when {@code deleteLegacyStorage} is set.
  *
  * <p>All public operations hold one lock, so the background sweep and calls from JavaScript never
  * interleave on the same entry.
  */
 final class SecureStore {
+
+    // TODO(SS-12183): enable in the app version that follows the migration release, once most users have migrated
+    static final boolean DELETE_LEGACY_STORAGE = false;
 
     static final String V2_PREFIX = "v2:";
     static final int GCM_IV_BYTES = 12;
@@ -85,17 +91,19 @@ final class SecureStore {
         final int decryptFailures;
         /**
          * Distinct keys whose legacy entry is still stored after its migration was skipped. A key
-         * is dropped once a migration or {@code set} rewrote it, or {@code remove}/{@code clear}
-         * deleted it.
+         * is dropped once a migration or {@code set} wrote its v2 entry, or {@code remove}/{@code
+         * clear} deleted it.
          */
         final int migrationSkipped;
+        final int legacyEntriesKept;
         final String keyBackend;
 
-        Diagnostics(int migrated, int lostItems, int decryptFailures, int migrationSkipped, String keyBackend) {
+        Diagnostics(int migrated, int lostItems, int decryptFailures, int migrationSkipped, int legacyEntriesKept, String keyBackend) {
             this.migrated = migrated;
             this.lostItems = lostItems;
             this.decryptFailures = decryptFailures;
             this.migrationSkipped = migrationSkipped;
+            this.legacyEntriesKept = legacyEntriesKept;
             this.keyBackend = keyBackend;
         }
     }
@@ -123,6 +131,8 @@ final class SecureStore {
     }
 
     private final KeyValueStore store;
+    private final KeyValueStore legacyStore;
+    private final boolean deleteLegacyStorage;
     private final CipherBackend backend;
     private final Base64Codec base64;
     private final Executor sweepExecutor;
@@ -133,7 +143,9 @@ final class SecureStore {
     private final Set<String> lostKeys = new HashSet<>();
     private final Set<String> undecodableKeys = new HashSet<>();
     private final Set<String> migrationSkippedKeys = new HashSet<>();
+    private final Set<String> legacyEntriesKeptKeys = new HashSet<>();
     private int migrated = 0;
+    private boolean legacyStorageDeleted = false;
 
     /**
      * Set once the AES round-trip self-test passed. There is one store per process in production,
@@ -153,8 +165,19 @@ final class SecureStore {
      */
     private boolean aesFailing = false;
 
-    SecureStore(KeyValueStore store, CipherBackend backend, Base64Codec base64, Executor sweepExecutor, Sleeper sleeper, Logger logger) {
+    SecureStore(
+        KeyValueStore store,
+        KeyValueStore legacyStore,
+        boolean deleteLegacyStorage,
+        CipherBackend backend,
+        Base64Codec base64,
+        Executor sweepExecutor,
+        Sleeper sleeper,
+        Logger logger
+    ) {
         this.store = store;
+        this.legacyStore = legacyStore;
+        this.deleteLegacyStorage = deleteLegacyStorage;
         this.backend = backend;
         this.base64 = base64;
         this.sweepExecutor = sweepExecutor;
@@ -164,7 +187,7 @@ final class SecureStore {
 
     synchronized ReadResult get(String key) {
         startSweepOnce();
-        return readAndMigrate(key, true);
+        return read(key, true);
     }
 
     /**
@@ -194,35 +217,39 @@ final class SecureStore {
             throw new StorageException("Could not write value", null);
         }
         migrationSkippedKeys.remove(key);
+        if (deleteLegacyStorage) {
+            removeLegacyEntry(key);
+        }
     }
 
     synchronized boolean contains(String key) {
         startSweepOnce();
-        return store.contains(key);
+        return store.contains(key) || legacyStore.contains(key);
     }
 
     synchronized boolean remove(String key) {
         startSweepOnce();
         boolean removed = store.remove(key);
-        if (removed) {
-            migrationSkippedKeys.remove(key);
-        }
-        return removed;
+        return removeLegacyEntry(key) && removed;
     }
 
-    /** Clears the preferences file. Keystore keys are kept. */
+    /** Clears both preferences files. Keystore keys are kept. */
     synchronized boolean clear() {
         startSweepOnce();
         boolean cleared = store.clear();
-        if (cleared) {
+        boolean legacyCleared = legacyStore.keys().isEmpty() || legacyStore.clear();
+        if (legacyCleared) {
             migrationSkippedKeys.clear();
+            legacyEntriesKeptKeys.clear();
+            deleteLegacyStorageIfEmpty();
         }
-        return cleared;
+        return cleared && legacyCleared;
     }
 
     synchronized String[] keys() {
         startSweepOnce();
         Set<String> keys = store.keys();
+        keys.addAll(legacyStore.keys());
         return keys.toArray(new String[0]);
     }
 
@@ -239,29 +266,42 @@ final class SecureStore {
         } catch (Exception e) {
             keyBackend = "none";
         }
-        return new Diagnostics(migrated, lostKeys.size(), undecodableKeys.size(), migrationSkippedKeys.size(), keyBackend);
+        return new Diagnostics(
+            migrated,
+            lostKeys.size(),
+            undecodableKeys.size(),
+            migrationSkippedKeys.size(),
+            legacyEntriesKeptKeys.size(),
+            keyBackend
+        );
     }
 
     /**
-     * Migrates every legacy entry. Runs on the sweep executor, takes the lock once per entry. Stops
-     * when the self-test fails. Reads migrate the remaining entries.
+     * Migrates every legacy entry that has no v2 entry yet. Runs on the sweep executor, takes the
+     * lock once per entry. Stops when the self-test fails. Reads migrate the remaining entries.
      */
     void sweepLegacyEntries() {
         Set<String> keys;
         synchronized (this) {
-            keys = store.keys();
+            keys = legacyStore.keys();
         }
         for (String key : keys) {
             synchronized (this) {
-                String raw = readRaw(key);
-                if (raw != null && !raw.startsWith(V2_PREFIX)) {
-                    readAndMigrate(key, !aesFailing);
+                if (store.contains(key)) {
+                    if (deleteLegacyStorage) {
+                        read(key, !aesFailing);
+                    }
+                } else if (legacyStore.contains(key)) {
+                    readLegacyAndMigrate(key, !aesFailing);
                     if (selfTestFailed) {
                         logger.warn("Legacy sweep stopped, AES self-test did not pass", null);
                         return;
                     }
                 }
             }
+        }
+        synchronized (this) {
+            deleteLegacyStorageIfEmpty();
         }
     }
 
@@ -275,20 +315,11 @@ final class SecureStore {
         }
     }
 
-    private String readRaw(String key) {
-        try {
-            return store.getString(key);
-        } catch (ClassCastException e) {
-            // Not a string, so not written by this plugin. Treat like an undecodable entry.
-            return "";
-        }
-    }
-
     /**
-     * Reads an entry and migrates it when it is in a legacy format. {@code retryReads} is false
-     * only for the sweep while {@link #aesFailing} is set.
+     * Reads the v2 entry, or the legacy entry when there is no v2 entry, and migrates the legacy
+     * entry. {@code retryReads} is false only for the sweep while {@link #aesFailing} is set.
      */
-    private ReadResult readAndMigrate(String key, boolean retryReads) {
+    private ReadResult read(String key, boolean retryReads) {
         String raw;
         try {
             raw = store.getString(key);
@@ -296,16 +327,69 @@ final class SecureStore {
             return undecodable(key, e);
         }
         if (raw == null) {
+            return readLegacyAndMigrate(key, retryReads);
+        }
+        ReadResult result = raw.startsWith(V2_PREFIX) ? readV2(key, raw) : undecodable(key, null);
+        if (result.status == Status.FOUND && deleteLegacyStorage) {
+            removeLegacyEntry(key);
+        }
+        return result;
+    }
+
+    private ReadResult readLegacyAndMigrate(String key, boolean retryReads) {
+        String raw;
+        try {
+            raw = legacyStore.getString(key);
+        } catch (ClassCastException e) {
+            return undecodable(key, e);
+        }
+        if (raw == null) {
             return ReadResult.NOT_FOUND;
         }
-        if (raw.startsWith(V2_PREFIX)) {
-            return readV2(key, raw);
-        }
-        ReadResult legacy = readLegacy(key, raw, retryReads);
+        ReadResult legacy = raw.startsWith(V2_PREFIX) ? readV2(key, raw) : readLegacy(key, raw, retryReads);
         if (legacy.status == Status.FOUND) {
             migrate(key, legacy.value);
         }
         return legacy;
+    }
+
+    private boolean removeLegacyEntry(String key) {
+        boolean present = legacyStore.contains(key);
+        if (present && !legacyStore.remove(key)) {
+            logger.warn("Could not delete legacy entry", null);
+            return false;
+        }
+        migrationSkippedKeys.remove(key);
+        legacyEntriesKeptKeys.remove(key);
+        if (present) {
+            deleteLegacyStorageIfEmpty();
+        }
+        return true;
+    }
+
+    private void deleteLegacyStorageIfEmpty() {
+        if (!deleteLegacyStorage || legacyStorageDeleted || !legacyStore.keys().isEmpty()) {
+            return;
+        }
+        try {
+            if (withRetry(backend::hasRsaKey, this::isPermanentLegacy)) {
+                withRetry(
+                    () -> {
+                        backend.deleteRsaKey();
+                        return null;
+                    },
+                    this::isPermanentLegacy
+                );
+            }
+        } catch (Exception e) {
+            logger.warn("Could not delete legacy RSA key", e);
+            return;
+        }
+        if (legacyStore.deleteFile()) {
+            legacyStorageDeleted = true;
+        } else {
+            logger.warn("Could not delete legacy preferences file", null);
+        }
     }
 
     private ReadResult readV2(String key, String raw) {
@@ -398,9 +482,10 @@ final class SecureStore {
     }
 
     /**
-     * Rewrites a legacy entry in the v2 format. The new blob is written only when it decrypts back
-     * to the same bytes. Any failure leaves the legacy entry in place and counts the key as skipped
-     * until a later migration or write replaces the entry.
+     * Writes the v2 entry of a legacy entry. The new blob is written only when it decrypts back to
+     * the same bytes. Any failure counts the key as skipped until a later migration or write stores
+     * its v2 entry. The legacy entry is never changed, it is only deleted after a v2 write when
+     * {@link #deleteLegacyStorage} is set.
      */
     private void migrate(String key, byte[] value) {
         boolean retry = !aesFailing;
@@ -433,6 +518,9 @@ final class SecureStore {
         if (store.putString(key, encoded)) {
             migrated++;
             migrationSkippedKeys.remove(key);
+            if (!deleteLegacyStorage || !removeLegacyEntry(key)) {
+                legacyEntriesKeptKeys.add(key);
+            }
         } else {
             skipMigration(key, "Could not write migrated entry", null);
         }

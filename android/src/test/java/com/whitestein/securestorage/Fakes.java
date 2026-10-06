@@ -159,7 +159,11 @@ final class Fakes {
 
         final Map<String, String> map = new HashMap<>();
         boolean failWrites = false;
+        boolean failRemoves = false;
         int writes = 0;
+        int removes = 0;
+        int clears = 0;
+        int fileDeletions = 0;
 
         @Override
         public String getString(String key) {
@@ -188,12 +192,24 @@ final class Fakes {
 
         @Override
         public boolean remove(String key) {
+            removes++;
+            if (failRemoves) {
+                return false;
+            }
             map.remove(key);
             return true;
         }
 
         @Override
         public boolean clear() {
+            clears++;
+            map.clear();
+            return true;
+        }
+
+        @Override
+        public boolean deleteFile() {
+            fileDeletions++;
             map.clear();
             return true;
         }
@@ -209,6 +225,7 @@ final class Fakes {
         int transientFailures = 0;
         int aesEncryptCalls = 0;
         int aesKeysCreated = 0;
+        int rsaKeysDeleted = 0;
         /** AAD of every aesEncrypt call that got past the failure hooks, in order. */
         final List<String> aesEncryptAads = new ArrayList<>();
         /** Thrown by upcoming aesEncrypt calls, one per call, before anything else happens. */
@@ -223,6 +240,7 @@ final class Fakes {
         byte[] aesDecryptCorruptsForAad = null;
         /** Thrown by upcoming rsaDecrypt calls, one per call, before anything else happens. */
         final Deque<GeneralSecurityException> rsaDecryptErrors = new ArrayDeque<>();
+        GeneralSecurityException deleteRsaKeyThrows = null;
 
         private final SecureRandom random = new SecureRandom();
 
@@ -349,6 +367,16 @@ final class Fakes {
                 out.writeBytes(cipher.doFinal(ciphertext, position, 256));
             }
             return out.toByteArray();
+        }
+
+        @Override
+        public void deleteRsaKey() throws GeneralSecurityException {
+            maybeFail();
+            if (deleteRsaKeyThrows != null) {
+                throw deleteRsaKeyThrows;
+            }
+            rsaKey = null;
+            rsaKeysDeleted++;
         }
     }
 

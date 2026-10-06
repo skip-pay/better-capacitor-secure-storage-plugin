@@ -34,6 +34,8 @@ interface CipherBackend {
     /** Decrypts legacy RSA/ECB/PKCS1Padding ciphertext made of 256 byte blocks. Never creates a key. */
     byte[] rsaDecrypt(byte[] ciphertext) throws GeneralSecurityException;
 
+    void deleteRsaKey() throws GeneralSecurityException;
+
     /**
      * True when the key store itself reports the failure behind {@code error} as transient, which
      * overrides the permanent classification of the exception type.

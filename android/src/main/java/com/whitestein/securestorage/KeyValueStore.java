@@ -16,4 +16,6 @@ interface KeyValueStore {
     boolean remove(String key);
 
     boolean clear();
+
+    boolean deleteFile();
 }

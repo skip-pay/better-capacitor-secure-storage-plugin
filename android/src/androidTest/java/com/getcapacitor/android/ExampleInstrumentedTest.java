@@ -34,14 +34,17 @@ public class ExampleInstrumentedTest {
 
     private Context appContext;
     private SharedPreferences prefs;
+    private SharedPreferences legacyPrefs;
     private String rsaAlias;
     private String aesAlias;
 
     @Before
     public void setUp() throws Exception {
         appContext = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        prefs = appContext.getSharedPreferences("cap_sec", Context.MODE_PRIVATE);
+        prefs = appContext.getSharedPreferences("cap_sec_v2", Context.MODE_PRIVATE);
         prefs.edit().clear().commit();
+        legacyPrefs = appContext.getSharedPreferences("cap_sec", Context.MODE_PRIVATE);
+        legacyPrefs.edit().clear().commit();
         rsaAlias = appContext.getPackageName() + "_cap_sec";
         aesAlias = appContext.getPackageName() + "_cap_sec_aes_v2";
     }
@@ -231,39 +234,64 @@ public class ExampleInstrumentedTest {
     public void legacyRsaIsReadAndMigratedToAes() throws Exception {
         PublicKey publicKey = ensureUpstreamRsaKey();
         String longValue = repeat("token-", 120);
-        prefs
-            .edit()
-            .putString("pin", upstreamRsaEncrypt(publicKey, "1234".getBytes(StandardCharsets.UTF_8)))
-            .putString("token", upstreamRsaEncrypt(publicKey, longValue.getBytes(StandardCharsets.UTF_8)))
-            .commit();
+        String pin = upstreamRsaEncrypt(publicKey, "1234".getBytes(StandardCharsets.UTF_8));
+        String token = upstreamRsaEncrypt(publicKey, longValue.getBytes(StandardCharsets.UTF_8));
+        legacyPrefs.edit().putString("pin", pin).putString("token", token).commit();
 
         SecureStoragePluginPlugin plugin = newPlugin();
         assertEquals("1234", plugin._get("pin").getString("value"));
         assertEquals(longValue, plugin._get("token").getString("value"));
         assertTrue(prefs.getString("pin", null).startsWith("v2:"));
         assertTrue(prefs.getString("token", null).startsWith("v2:"));
-        assertTrue("RSA key is kept for other legacy entries", keyStore().containsAlias(rsaAlias));
+        assertEquals("legacy RSA entry kept unchanged", pin, legacyPrefs.getString("pin", null));
+        assertEquals("legacy RSA entry kept unchanged", token, legacyPrefs.getString("token", null));
+        assertTrue("RSA key is kept for the legacy entries", keyStore().containsAlias(rsaAlias));
+        assertEquals(2, plugin._getDiagnostics().getInteger("legacyEntriesKept").intValue());
 
         SecureStoragePluginPlugin fresh = newPlugin();
         assertEquals("1234", fresh._get("pin").getString("value"));
         assertEquals(longValue, fresh._get("token").getString("value"));
+        assertEquals(pin, legacyPrefs.getString("pin", null));
     }
 
     @Test
     public void legacyPlaintextIsReadAndMigratedToAes() throws Exception {
-        prefs.edit().putString("pin", Base64.encodeToString("1234".getBytes(StandardCharsets.UTF_8), Base64.DEFAULT)).commit();
+        String legacy = Base64.encodeToString("1234".getBytes(StandardCharsets.UTF_8), Base64.DEFAULT);
+        legacyPrefs.edit().putString("pin", legacy).commit();
 
         SecureStoragePluginPlugin plugin = newPlugin();
         assertEquals("1234", plugin._get("pin").getString("value"));
         assertTrue(prefs.getString("pin", null).startsWith("v2:"));
+        assertEquals(legacy, legacyPrefs.getString("pin", null));
         assertEquals("1234", newPlugin()._get("pin").getString("value"));
+    }
+
+    @Test
+    public void setWritesOnlyTheV2FileAndRemoveAndClearTouchBoth() throws Exception {
+        String legacy = Base64.encodeToString("old".getBytes(StandardCharsets.UTF_8), Base64.DEFAULT);
+        legacyPrefs.edit().putString("pin", legacy).putString("other", legacy).commit();
+
+        SecureStoragePluginPlugin plugin = newPlugin();
+        plugin._set("pin", "new");
+        assertEquals(legacy, legacyPrefs.getString("pin", null));
+        assertEquals("new", plugin._get("pin").getString("value"));
+        JSArray keys = (JSArray) plugin._keys().get("value");
+        assertEquals(2, keys.length());
+
+        plugin._remove("pin");
+        assertFalse(prefs.contains("pin"));
+        assertFalse(legacyPrefs.contains("pin"));
+
+        plugin._clear();
+        assertEquals(0, prefs.getAll().size());
+        assertEquals(0, legacyPrefs.getAll().size());
     }
 
     @Test
     public void legacyEntryOutsideBase64IsUnreadable() throws Exception {
         // android.util.Base64 skips characters outside the alphabet instead of throwing.
         assertEquals(0, Base64.decode("%%%", Base64.DEFAULT).length);
-        prefs.edit().putString("garbage", "%%%").putString("junk", "QUJD%").commit();
+        legacyPrefs.edit().putString("garbage", "%%%").putString("junk", "QUJD%").commit();
 
         SecureStoragePluginPlugin plugin = newPlugin();
         for (String key : new String[] { "garbage", "junk" }) {
@@ -274,7 +302,7 @@ public class ExampleInstrumentedTest {
                 assertEquals("Item with given key does not exist", expected.getMessage());
             }
         }
-        assertEquals("%%%", prefs.getString("garbage", null));
+        assertEquals("%%%", legacyPrefs.getString("garbage", null));
         assertEquals(2, plugin._getDiagnostics().getInteger("decryptFailures").intValue());
     }
 
@@ -303,6 +331,8 @@ public class ExampleInstrumentedTest {
         assertNotNull(diagnostics.getInteger("migrated"));
         assertNotNull(diagnostics.getInteger("lostItems"));
         assertNotNull(diagnostics.getInteger("decryptFailures"));
+        assertNotNull(diagnostics.getInteger("migrationSkipped"));
+        assertNotNull(diagnostics.getInteger("legacyEntriesKept"));
         assertNotNull(diagnostics.getString("keyBackend"));
     }
 }
