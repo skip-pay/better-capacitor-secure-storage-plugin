@@ -1,8 +1,251 @@
+/// <reference types="@capacitor/cli" preserve="true" />
+
+/**
+ * Keychain accessibility class of a stored item on iOS.
+ *
+ * | Value                              | iOS constant                                        |
+ * | ---------------------------------- | --------------------------------------------------- |
+ * | `whenUnlocked`                     | `kSecAttrAccessibleWhenUnlocked`                    |
+ * | `whenUnlockedThisDeviceOnly`       | `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`      |
+ * | `afterFirstUnlock`                 | `kSecAttrAccessibleAfterFirstUnlock`                |
+ * | `afterFirstUnlockThisDeviceOnly`   | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`  |
+ * | `whenPasscodeSetThisDeviceOnly`    | `kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly`   |
+ *
+ * Android and web accept the value and ignore it.
+ */
+export type KeychainAccessibility =
+  | 'whenUnlocked'
+  | 'whenUnlockedThisDeviceOnly'
+  | 'afterFirstUnlock'
+  | 'afterFirstUnlockThisDeviceOnly'
+  | 'whenPasscodeSetThisDeviceOnly';
+
+export interface SecureStorageSetOptions {
+  /**
+   * Key under which the value is stored.
+   */
+  key: string;
+  /**
+   * Value to store.
+   */
+  value: string;
+  /**
+   * Keychain accessibility class for this item (iOS only).
+   * Overrides the `accessibility` plugin configuration for this call.
+   * An unknown value rejects with `Unsupported accessibility value`.
+   * Ignored on Android and web.
+   *
+   * @since 1.0.0
+   */
+  accessibility?: KeychainAccessibility;
+}
+
+/**
+ * `code` of a rejected call on iOS. The rejection messages are the same as in upstream. The code only adds detail.
+ *
+ * | Code                        | Meaning                                                                                     |
+ * | --------------------------- | ------------------------------------------------------------------------------------------- |
+ * | `NOT_FOUND`                 | No item for the key.                                                                         |
+ * | `UNREADABLE`                | An item exists but cannot be decrypted or read. The message says the key does not exist.   |
+ * | `LOCKED`                    | Reserved. The plugin waits for unlock instead and does not emit it.                          |
+ * | `UNSUPPORTED_ACCESSIBILITY` | Unknown `accessibility` value in the call or in the plugin configuration.                    |
+ * | `STORAGE_ERROR`             | Any other keychain failure.                                                                  |
+ *
+ * @since 1.0.0
+ */
+export type SecureStorageErrorCode =
+  | 'NOT_FOUND'
+  | 'UNREADABLE'
+  | 'LOCKED'
+  | 'UNSUPPORTED_ACCESSIBILITY'
+  | 'STORAGE_ERROR';
+
+/**
+ * State of the native storage for support and monitoring. Counters start at zero when the app process starts.
+ * On Android `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a`.
+ *
+ * @since 1.0.0
+ */
+export interface SecureStorageDiagnostics {
+  /**
+   * Calls that had to wait for protected data, for example because the device was locked. Always `0` on Android.
+   */
+  parked: number;
+  /**
+   * On iOS keys copied from the legacy keychain service `cap_sec` or the bundle id service into `cap_sec_v2` and verified
+   * by a read-back. On Android entries rewritten from RSA or plaintext to AES-GCM.
+   */
+  migrated: number;
+  /**
+   * Legacy copies deleted once their key had a verified `cap_sec_v2` item: `cap_sec` items in any access group and bundle id
+   * service items. Stays `0` until the deletion of older copies is switched on. Always `0` on Android.
+   */
+  duplicatesResolved: number;
+  /**
+   * Calls whose item kept reporting a locked keychain while the device was unlocked and that were completed as if the item
+   * were missing. On Android distinct keys whose entry is intact but does not decrypt.
+   */
+  lostItems: number;
+  /**
+   * Reads of an item that could not be decrypted or decoded. On Android distinct keys in an unknown format or failing after
+   * all retries.
+   */
+  decryptFailures: number;
+  /**
+   * Values stored as plaintext with the strict class because encryption was unavailable. Always `0` on Android, which
+   * rejects such a write instead.
+   */
+  plaintextFallbacks: number;
+  /**
+   * Decryption attempts repeated after a failure on an unlocked device, with the key looked up again (iOS, web resolves `0`).
+   * Optional because Android does not report it.
+   *
+   * @since 1.0.0
+   */
+  decryptRetries?: number;
+  /**
+   * Legacy copies whose value differed from the copy that won when their key was copied into `cap_sec_v2` (iOS, web
+   * resolves `0`). Optional because Android does not report it.
+   *
+   * @since 1.0.0
+   */
+  conflictingDuplicates?: number;
+  /**
+   * Keys that have their `cap_sec_v2` item while legacy copies (`cap_sec` in any access group or the bundle id service) are
+   * still stored, because the deletion of older copies is not switched on yet or a delete failed. Each key counts once per
+   * process (iOS, web resolves `0`). Optional because Android does not report it.
+   *
+   * @since 1.0.0
+   */
+  legacyCopiesKept?: number;
+  /**
+   * Android only: legacy entries still stored whose migration was skipped because the re-encrypted value did not
+   * decrypt back to the same bytes, could not be encrypted, or could not be written. A key leaves the count once a later
+   * migration or `set` wrote its `cap_sec_v2` entry, or `remove` or `clear` deleted it. Optional because iOS and web do
+   * not report it.
+   *
+   * @since 1.0.0
+   */
+  migrationSkipped?: number;
+  /**
+   * Android only: keys whose `cap_sec` entry is still stored after its migration to `cap_sec_v2` in this process,
+   * because the deletion of the older storage is not switched on yet or the delete failed. A key leaves the count once
+   * `remove` or `clear` deletes the entry. Optional because iOS and web do not report it.
+   *
+   * @since 1.0.0
+   */
+  legacyEntriesKept?: number;
+  /**
+   * Key that encrypts values. On iOS `secureEnclave`, `software` (the simulator fallback), or `unusable` once the key kept
+   * refusing on an unlocked device and values fall back to plaintext for the rest of the process. On Android
+   * `keystoreAes`, or `keystoreRsaLegacy` while only the upstream RSA key exists. `none` means no key exists yet or it could
+   * not be looked up at this moment.
+   */
+  keyBackend: 'secureEnclave' | 'software' | 'unusable' | 'keystoreAes' | 'keystoreRsaLegacy' | 'none';
+  /**
+   * `explicit` when new items go to the app-private `<team id>.<bundle id>` keychain access group, `default` when the plugin
+   * fell back to the app's default access group or could not determine it yet. `n/a` on Android.
+   */
+  accessGroupMode: 'explicit' | 'default' | 'n/a';
+}
+
+declare module '@capacitor/cli' {
+  export interface PluginsConfig {
+    /**
+     * Configuration of better-capacitor-secure-storage-plugin.
+     */
+    SecureStoragePlugin?: {
+      /**
+       * Default keychain accessibility class for items written by the plugin (iOS only).
+       * `afterFirstUnlock` is available as an explicit opt-out, for example when the app must read values while the device is locked.
+       * A legacy item copied into `cap_sec_v2` gets this class or its own, whichever is stricter.
+       * An unknown value makes every storage call reject with
+       * `Unsupported accessibility value in plugin configuration`. Only `getPlatform` still resolves.
+       *
+       * @since 1.0.0
+       * @default 'whenUnlockedThisDeviceOnly'
+       * @example "afterFirstUnlock"
+       */
+      accessibility?: KeychainAccessibility;
+      /**
+       * Encrypt stored values with a Secure Enclave key (iOS only). Enabled by default. Set `false` to opt out.
+       * The plugin writes into the keychain service `cap_sec_v2`. Items of upstream versions in `cap_sec` are copied into it, encrypted,
+       * by the first `get` of a key and by a sweep once per app launch, in the foreground, after about 1.5 s without app calls once the
+       * first call has completed (or about five seconds after load when the app makes no call).
+       * Items in the app bundle id service are copied when `get` reads them.
+       * The migration leaves the items in `cap_sec` and the bundle id service as they were until the deletion of older copies is switched on in a later release.
+       * `remove` deletes the legacy items of its key. `clear` deletes every `cap_sec` item and the bundle id copies of the keys it finds
+       * in `cap_sec_v2` and `cap_sec`.
+       * A `cap_sec_v2` item that holds plaintext is encrypted by its next `get` once encryption works.
+       * Android always encrypts with AndroidKeyStore, web ignores the option.
+       *
+       * @since 1.0.0
+       * @default true
+       * @example false
+       */
+      encryptValues?: boolean;
+    };
+  }
+}
+
 export interface SecureStoragePluginPlugin {
+  /**
+   * Read a stored value.
+   *
+   * @param options The key to read.
+   * @returns The stored value. Rejects with `Item with given key does not exist` when the key is missing.
+   * On iOS an item that cannot be decrypted rejects with the same message and the code `UNREADABLE`. A `set` overwrites it.
+   * While the device is locked the call waits for unlock instead of rejecting.
+   */
   get(options: { key: string }): Promise<{ value: string }>;
-  set(options: { key: string; value: string }): Promise<{ value: boolean }>;
+  /**
+   * Store a value under a key, replacing an existing one.
+   *
+   * @param options The key, the value and optionally the iOS keychain accessibility class.
+   * @returns `true` on success, otherwise the promise rejects.
+   */
+  set(options: SecureStorageSetOptions): Promise<{ value: boolean }>;
+  /**
+   * Remove a stored value.
+   * On iOS it deletes the `cap_sec_v2` item and every legacy copy of the key, in `cap_sec` in any access group and in the
+   * bundle id service.
+   *
+   * @param options The key to remove.
+   * @returns `true` on success. Rejects with `Item with given key does not exist` when the key is missing.
+   */
   remove(options: { key: string }): Promise<{ value: boolean }>;
+  /**
+   * Remove all values in the plugin's keychain services plus the legacy bundle id copies of those keys.
+   * On iOS it deletes every item in `cap_sec_v2` and `cap_sec`, in any access group. A bundle id copy is removed only for a
+   * key that also exists in one of those services. Legacy items left only in the bundle id service are kept and `get` can
+   * still return them, so an app that needs a hard wipe also calls `remove` for each key it knows.
+   *
+   * @returns `true` on success, otherwise the promise rejects.
+   */
   clear(): Promise<{ value: boolean }>;
+  /**
+   * List the keys of all values in the plugin's keychain services.
+   * On iOS the keys of `cap_sec_v2` and of the legacy `cap_sec` service, each once. Legacy items in the bundle id service are
+   * not listed until `get` copied them.
+   *
+   * @returns The stored keys.
+   */
   keys(): Promise<{ value: string[] }>;
+  /**
+   * Get the implementation in use.
+   *
+   * @returns One of `web`, `ios` or `android`.
+   */
   getPlatform(): Promise<{ value: string }>;
+  /**
+   * Read counters and the key and access group state of the native storage, for support and monitoring.
+   * Resolves right away, also while other calls wait for the device to unlock.
+   * Web resolves zeros with `keyBackend: 'none'` and `accessGroupMode: 'default'`. Android resolves real `migrated`,
+   * `lostItems` and `decryptFailures` counters and `keyBackend` `keystoreAes`, `keystoreRsaLegacy` or `none`, while
+   * `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a`.
+   *
+   * @since 1.0.0
+   * @returns The diagnostics snapshot.
+   */
+  getDiagnostics(): Promise<SecureStorageDiagnostics>;
 }

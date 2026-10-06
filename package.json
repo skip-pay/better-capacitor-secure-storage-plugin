@@ -1,7 +1,7 @@
 {
-  "name": "capacitor-secure-storage-plugin",
-  "version": "0.13.0",
-  "description": "Securely store secrets such as usernames, passwords, tokens, certificates or other sensitive information (strings) on iOS & Android",
+  "name": "better-capacitor-secure-storage-plugin",
+  "version": "1.0.0",
+  "description": "Capacitor plugin for storing string values securely on iOS and Android. Skip Pay fork of capacitor-secure-storage-plugin with hardened Keychain/Keystore configuration.",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
   "types": "dist/esm/index.d.ts",
@@ -11,19 +11,23 @@
     "android/build.gradle",
     "dist/",
     "ios/Sources",
-    "ios/Tests",
+    "ios/Tests/SecureStoragePluginTests",
     "Package.swift",
-    "CapacitorSecureStoragePlugin.podspec"
+    "BetterCapacitorSecureStoragePlugin.podspec"
   ],
   "author": "martinkasa",
+  "contributors": [
+    "Skip Pay"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/martinkasa/capacitor-secure-storage-plugin.git"
+    "url": "https://github.com/skip-pay/better-capacitor-secure-storage-plugin.git"
   },
   "bugs": {
-    "url": "https://github.com/martinkasa/capacitor-secure-storage-plugin.git/issues"
+    "url": "https://github.com/skip-pay/better-capacitor-secure-storage-plugin/issues"
   },
+  "homepage": "https://github.com/skip-pay/better-capacitor-secure-storage-plugin",
   "keywords": [
     "capacitor",
     "plugin",
@@ -31,7 +35,7 @@
   ],
   "scripts": {
     "verify": "npm run verify:ios && npm run verify:android && npm run verify:web",
-    "verify:ios": "xcodebuild -scheme CapacitorSecureStoragePlugin -destination generic/platform=iOS",
+    "verify:ios": "xcodebuild -scheme BetterCapacitorSecureStoragePlugin -destination generic/platform=iOS",
     "verify:android": "cd android && ./gradlew clean build test && cd ..",
     "verify:web": "npm run build",
     "lint": "npm run eslint && npm run prettier -- --check && npm run swiftlint -- lint",
@@ -46,25 +50,30 @@
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
-    "@capacitor/android": "^8.0.0",
-    "@capacitor/cli": "^8.0.0",
-    "@capacitor/core": "^8.0.0",
+    "@capacitor/android": "^8.3.0",
+    "@capacitor/cli": "^8.3.0",
+    "@capacitor/core": "^8.3.0",
     "@capacitor/docgen": "^0.3.1",
-    "@capacitor/ios": "^8.0.0",
+    "@capacitor/ios": "^8.3.0",
     "@ionic/eslint-config": "^0.4.0",
     "@ionic/prettier-config": "^4.0.0",
     "@ionic/swiftlint-config": "^2.0.0",
     "eslint": "^8.57.1",
     "prettier": "^3.6.2",
     "prettier-plugin-java": "^2.7.7",
-    "release-it": "^17.2.1",
     "rimraf": "^6.1.0",
     "rollup": "^4.53.2",
     "swiftlint": "^2.0.0",
     "typescript": "^5.9.3"
   },
   "peerDependencies": {
-    "@capacitor/core": ">=8.0.0"
+    "@capacitor/core": ">=8.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "prettier": "@ionic/prettier-config",
   "swiftlint": "@ionic/swiftlint-config",

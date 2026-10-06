@@ -47,3 +47,8 @@ Podfile.lock
 Package.resolved
 Build
 /.build
+# Build caches
+android/.gradle/
+android/build/
+ios/Tests/harness/.build/
+.swiftpm/
