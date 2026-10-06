@@ -173,7 +173,9 @@ declare module '@capacitor/cli' {
        * by the first `get` of a key and by a sweep once per app launch, in the foreground, after about 1.5 s without app calls once the
        * first call has completed (or about five seconds after load when the app makes no call).
        * Items in the app bundle id service are copied when `get` reads them.
-       * The migration leaves the items in `cap_sec` and the bundle id service as they were until the deletion of older copies is switched on in a later release. `remove` and `clear` delete them.
+       * The migration leaves the items in `cap_sec` and the bundle id service as they were until the deletion of older copies is switched on in a later release.
+       * `remove` deletes the legacy items of its key. `clear` deletes every `cap_sec` item and the bundle id copies of the keys it finds
+       * in `cap_sec_v2` and `cap_sec`.
        * A `cap_sec_v2` item that holds plaintext is encrypted by its next `get` once encryption works.
        * Android always encrypts with AndroidKeyStore, web ignores the option.
        *
