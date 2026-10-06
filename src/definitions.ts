@@ -110,6 +110,14 @@ export interface SecureStorageDiagnostics {
    */
   conflictingDuplicates?: number;
   /**
+   * Keys whose older copies (in another access group or the bundle id service) the plugin found and left in place,
+   * because the deletion of older copies is not switched on yet. Each key counts once per process (iOS, web resolves `0`).
+   * Optional because Android does not report it.
+   *
+   * @since 1.0.0
+   */
+  legacyCopiesKept?: number;
+  /**
    * Android only: legacy entries still stored whose migration was skipped because the re-encrypted value did not
    * decrypt back to the same bytes, could not be encrypted, or could not be written. A key leaves the count once a later
    * migration, `set`, `remove` or `clear` replaced its legacy entry. Optional because iOS and web do not report it.

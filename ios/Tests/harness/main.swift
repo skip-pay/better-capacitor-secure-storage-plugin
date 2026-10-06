@@ -5,10 +5,11 @@ let service = "cap_sec"
 let upstreamService = "cap_sec_upstream"
 let upstreamStandardService = "harness.standard.upstream"
 // entitlements.plist mirrors the Skip Pay app: application-identifier <TEAM>.<bundle id> (the app-ID group, which the plugin
-// now uses as its app-private group) and one keychain-access-groups entry that is the default group for writes without a
-// group (the widget-shared group in the app).
+// now uses as its app-private group) and a first keychain-access-groups entry that is the default group for writes without a
+// group (the widget-shared group in the app). Its second entry is one more group for older copies.
 let appIdGroup = "ABCDE12345.capacitor-secure-storage-plugin.harness"
 let sharedGroup = appIdGroup + ".shared"
+let olderGroup = appIdGroup + ".legacy"
 let harnessBundle = "capacitor-secure-storage-plugin.harness"
 let keyTag = Data("capacitor-secure-storage-plugin.v1".utf8)
 let simKeyTag = Data("capacitor-secure-storage-plugin.v1.sim".utf8)
@@ -28,10 +29,11 @@ func makeVault(
     standardService: String = KeychainWrapper.standard.serviceName,
     keyTag: String = "capacitor-secure-storage-plugin.v1",
     bundleIdentifier: String? = harnessBundle,
-    available: @escaping () -> Bool = { true }
+    available: @escaping () -> Bool = { true },
+    deletes: Bool = true
 ) -> SecureStorageVault {
     return SecureStorageVault(
-        configuration: SecureStorageVault.Configuration(accessibility: accessibility, encryptsValues: encrypts),
+        configuration: SecureStorageVault.Configuration(accessibility: accessibility, encryptsValues: encrypts, deletesLegacyCopies: deletes),
         dedicatedService: dedicatedService,
         standardService: standardService,
         keyTag: keyTag,
@@ -240,6 +242,8 @@ let legacy = KeychainWrapper(serviceName: service)
 let legacyAppGroup = KeychainWrapper(serviceName: service, accessGroup: appIdGroup)
 let legacyUpstream = KeychainWrapper(serviceName: upstreamService)
 let legacyUpstreamStandard = KeychainWrapper(serviceName: upstreamStandardService)
+let legacyOlderGroup = KeychainWrapper(serviceName: service, accessGroup: olderGroup)
+let phaseTwo = SecureStorageVault.Configuration(deletesLegacyCopies: true)
 
 cleanAll()
 let vault = makeVault()
@@ -939,7 +943,7 @@ explicitVault.queue.sync {
 }
 let explicitDiagnostics = diagnostics(explicitVault)
 check("27 diagnostics accessGroupMode explicit, keyBackend secureEnclave", explicitDiagnostics["accessGroupMode"] as? String == "explicit" && explicitDiagnostics["keyBackend"] as? String == "secureEnclave", "\(explicitDiagnostics)")
-check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates", "keyBackend", "accessGroupMode"], "\(explicitDiagnostics.keys.sorted())")
+check("27 diagnostics has exactly the documented fields", Set(explicitDiagnostics.keys) == ["parked", "migrated", "duplicatesResolved", "lostItems", "decryptFailures", "plaintextFallbacks", "decryptRetries", "conflictingDuplicates", "legacyCopiesKept", "keyBackend", "accessGroupMode"], "\(explicitDiagnostics.keys.sorted())")
 fallbackVault.queue.sync {
     check("27 fallback mode moves an app-ID item into the default group", addRaw("fb2", Data("__secured_fb2".utf8), group: appIdGroup) == errSecSuccess && describe(fallbackVault.loadValue(forKey: "fb2")) == "resolve __secured_fb2" && groups("fb2") == [sharedGroup], "\(groups("fb2"))")
 }
@@ -1018,7 +1022,7 @@ check("30 diagnostics count three plaintext fallbacks", counter(diagnostics(plai
 print("--- 31 lost items with the real keychain and unlock probe")
 cleanAll()
 let lostTicker = HarnessTicker()
-let lostVault = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: lostTicker)
+let lostVault = SecureStorageVault(configuration: phaseTwo, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: lostTicker)
 let lostLog = EventLog()
 check("31 seed two copies of z1", legacyAppGroup.set("__secured_z_old", forKey: "z1", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_z_new", forKey: "z1", withAccessibility: .afterFirstUnlock))
 check("31 seed z2 and z3", legacy.set("__secured_z2", forKey: "z2", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_z3", forKey: "z3", withAccessibility: .afterFirstUnlock))
@@ -1046,7 +1050,7 @@ print("--- 32 a parked get waits for the gate, then reads the migrated value")
 cleanAll()
 let gateFlag = Flag(false)
 let gateTicker = HarnessTicker()
-let gateVault = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { gateFlag.read() }, ticker: gateTicker)
+let gateVault = SecureStorageVault(configuration: phaseTwo, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { gateFlag.read() }, ticker: gateTicker)
 let gateLog = EventLog()
 check("32 seed legacy pin in the shared group", legacy.set("__secured_1234", forKey: "pin", withAccessibility: .afterFirstUnlock))
 gateVault.submitOperation(named: "get", key: "pin", run: { gateVault.loadValue(forKey: "pin") }, lost: { gateVault.lostValue(forKey: "pin") }, completion: { gateLog.record("get \(describe($0))") })
@@ -1090,7 +1094,7 @@ retryVault.queue.sync {
     check("33 nothing was deleted, the value still reads back", describe(retryVault.loadValue(forKey: "r1")) == "resolve __secured_retry" && items(account: "r1").count == 1)
 }
 let parkTicker = HarnessTicker()
-let parkVault = SecureStorageVault(keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: parkTicker)
+let parkVault = SecureStorageVault(configuration: phaseTwo, keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: parkTicker)
 let parkLog = EventLog()
 parkVault.queue.sync {
     parkVault.decryptRetryDelays = [0, 0]
@@ -1116,7 +1120,7 @@ check("33 the key is kept", keyCount(retryTags.secureEnclave) + keyCount(retryTa
 // A failure that only this ciphertext shows: the key still opens fresh ciphertext, so only this call ends, as lost.
 let brokenCiphertext = storedData("r1").first.map { Data($0.dropFirst(magic.count)) }
 let itemTicker = HarnessTicker()
-let itemVault = SecureStorageVault(keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: itemTicker)
+let itemVault = SecureStorageVault(configuration: phaseTwo, keyTag: retryTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: itemTicker)
 let itemLog = EventLog()
 itemVault.queue.sync {
     itemVault.decryptRetryDelays = [0, 0]
@@ -1139,7 +1143,7 @@ print("--- 34 a key that keeps refusing with -25308 while unlocked (Quick Start 
 cleanAll()
 let zombieTags = tags("harness.34")
 let zombieTicker = HarnessTicker()
-let zombieVault = SecureStorageVault(keyTag: zombieTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: zombieTicker)
+let zombieVault = SecureStorageVault(configuration: phaseTwo, keyTag: zombieTags.name, bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: zombieTicker)
 let zombieLog = EventLog()
 zombieVault.queue.sync {
     check("34 seed an encrypted value while the key works", describe(zombieVault.storeValue("__secured_z1", forKey: "zk1")) == "resolve true" && encrypted("zk1"))
@@ -1201,6 +1205,198 @@ checkVault.queue.sync {
     check("35 once decryption works the sweep migrates them", describe(checkVault.migrateLegacyValues()) == "resolve -" && encrypted("c2") && encrypted("c3") && groups("c3") == [appIdGroup] && accessible("c2") == ["aku"] && accessible("c3") == ["aku"])
     check("35 the values read back", describe(checkVault.loadValue(forKey: "c2")) == "resolve __secured_c2" && describe(checkVault.loadValue(forKey: "c3")) == "resolve __secured_c3")
 }
+
+print("--- 36 phase 1: an upgrade keeps the older copies as they are")
+cleanAll()
+func copySnapshot(_ account: String, in group: String) -> String? {
+    guard let item = copy(account, in: group) else { return nil }
+    let data = (item[kSecValueData as String] as? Data)?.base64EncodedString() ?? "nil"
+    let date = (item[kSecAttrModificationDate as String] as? Date)?.timeIntervalSince1970 ?? 0
+    return "\(item[kSecAttrAccessible as String] ?? "nil")|\(item[kSecAttrLabel as String] ?? "-")|\(data)|\(date)"
+}
+func serviceSnapshot(_ itemService: String) -> [String] {
+    return items(in: itemService).map { item in
+        let account = (item[kSecAttrAccount as String] as? Data).map { String(decoding: $0, as: UTF8.self) } ?? "nil"
+        let data = (item[kSecValueData as String] as? Data)?.base64EncodedString() ?? "nil"
+        let date = (item[kSecAttrModificationDate as String] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(account)|\(item[kSecAttrAccessGroup as String] ?? "nil")|\(item[kSecAttrAccessible as String] ?? "nil")|\(item[kSecAttrLabel as String] ?? "-")|\(data)|\(date)"
+    }.sorted()
+}
+func touch(_ account: String, in group: String, _ value: String) -> OSStatus {
+    let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: Data(account.utf8), kSecAttrAccessGroup as String: group]
+    return SecItemUpdate(query as CFDictionary, [kSecValueData as String: Data(value.utf8)] as CFDictionary)
+}
+func delta(_ before: [String: Any], _ after: [String: Any], _ name: String) -> Int {
+    return counter(after, name) - counter(before, name)
+}
+let standardService = KeychainWrapper.standard.serviceName
+let phaseOne = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true })
+check("36 the default configuration keeps older copies", !phaseOne.configuration.deletesLegacyCopies)
+check("36a seed a 0.13.0 copy in the shared group", legacy.set("__secured_k1_shared", forKey: "k1", withAccessibility: .afterFirstUnlock))
+check("36a seed a 0.13.0 copy in another older group", legacyOlderGroup.set("__secured_k1_older", forKey: "k1", withAccessibility: .afterFirstUnlock) && groups("k1") == [olderGroup, sharedGroup].sorted(), "\(groups("k1"))")
+let upstreamK1 = legacy.string(forKey: "k1") ?? "nil"
+let k1Shared = copySnapshot("k1", in: sharedGroup)
+let k1Older = copySnapshot("k1", in: olderGroup)
+let before36 = diagnostics(phaseOne)
+phaseOne.queue.sync {
+    check("36a get returns the copy upstream 0.13.0 read", describe(phaseOne.loadValue(forKey: "k1")) == "resolve \(upstreamK1)", upstreamK1)
+}
+check("36a both older copies are unchanged: data, class, group, label and date", k1Shared != nil && k1Older != nil && copySnapshot("k1", in: sharedGroup) == k1Shared && copySnapshot("k1", in: olderGroup) == k1Older)
+check("36a a labelled encrypted copy with the configured class sits in the app-ID group", groups("k1") == [appIdGroup, olderGroup, sharedGroup].sorted() && copyMarked("k1", in: appIdGroup) && copyData("k1", in: appIdGroup)?.starts(with: magic) == true && copyClass("k1", in: appIdGroup) == "aku", "\(groups("k1"))")
+let after36 = diagnostics(phaseOne)
+check("36a diagnostics: one migration, nothing deleted, one key with older copies kept", delta(before36, after36, "migrated") == 1 && delta(before36, after36, "duplicatesResolved") == 0 && delta(before36, after36, "conflictingDuplicates") == 0 && delta(before36, after36, "legacyCopiesKept") == 1, "\(after36)")
+let k1Target = copySnapshot("k1", in: appIdGroup)
+phaseOne.queue.sync {
+    check("36a the next get returns the same value and writes nothing", describe(phaseOne.loadValue(forKey: "k1")) == "resolve \(upstreamK1)" && copySnapshot("k1", in: appIdGroup) == k1Target && copySnapshot("k1", in: sharedGroup) == k1Shared && copySnapshot("k1", in: olderGroup) == k1Older)
+}
+check("36a a key counts once in legacyCopiesKept", delta(before36, diagnostics(phaseOne), "legacyCopiesKept") == 1)
+
+check("36b seed a 0.13.0 copy in the app-ID group and one in the shared group", legacyAppGroup.set("__secured_k2_app", forKey: "k2", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_k2_shared", forKey: "k2", withAccessibility: .afterFirstUnlock) && groups("k2") == [appIdGroup, sharedGroup])
+check("36b seed a 0.13.0 copy in the shared group and a bundle id copy", legacy.set("__secured_k3_shared", forKey: "k3", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_k3_std", forKey: "k3"))
+let upstreamK2 = legacy.string(forKey: "k2") ?? "nil"
+let k2Shared = copySnapshot("k2", in: sharedGroup)
+let k3Shared = copySnapshot("k3", in: sharedGroup)
+let standardBefore36 = serviceSnapshot(standardService)
+let before36b = diagnostics(phaseOne)
+phaseOne.queue.sync {
+    check("36b the first sweep resolves", describe(phaseOne.migrateLegacyValues()) == "resolve -")
+}
+check("36b k2: the shared copy is unchanged", k2Shared != nil && copySnapshot("k2", in: sharedGroup) == k2Shared)
+check("36b k2: the 0.13.0 copy in the app-ID group is the place of the new copy, now labelled, encrypted, aku", groups("k2") == [appIdGroup, sharedGroup] && copyMarked("k2", in: appIdGroup) && copyData("k2", in: appIdGroup)?.starts(with: magic) == true && copyClass("k2", in: appIdGroup) == "aku", "\(groups("k2"))")
+check("36b k3: the shared copy and the bundle id copy are unchanged, a new copy sits in the app-ID group", k3Shared != nil && copySnapshot("k3", in: sharedGroup) == k3Shared && serviceSnapshot(standardService) == standardBefore36 && !standardBefore36.isEmpty && groups("k3") == [appIdGroup, sharedGroup] && copyMarked("k3", in: appIdGroup) && copyData("k3", in: appIdGroup)?.starts(with: magic) == true)
+phaseOne.queue.sync {
+    check("36b k2 reads the value upstream read, k3 the cap_sec value", describe(phaseOne.loadValue(forKey: "k2")) == "resolve \(upstreamK2)" && describe(phaseOne.loadValue(forKey: "k3")) == "resolve __secured_k3_shared", upstreamK2)
+}
+let after36b = diagnostics(phaseOne)
+check("36b diagnostics: two migrations, nothing deleted, an overwritten app-ID copy with another value counts as conflicting", delta(before36b, after36b, "migrated") == 2 && delta(before36b, after36b, "duplicatesResolved") == 0 && delta(before36b, after36b, "conflictingDuplicates") == (upstreamK2 == "__secured_k2_shared" ? 1 : 0) && delta(before36b, after36b, "legacyCopiesKept") == 2, "\(after36b)")
+
+Thread.sleep(forTimeInterval: 1.1)
+let secondLaunch = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true })
+let secondLaunchDecryptions = Flag(false)
+let everythingBefore36c = serviceSnapshot(service) + serviceSnapshot(standardService)
+secondLaunch.queue.sync {
+    secondLaunch.decryptCiphertext = { key, algorithm, ciphertext, error in
+        secondLaunchDecryptions.write(true)
+        return SecKeyCreateDecryptedData(key, algorithm, ciphertext, error)
+    }
+    check("36c the sweep of the next launch resolves", describe(secondLaunch.migrateLegacyValues()) == "resolve -")
+    secondLaunch.decryptCiphertext = SecKeyCreateDecryptedData
+}
+check("36c it writes nothing and decrypts nothing for keys that have their new copy", serviceSnapshot(service) + serviceSnapshot(standardService) == everythingBefore36c && !secondLaunchDecryptions.read())
+let second36c = diagnostics(secondLaunch)
+check("36c diagnostics of the next launch: no migration, nothing deleted, three keys with older copies kept", counter(second36c, "migrated") == 0 && counter(second36c, "duplicatesResolved") == 0 && counter(second36c, "legacyCopiesKept") == 3, "\(second36c)")
+
+phaseOne.queue.sync {
+    check("36d set resolves", describe(phaseOne.storeValue("__secured_k1_new", forKey: "k1")) == "resolve true")
+    check("36d get returns the new value", describe(phaseOne.loadValue(forKey: "k1")) == "resolve __secured_k1_new")
+}
+check("36d set changed only the new copy", copySnapshot("k1", in: appIdGroup) != k1Target && copyMarked("k1", in: appIdGroup) && copySnapshot("k1", in: sharedGroup) == k1Shared && copySnapshot("k1", in: olderGroup) == k1Older)
+
+Thread.sleep(forTimeInterval: 1.1)
+check("36e an older copy is written again after the migration", touch("k1", in: sharedGroup, "__secured_k1_touched") == errSecSuccess)
+let touchedDate = copy("k1", in: sharedGroup)?[kSecAttrModificationDate as String] as? Date ?? .distantPast
+let newCopyDate = copy("k1", in: appIdGroup)?[kSecAttrModificationDate as String] as? Date ?? .distantFuture
+check("36e the older copy is now newer by date than the new copy", touchedDate > newCopyDate, "\(touchedDate) \(newCopyDate)")
+let k1Touched = copySnapshot("k1", in: sharedGroup)
+let k1NewCopy = copySnapshot("k1", in: appIdGroup)
+phaseOne.queue.sync {
+    check("36e get still returns the value of the new copy", describe(phaseOne.loadValue(forKey: "k1")) == "resolve __secured_k1_new")
+    check("36e the sweep still treats the key as settled", describe(phaseOne.migrateLegacyValues()) == "resolve -")
+}
+check("36e nothing was written", copySnapshot("k1", in: sharedGroup) == k1Touched && copySnapshot("k1", in: appIdGroup) == k1NewCopy && copySnapshot("k1", in: olderGroup) == k1Older)
+
+let f1Target = phaseOne.queue.sync { encode(phaseOne, "__secured_f1_target") }
+let f1Fallback = phaseOne.queue.sync { encode(phaseOne, "__secured_f1_fallback") }
+check("36f seed a copy this version wrote in the app-ID group", f1Target.map { addRaw("f1", $0, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) } == errSecSuccess)
+Thread.sleep(forTimeInterval: 1.1)
+check("36f seed a newer copy this version wrote in the shared group during a fallback to the default group", f1Fallback.map { addRaw("f1", $0, group: sharedGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) } == errSecSuccess)
+let f1Shared = copySnapshot("f1", in: sharedGroup)
+let before36f = diagnostics(phaseOne)
+phaseOne.queue.sync {
+    check("36f get returns the newer value, the older copy in the app-ID group does not shadow it", describe(phaseOne.loadValue(forKey: "f1")) == "resolve __secured_f1_fallback")
+    check("36f the copy in the app-ID group now holds that value, the shared copy is unchanged", copyData("f1", in: appIdGroup).map { describe(phaseOne.decodeValue($0)) } == "decrypted(__secured_f1_fallback)" && copyMarked("f1", in: appIdGroup) && copySnapshot("f1", in: sharedGroup) == f1Shared)
+    check("36f the next get reads the copy in the app-ID group", describe(phaseOne.loadValue(forKey: "f1")) == "resolve __secured_f1_fallback" && copySnapshot("f1", in: sharedGroup) == f1Shared)
+}
+let after36f = diagnostics(phaseOne)
+check("36f diagnostics: the overwritten copy with another value counts as conflicting, nothing deleted", delta(before36f, after36f, "migrated") == 1 && delta(before36f, after36f, "conflictingDuplicates") == 1 && delta(before36f, after36f, "duplicatesResolved") == 0 && delta(before36f, after36f, "legacyCopiesKept") == 1, "\(after36f)")
+
+print("--- 37 phase 1: a lost set writes a fresh new copy and keeps the older ones")
+cleanAll()
+let keepTicker = HarnessTicker()
+let keepLostVault = SecureStorageVault(bundleIdentifier: harnessBundle, isProtectedDataAvailable: { true }, ticker: keepTicker)
+let keepLostLog = EventLog()
+check("37 seed two 0.13.0 copies of z1", legacyAppGroup.set("__secured_z_old", forKey: "z1", withAccessibility: .afterFirstUnlock) && legacy.set("__secured_z_new", forKey: "z1", withAccessibility: .afterFirstUnlock))
+let z1Shared = copySnapshot("z1", in: sharedGroup)
+keepLostVault.submitOperation(named: "set", key: "z1", run: { .locked }, lost: { keepLostVault.replaceLostValue("__secured_replaced", forKey: "z1") }, completion: { keepLostLog.record("set \(describe($0))") })
+keepLostVault.queue.sync {}
+keepTicker.fire(times: 2)
+check("37 a stuck set waits through two retries", keepLostLog.events.isEmpty)
+keepTicker.fire()
+check("37 then the lost set replaces the copy in the app-ID group with a fresh one", keepLostLog.events == ["set resolve true"] && copyMarked("z1", in: appIdGroup) && copyData("z1", in: appIdGroup)?.starts(with: magic) == true && keepLostVault.queue.sync { describe(keepLostVault.loadValue(forKey: "z1")) } == "resolve __secured_replaced", "\(keepLostLog.events)")
+check("37 and keeps the older copy in the shared group", z1Shared != nil && copySnapshot("z1", in: sharedGroup) == z1Shared && groups("z1") == [appIdGroup, sharedGroup], "\(groups("z1"))")
+let lost37 = diagnostics(keepLostVault)
+check("37 diagnostics: one lost item, nothing deleted, one key with older copies kept", counter(lost37, "lostItems") == 1 && counter(lost37, "duplicatesResolved") == 0 && counter(lost37, "legacyCopiesKept") == 1, "\(lost37)")
+
+print("--- 38 phase 1: an undecryptable new copy leaves older plaintext copies as they are")
+cleanAll()
+check("38 seed an older plaintext copy in the shared group", legacy.set("__secured_older", forKey: "u1", withAccessibility: .afterFirstUnlock))
+Thread.sleep(forTimeInterval: 0.05)
+check("38 seed a newer undecryptable copy written by this version", addRaw("u1", garbage25, group: appIdGroup, accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly, label: marker) == errSecSuccess)
+let u1Shared = copySnapshot("u1", in: sharedGroup)
+let before38 = diagnostics(phaseOne)
+phaseOne.queue.sync {
+    check("38 get is UNREADABLE", code(phaseOne.loadValue(forKey: "u1")) == "UNREADABLE")
+    check("38 the older plaintext copy is not encrypted or tightened in place", u1Shared != nil && copySnapshot("u1", in: sharedGroup) == u1Shared)
+    check("38 the sweep skips the key and leaves both copies", describe(phaseOne.migrateLegacyValues()) == "resolve -" && copySnapshot("u1", in: sharedGroup) == u1Shared && copyData("u1", in: appIdGroup) == garbage25)
+}
+let after38 = diagnostics(phaseOne)
+check("38 only the get counted a decrypt failure, nothing migrated", delta(before38, after38, "decryptFailures") == 1 && delta(before38, after38, "migrated") == 0, "\(after38)")
+phaseOne.queue.sync {
+    check("38 set overwrites the new copy and keeps the older one", describe(phaseOne.storeValue("__secured_fresh", forKey: "u1")) == "resolve true" && describe(phaseOne.loadValue(forKey: "u1")) == "resolve __secured_fresh" && copySnapshot("u1", in: sharedGroup) == u1Shared && groups("u1") == [appIdGroup, sharedGroup])
+}
+
+print("--- 39 phase 1: the sweep still encrypts a new copy that was stored as plaintext")
+check("39 seed a 0.13.0 copy in the shared group", legacy.set("__secured_pf", forKey: "pf1", withAccessibility: .afterFirstUnlock))
+let pf1Shared = copySnapshot("pf1", in: sharedGroup)
+phaseOne.queue.sync {
+    phaseOne.simulatesEncryptionFailure = true
+    check("39 get writes a plaintext new copy with the strict class", describe(phaseOne.loadValue(forKey: "pf1")) == "resolve __secured_pf" && copyData("pf1", in: appIdGroup) == Data("__secured_pf".utf8) && copyClass("pf1", in: appIdGroup) == "aku" && copyMarked("pf1", in: appIdGroup))
+    phaseOne.simulatesEncryptionFailure = false
+    check("39 the sweep encrypts the new copy once encryption works, class kept", describe(phaseOne.migrateLegacyValues()) == "resolve -" && copyData("pf1", in: appIdGroup)?.starts(with: magic) == true && copyClass("pf1", in: appIdGroup) == "aku")
+    check("39 the value reads back", describe(phaseOne.loadValue(forKey: "pf1")) == "resolve __secured_pf")
+}
+check("39 the older copy stays as it was", pf1Shared != nil && copySnapshot("pf1", in: sharedGroup) == pf1Shared)
+
+print("--- 40 phase 1: remove and clear still delete every copy")
+check("40 seed rm1 in two older groups and the bundle id service", legacy.set("__secured_rm1", forKey: "rm1", withAccessibility: .afterFirstUnlock) && legacyOlderGroup.set("__secured_rm1_older", forKey: "rm1", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_rm1_std", forKey: "rm1"))
+phaseOne.queue.sync {
+    check("40 get settles rm1 and keeps the older copies", describe(phaseOne.loadValue(forKey: "rm1")).hasPrefix("resolve __secured_rm1") && groups("rm1") == [appIdGroup, olderGroup, sharedGroup].sorted() && KeychainWrapper.standard.hasValue(forKey: "rm1"), "\(groups("rm1"))")
+    check("40 remove deletes the new copy, the older copies and the bundle id copy", describe(phaseOne.removeValue(forKey: "rm1")) == "resolve true" && items(account: "rm1").isEmpty && !KeychainWrapper.standard.hasValue(forKey: "rm1"))
+}
+check("40 seed cl1 in two older groups and the bundle id service", legacy.set("__secured_cl1", forKey: "cl1", withAccessibility: .afterFirstUnlock) && legacyOlderGroup.set("__secured_cl1_older", forKey: "cl1", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_cl1_std", forKey: "cl1"))
+phaseOne.queue.sync {
+    check("40 get settles cl1", describe(phaseOne.loadValue(forKey: "cl1")).hasPrefix("resolve __secured_cl1") && groups("cl1").count == 3)
+    check("40 clear deletes every cap_sec copy in every group and the bundle id copy of the key", describe(phaseOne.removeAllValues()) == "resolve true" && items().isEmpty && !KeychainWrapper.standard.hasValue(forKey: "cl1"))
+}
+check("36-40 phase 1 never counted a deleted duplicate", counter(diagnostics(phaseOne), "duplicatesResolved") == 0 && counter(diagnostics(secondLaunch), "duplicatesResolved") == 0)
+
+print("--- 41 phase 2 after phase 1: the next app version deletes the older copies")
+cleanAll()
+check("41 seed n1 in two older groups and the bundle id service", legacy.set("__secured_n1_shared", forKey: "n1", withAccessibility: .afterFirstUnlock) && legacyOlderGroup.set("__secured_n1_older", forKey: "n1", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_n1_std", forKey: "n1"))
+let upstreamN1 = legacy.string(forKey: "n1") ?? "nil"
+phaseOne.queue.sync {
+    check("41 phase 1 settles n1 and keeps the older copies", describe(phaseOne.loadValue(forKey: "n1")) == "resolve \(upstreamN1)" && groups("n1").count == 3 && KeychainWrapper.standard.hasValue(forKey: "n1"))
+}
+let n1NewCopy = copySnapshot("n1", in: appIdGroup)
+let nextVersion = makeVault()
+let before41 = diagnostics(nextVersion)
+nextVersion.queue.sync {
+    check("41 the phase 2 sweep resolves", describe(nextVersion.migrateLegacyValues()) == "resolve -")
+    check("41 the value stays", describe(nextVersion.loadValue(forKey: "n1")) == "resolve \(upstreamN1)")
+}
+check("41 only the new copy is left, unchanged, and the bundle id copy is gone", groups("n1") == [appIdGroup] && n1NewCopy != nil && copySnapshot("n1", in: appIdGroup) == n1NewCopy && !KeychainWrapper.standard.hasValue(forKey: "n1"), "\(groups("n1"))")
+let after41 = diagnostics(nextVersion)
+check("41 diagnostics: three copies deleted, two with another value, no rewrite, nothing kept", delta(before41, after41, "duplicatesResolved") == 3 && delta(before41, after41, "conflictingDuplicates") == 2 && delta(before41, after41, "migrated") == 0 && delta(before41, after41, "legacyCopiesKept") == 0, "\(after41)")
 
 cleanAll()
 check("cleanup items", items().isEmpty && allKeyCount() == 0)
