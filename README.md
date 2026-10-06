@@ -470,15 +470,17 @@ Without `SIMULATOR_ID` the script uses the booted simulator. The first run clone
 
 ### Android
 
-Values live in the SharedPreferences file `cap_sec` (`MODE_PRIVATE`). Each value is encrypted with an AES-256-GCM key in AndroidKeyStore. `keys()` lists the entries of that file.
+Values live in the SharedPreferences file `cap_sec_v2` (`MODE_PRIVATE`). Each value is encrypted with an AES-256-GCM key in AndroidKeyStore. Entries written by upstream versions stay in the older file `cap_sec` until the plugin deletes them, see Two-phase migration below. `keys()` lists the entries of both files, each key once, and `contains` checks both.
 
 #### Storage format
 
-A value is stored as the string `v2:` followed by base64 of the 12 byte IV, the ciphertext and the 16 byte GCM tag. The key alias is `<packageName>_cap_sec_aes_v2`, with purposes encrypt and decrypt, GCM, no padding and randomized encryption, so AndroidKeyStore picks a fresh IV for every write. The additional authenticated data is `v2:` plus the storage key, so an encrypted value copied to another key does not decrypt. The key is created on the first write and the plugin never deletes it, `clear()` empties the preferences file only.
+A value is stored as the string `v2:` followed by base64 of the 12 byte IV, the ciphertext and the 16 byte GCM tag. The key alias is `<packageName>_cap_sec_aes_v2`, with purposes encrypt and decrypt, GCM, no padding and randomized encryption, so AndroidKeyStore picks a fresh IV for every write. The additional authenticated data is `v2:` plus the storage key, so an encrypted value copied to another key does not decrypt. The key is created on the first write and the plugin never deletes it, `clear()` empties the preferences files only.
 
-Readers detect the format per entry, in this order:
+`get` reads `cap_sec_v2` first. Only when the key is not there does it read `cap_sec`. An entry in `cap_sec_v2` that cannot be decrypted rejects as unreadable and never falls back to `cap_sec`, because the older entry may hold an older value.
 
-1. starts with `v2:` → AES-GCM. The `:` is not in the base64 alphabet, so no older entry starts with it.
+Readers detect the format of a `cap_sec` entry, in this order:
+
+1. starts with `v2:` → AES-GCM, as written into `cap_sec` by earlier builds of this fork. The `:` is not in the base64 alphabet, so no older entry starts with it.
 2. contains a character other than `A-Z`, `a-z`, `0-9`, `+`, `/`, `=` and whitespace, or is not empty but decodes to zero bytes → unreadable. `android.util.Base64` skips such characters instead of failing, so without this check a corrupt entry would read as a shorter value or as `""`.
 3. the RSA key pair of upstream versions (`<packageName>_cap_sec`) exists and the base64 decodes to a non-zero multiple of 256 bytes → RSA/ECB/PKCS1Padding in 256 byte blocks, as upstream wrote it.
 4. the base64 decodes to valid UTF-8 → plaintext entry. Upstream fell back to plaintext base64 silently when AndroidKeyStore failed to initialise, so some installs have such entries.
@@ -488,13 +490,33 @@ When the RSA decrypt fails on a 256 byte multiple, step 4 still runs, because a 
 
 #### Migration
 
-The plugin encrypts an entry read through step 3 or 4 with the AES key, decrypts it again and writes it back with `commit()` before `get` resolves. It writes only when the decrypted bytes equal the value that was read. Otherwise the legacy entry stays untouched, `get` returns its value and the plugin counts the key in `migrationSkipped` until the entry is migrated, overwritten or removed.
+The plugin encrypts an entry read from `cap_sec` with the AES key, decrypts it again and writes it to `cap_sec_v2` with `commit()` before `get` resolves. It writes only when the decrypted bytes equal the value that was read. Otherwise nothing is written, `get` returns the value of the legacy entry and the plugin counts the key in `migrationSkipped` until the entry is migrated, overwritten or removed.
 
 Before the first migration write of the process the plugin encrypts and decrypts a constant with a fixed AAD. Until that self-test passes the plugin migrates no entry, reads older entries as they are and stops the background walk. The test runs again on the next migration, so a keystore that recovers is used again. `set` does not run the self-test, but it decrypts its own ciphertext once in memory before writing and rejects when the result differs.
 
-On the first storage call of the process the plugin also walks the file on a background thread and migrates every older entry. The walk takes the storage lock per entry, so calls from JavaScript are not held up behind it, and an entry written by `set` in the meantime is left alone. When the AES key cannot be created, the check fails or the write-back fails, `get` still returns the old value and the entry stays as it was until a later read or walk migrates it. The RSA key is kept for that reason, and the plugin never generates a new RSA key.
+On the first storage call of the process the plugin also walks `cap_sec` on a background thread and migrates every entry that has no `cap_sec_v2` entry yet. The walk takes the storage lock per entry, so calls from JavaScript are not held up behind it, and a key written by `set` in the meantime is left alone. When the AES key cannot be created, the check fails or the write fails, `get` still returns the old value until a later read or walk migrates it. The RSA key is kept for that reason, and the plugin never generates a new RSA key.
 
 The upgrade needs nothing from the app. Users stay logged in and see no prompt.
+
+#### Two-phase migration
+
+The constant `SecureStore.DELETE_LEGACY_STORAGE` decides whether the plugin deletes the older storage. It is `false` in this release.
+
+Phase 1, this release (`false`):
+
+- A migration writes the `cap_sec_v2` entry and leaves the `cap_sec` entry exactly as it was. It is not deleted, rewritten or re-encrypted, and neither is the RSA key.
+- `set` writes to `cap_sec_v2` only. The `cap_sec` entry of that key keeps its older value.
+- `remove` deletes the key from both files. `clear` empties both files. Both are wipes the app asked for, so the older copies go too.
+- Entries the plugin cannot read, or whose migration was skipped, stay in `cap_sec`.
+- An app version that still reads `cap_sec` finds the values as they were before the upgrade, without later changes.
+
+Phase 2, a later app version (`true`, tracked in SS-12183, planned once most users have migrated):
+
+- After a verified write to `cap_sec_v2`, by a migration or by `set`, the plugin deletes the `cap_sec` entry of that key. A `cap_sec` entry whose key already has a readable `cap_sec_v2` entry, as phase 1 left them, is deleted by `get` and by the background walk.
+- Entries the plugin cannot read, or whose migration was skipped, still stay.
+- Once `cap_sec` has no entry left, the plugin deletes the RSA key `<packageName>_cap_sec` and the `cap_sec` file. A failure is logged and tried again on the next occasion.
+
+The phase 2 code ships in this release, switched off, and the unit tests run it with the switch on.
 
 #### Failure behaviour
 
@@ -504,7 +526,7 @@ The upgrade needs nothing from the app. Users stay logged in and see no prompt.
 - Which errors count as permanent depends on the path. AES-GCM: only a wrong tag (`AEADBadTagException`) and a missing AES key. AndroidKeyStore reports most other `doFinal` failures as `IllegalBlockSizeException`, so that and a plain `BadPaddingException` are retried, and if they persist the read ends as `UNREADABLE` counted in `decryptFailures`, not in `lostItems`. Legacy RSA: `BadPaddingException` and a missing RSA key are permanent. `IllegalBlockSizeException` is permanent only when the stored bytes are valid UTF-8, so a plaintext entry of 256 × n bytes still reaches the UTF-8 reader. For any other entry it is retried and, if it persists, counted in `decryptFailures`, not in `lostItems`. On Android 13 and later an error caused by an `android.security.KeyStoreException` that reports `isTransientFailure()` is always retried.
 - After an AES encrypt, the self-test or the check of a migrated entry failed on every attempt, migrations and the background walk make a single attempt without delays until an AES operation succeeds again, so a broken keystore does not add about 250 ms to every read of an older entry. An older entry the background walk cannot read in that single attempt, for a reason that is not permanent, is not counted in `decryptFailures`, the next `get` reads it with all three attempts. `get` of the value itself and `set` keep all three attempts.
 - An entry that exists but cannot be decrypted (a wrong GCM tag, a missing AES key, a failing RSA decrypt) rejects `get` with `Item with given key does not exist` and code `UNREADABLE`. The plugin deletes neither the entry nor the keys. `set` overwrites the entry and `remove` deletes it. A missing key rejects with the same message and code `NOT_FOUND`. The messages are the same as upstream, only the codes are new.
-- Undecryptable entries are expected after a device-to-device transfer that copied `cap_sec.xml` without the keystore key. Upstream read them as missing too.
+- Undecryptable entries are expected after a device-to-device transfer that copied `cap_sec.xml` or `cap_sec_v2.xml` without the keystore key. Upstream read them as missing too.
 - `load()` does no keystore work. The plugin creates the store on the first call. All storage calls run in order on one plugin thread per process, shared by every plugin instance.
 
 #### No lock-bound key flags
@@ -514,11 +536,11 @@ The AES key does not use `setUnlockedDeviceRequired`, `setUserAuthenticationRequ
 - JavaScript keeps running in the background on Android, and the app reads values while the screen is locked, for example when the inactivity logout reloads the page after 20 minutes. A key bound to the unlocked state would fail those reads, and the app would treat the value as missing.
 - On Android 12 to 14 keys with these flags have been reported to become permanently unusable on some devices, for example after lock screen changes. That would lose every stored value.
 
-The key stays non-exportable inside AndroidKeyStore (hardware-backed where the device supports it), so a copy of `cap_sec.xml` alone does not reveal values.
+The key stays non-exportable inside AndroidKeyStore (hardware-backed where the device supports it), so a copy of `cap_sec_v2.xml` alone does not reveal values. `cap_sec.xml` keeps the upstream protection of its entries during phase 1.
 
-#### Keep `cap_sec.xml` out of backups and transfers
+#### Keep `cap_sec.xml` and `cap_sec_v2.xml` out of backups and transfers
 
-`android:allowBackup="false"` does not stop device-to-device transfer on Android 12 and later. The copied file cannot be decrypted on the new device, because the key stays behind. Exclude the file in the app, not in the plugin.
+`android:allowBackup="false"` does not stop device-to-device transfer on Android 12 and later. The copied files cannot be decrypted on the new device, because the keys stay behind. Exclude both files in the app, not in the plugin.
 
 `android/app/src/main/res/xml/data_extraction_rules.xml` (Android 12 and later):
 
@@ -527,9 +549,11 @@ The key stays non-exportable inside AndroidKeyStore (hardware-backed where the d
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="cap_sec.xml" />
+        <exclude domain="sharedpref" path="cap_sec_v2.xml" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="cap_sec.xml" />
+        <exclude domain="sharedpref" path="cap_sec_v2.xml" />
     </device-transfer>
 </data-extraction-rules>
 ```
@@ -540,6 +564,7 @@ The key stays non-exportable inside AndroidKeyStore (hardware-backed where the d
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
     <exclude domain="sharedpref" path="cap_sec.xml" />
+    <exclude domain="sharedpref" path="cap_sec_v2.xml" />
 </full-backup-content>
 ```
 
@@ -555,11 +580,11 @@ The key stays non-exportable inside AndroidKeyStore (hardware-backed where the d
 
 #### Diagnostics
 
-`getDiagnostics()` resolves with counters of the current process: `migrated` (entries rewritten from RSA or plaintext), `lostItems` (distinct keys whose entry is intact but does not decrypt), `decryptFailures` (distinct keys in an unknown format or failing after all retries), `migrationSkipped` (Android only, legacy entries still stored whose migration was skipped because the self-test, the encryption, the decrypt check or the write-back failed. A key leaves the count once a later migration or `set` rewrites it, or `remove` or `clear` deletes it) and `keyBackend` (`keystoreAes`, `keystoreRsaLegacy` or `none`). `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a` on Android.
+`getDiagnostics()` resolves with counters of the current process: `migrated` (verified writes of a `cap_sec` entry into `cap_sec_v2`), `lostItems` (distinct keys whose entry is intact but does not decrypt), `decryptFailures` (distinct keys in an unknown format or failing after all retries), `migrationSkipped` (Android only, legacy entries still stored whose migration was skipped because the self-test, the encryption, the decrypt check or the write failed. A key leaves the count once a later migration or `set` writes its `cap_sec_v2` entry, or `remove` or `clear` deletes it), `legacyEntriesKept` (Android only, distinct keys whose `cap_sec` entry is still stored after its migration. In phase 1 every migrated key stays in the count until `remove` or `clear` deletes it. In phase 2 only keys whose `cap_sec` entry could not be deleted) and `keyBackend` (`keystoreAes`, `keystoreRsaLegacy` or `none`). `parked`, `duplicatesResolved` and `plaintextFallbacks` are always `0` and `accessGroupMode` is `n/a` on Android.
 
-#### Never downgrade after the upgrade
+#### Downgrades
 
-Upstream versions and earlier builds of this fork cannot read `v2:` entries. After this version has written or migrated values, going back makes them unreadable.
+Upstream versions and earlier builds of this fork do not read `cap_sec_v2`. During phase 1 the `cap_sec` entries stay, so going back to such a version finds the values as they were before the upgrade. Values written by `set` after the upgrade are not there. After phase 2 deleted `cap_sec`, going back finds no values.
 
 #### Tests
 
