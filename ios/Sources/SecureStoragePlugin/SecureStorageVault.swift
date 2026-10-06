@@ -10,7 +10,7 @@ struct SecureStorageItemStore {
         let modified: Date?
         let persistentRef: Data?
         let label: String?
-        /// Written by this fork, so its class was chosen by a `set` and a migration keeps it.
+        /// Written by this fork, so it ranks first among the legacy copies of its key.
         var isMarked: Bool {
             return label == SecureStorageItemStore.marker
         }
@@ -20,6 +20,7 @@ struct SecureStorageItemStore {
     static let marker = "better-capacitor-secure-storage-plugin"
 
     let service: String
+    var deleteMatching: (CFDictionary) -> OSStatus = SecItemDelete
 
     /// Reads one item. Without a group the keychain searches every group the app can access and returns any match.
     func readItem(_ key: String, accessGroup: String? = nil) -> (status: OSStatus, data: Data, accessibility: String?, accessGroup: String?) {
@@ -101,23 +102,23 @@ struct SecureStorageItemStore {
 
     /// Deletes the key in every accessible group.
     func deleteItem(_ key: String) -> OSStatus {
-        return SecItemDelete(makeItemQuery(key) as CFDictionary)
+        return deleteMatching(makeItemQuery(key) as CFDictionary)
     }
 
     func deleteItem(_ key: String, accessGroup: String?) -> OSStatus {
-        return SecItemDelete(makeItemQuery(key, accessGroup: accessGroup) as CFDictionary)
+        return deleteMatching(makeItemQuery(key, accessGroup: accessGroup) as CFDictionary)
     }
 
     func deleteCopy(_ copy: Copy, of key: String) -> OSStatus {
         guard let reference = copy.persistentRef else {
             guard let group = copy.accessGroup else { return errSecParam }
-            return SecItemDelete(makeItemQuery(key, accessGroup: group) as CFDictionary)
+            return deleteMatching(makeItemQuery(key, accessGroup: group) as CFDictionary)
         }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecValuePersistentRef as String: reference,
         ]
-        return SecItemDelete(query as CFDictionary)
+        return deleteMatching(query as CFDictionary)
     }
 
     func listKeys() -> (status: OSStatus, keys: [String]) {
@@ -145,7 +146,7 @@ struct SecureStorageItemStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
         ]
-        return SecItemDelete(query as CFDictionary)
+        return deleteMatching(query as CFDictionary)
     }
 
     private func decodeAccount(_ account: Any?) -> String? {
@@ -459,7 +460,6 @@ final class SecureStorageVault {
     private struct Source {
         let store: SecureStorageItemStore
         let copy: SecureStorageItemStore.Copy
-        let isStandardService: Bool
     }
 
     private typealias KeyCandidate = (tag: Data, secureEnclave: Bool)
@@ -481,9 +481,9 @@ final class SecureStorageVault {
 
     let queue = DispatchQueue(label: "capacitor-secure-storage-plugin.vault")
     let configuration: Configuration
-    let current: SecureStorageItemStore
-    let legacy: SecureStorageItemStore
-    let standard: SecureStorageItemStore
+    var current: SecureStorageItemStore
+    var legacy: SecureStorageItemStore
+    var standard: SecureStorageItemStore
 
     private static let keyLock = NSLock()
     private typealias CachedKey = (key: SecKey, secureEnclave: Bool)
@@ -849,9 +849,8 @@ final class SecureStorageVault {
     }
 
     func removeValue(forKey key: String) -> Outcome {
-        let stores = [current, legacy, standard]
         var existed = false
-        for store in stores {
+        for store in [legacy, standard, current] {
             let found = store.copies(of: key)
             switch classifyStatus(found.status, context: "find \(key) in \(store.service) before remove") {
             case .ok, .notFound:
@@ -863,24 +862,35 @@ final class SecureStorageVault {
             }
         }
         guard existed else { return .reject(SecureStorageVault.missingItemMessage, code: .notFound) }
-        var removed = true
-        for store in stores {
+        var legacyRemoved = true
+        for store in [legacy, standard] {
             switch classifyStatus(store.deleteItem(key), context: "delete \(key) in \(store.service)") {
             case .ok, .notFound:
                 break
             case .locked:
                 return .locked
             case .failed:
-                removed = false
+                legacyRemoved = false
             }
         }
-        return removed ? .resolve(["value": true]) : .reject(SecureStorageVault.removeFailedMessage, code: .storageError)
+        guard legacyRemoved else { return .reject(SecureStorageVault.removeFailedMessage, code: .storageError) }
+        switch classifyStatus(current.deleteItem(key), context: "delete \(key) in \(current.service)") {
+        case .ok, .notFound:
+            return .resolve(["value": true])
+        case .locked:
+            return .locked
+        case .failed:
+            return .reject(SecureStorageVault.removeFailedMessage, code: .storageError)
+        }
     }
 
     /// `remove` for an item the keychain keeps refusing while unlocked. The app cannot read it any more, so it counts as removed.
     func removeLostValue(forKey key: String) -> Outcome {
-        for store in [current, legacy, standard] {
-            _ = classifyStatus(store.deleteItem(key), context: "delete lost \(key) in \(store.service)")
+        let legacyStatuses = [legacy, standard].map { store in
+            classifyStatus(store.deleteItem(key), context: "delete lost \(key) in \(store.service)")
+        }
+        if !legacyStatuses.contains(.failed) {
+            _ = classifyStatus(current.deleteItem(key), context: "delete lost \(key) in \(current.service)")
         }
         return .resolve(["value": true])
     }
@@ -895,25 +905,34 @@ final class SecureStorageVault {
             let added = list.keys.filter { !keys.contains($0) }
             keys.append(contentsOf: added)
         }
-        var cleared = true
-        let deletions: [() -> OSStatus] = keys.map { key in { self.standard.deleteItem(key) } } + [{ self.current.deleteAll() }, { self.legacy.deleteAll() }]
-        for delete in deletions {
+        var legacyCleared = true
+        let legacyDeletions: [() -> OSStatus] = keys.map { key in { self.standard.deleteItem(key) } } + [{ self.legacy.deleteAll() }]
+        for delete in legacyDeletions {
             switch classifyStatus(delete(), context: "clear") {
             case .ok, .notFound:
                 break
             case .locked:
                 return .locked
             case .failed:
-                cleared = false
+                legacyCleared = false
             }
         }
-        return cleared ? .resolve(["value": true]) : .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
+        guard legacyCleared else { return .reject(SecureStorageVault.storageErrorMessage, code: .storageError) }
+        switch classifyStatus(current.deleteAll(), context: "clear") {
+        case .ok, .notFound:
+            return .resolve(["value": true])
+        case .locked:
+            return .locked
+        case .failed:
+            return .reject(SecureStorageVault.storageErrorMessage, code: .storageError)
+        }
     }
 
     /// `clear` while the keychain keeps refusing it although the device is unlocked.
     func removeAllLostValues() -> Outcome {
-        _ = classifyStatus(current.deleteAll(), context: "clear lost")
-        _ = classifyStatus(legacy.deleteAll(), context: "clear lost legacy")
+        if classifyStatus(legacy.deleteAll(), context: "clear lost legacy") != .failed {
+            _ = classifyStatus(current.deleteAll(), context: "clear lost")
+        }
         return .resolve(["value": true])
     }
 
@@ -980,12 +999,12 @@ final class SecureStorageVault {
         case .failed:
             return .failure
         }
-        guard var sources = rank(found.copies, of: key, in: legacy, isStandardService: false, target: mode.targetGroup) else { return .locked }
+        guard var sources = rank(found.copies, of: key, in: legacy, target: mode.targetGroup) else { return .locked }
         if sources.isEmpty || migrate {
             let older = standard.copies(of: key)
             switch classifyStatus(older.status, context: "find standard \(key)") {
             case .ok, .notFound:
-                if let ranked = rank(older.copies, of: key, in: standard, isStandardService: true, target: nil) {
+                if let ranked = rank(older.copies, of: key, in: standard, target: nil) {
                     sources += ranked
                 } else if sources.isEmpty {
                     return .locked
@@ -1026,14 +1045,13 @@ final class SecureStorageVault {
     }
 
     /// Copies the winning legacy value, `sources.first` holding it as `data`, into `cap_sec_v2` in the target group: the
-    /// configured class, never looser than the class of that copy, and the current encoding. A copy this fork wrote keeps
-    /// its class, a `set` chose it. The new item is read back and decoded, and deleted again when it does not match. Only a
-    /// verified item counts, and only then does phase 2 delete the legacy copies.
+    /// configured class, never looser than the class of that copy, and the current encoding. The new item is read back and
+    /// decoded, and deleted again when it does not match. Only a verified item counts, and only then does phase 2 delete the
+    /// legacy copies.
     private func copyIntoCurrent(_ key: String, value: String, data: Data, sources: [Source], mode: AccessGroupMode) {
         guard let chosen = sources.first else { return }
         let currentClass = chosen.copy.accessibility.flatMap(Accessibility.init(attribute:))
-        let keepsClass = chosen.copy.isMarked && !chosen.isStandardService
-        var targetClass = (keepsClass ? currentClass : currentClass?.tightened(toAtLeast: configuration.accessibility)) ?? configuration.accessibility
+        var targetClass = currentClass?.tightened(toAtLeast: configuration.accessibility) ?? configuration.accessibility
         var targetData = data
         var isFallback = false
         if configuration.encryptsValues && !isEncodedValue(data) {
@@ -1337,7 +1355,7 @@ final class SecureStorageVault {
     /// newest of them first. When no copy is marked, the copy upstream 0.13.0 read wins, so the first read after the upgrade
     /// returns the value the app has been using: SwiftKeychainWrapper's query without a group and limit one decides, not the
     /// modification date, which can belong to another copy. `nil` when that query hits a locked keychain.
-    private func rank(_ copies: [SecureStorageItemStore.Copy], of key: String, in store: SecureStorageItemStore, isStandardService: Bool, target: String?) -> [Source]? {
+    private func rank(_ copies: [SecureStorageItemStore.Copy], of key: String, in store: SecureStorageItemStore, target: String?) -> [Source]? {
         var sorted = copies.enumerated().sorted { lhs, rhs in
             if lhs.element.isMarked != rhs.element.isMarked {
                 return lhs.element.isMarked
@@ -1369,7 +1387,7 @@ final class SecureStorageVault {
                 break
             }
         }
-        return sorted.map { Source(store: store, copy: $0, isStandardService: isStandardService) }
+        return sorted.map { Source(store: store, copy: $0) }
     }
 
     /// True when a copy decodes to another value than the winner. A copy that cannot be read or decoded is not counted.

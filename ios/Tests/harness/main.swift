@@ -284,6 +284,22 @@ final class Flag {
     func write(_ value: Bool) { lock.lock(); storage = value; lock.unlock() }
 }
 
+final class DeletionFaults {
+    private let lock = NSLock()
+    private var statuses: [String: OSStatus] = [:]
+    let log = EventLog()
+    func set(_ itemService: String, _ status: OSStatus?) { lock.lock(); statuses[itemService] = status; lock.unlock() }
+    func hook(_ itemService: String) -> (CFDictionary) -> OSStatus {
+        return { query in
+            self.log.record(itemService)
+            self.lock.lock()
+            let status = self.statuses[itemService]
+            self.lock.unlock()
+            return status ?? SecItemDelete(query)
+        }
+    }
+}
+
 final class Tally {
     private let lock = NSLock()
     private var storage = 0
@@ -655,7 +671,7 @@ plainStrictVault.queue.sync {
     check("17c sweep without encryption resolves", describe(plainStrictVault.migrateLegacyValues()) == "resolve -")
     check("17c r1 copied as plaintext, tightened to aku", accessible("r1") == ["aku"] && storedData("r1") == [Data("__secured_r1".utf8)] && groups("r1") == [appIdGroup], "\(accessible("r1"))")
     check("17c r2 copied into the app-private group, aku and plaintext", accessible("r2") == ["aku"] && groups("r2") == [appIdGroup] && storedData("r2") == [Data("__secured_r2".utf8)], "\(groups("r2"))")
-    check("17c r3 written by this fork keeps its class and bytes", accessible("r3") == ["ck"] && r3Data != nil && storedData("r3") == [r3Data!], "\(accessible("r3"))")
+    check("17c r3 written by an earlier build of this fork keeps its bytes and is tightened to aku", accessible("r3") == ["aku"] && r3Data != nil && storedData("r3") == [r3Data!], "\(accessible("r3"))")
     check("17c a later set uses the configured class", describe(plainStrictVault.storeValue("__secured_r1b", forKey: "r1")) == "resolve true" && accessible("r1") == ["aku"] && storedData("r1") == [Data("__secured_r1b".utf8)])
 }
 check("17c cap_sec is unchanged", legacyBefore17c.count == 3 && snapshot(legacyService) == legacyBefore17c)
@@ -789,7 +805,7 @@ check("22b seed a newer copy it wrote with ck in the shared group during a fallb
 let before22b = diagnostics(rankVault)
 rankVault.queue.sync {
     check("22b the newer of two marked copies wins", describe(rankVault.loadValue(forKey: "f1")) == "resolve __secured_marked_newer" && currentValue(rankVault, "f1") == "decrypted(__secured_marked_newer)")
-    check("22b the class a set of this fork chose is kept", accessible("f1") == ["ck"], "\(accessible("f1"))")
+    check("22b a marked ck copy gets the configured class", accessible("f1") == ["aku"], "\(accessible("f1"))")
 }
 check("22b the older marked copy counts as conflicting", delta(before22b, diagnostics(rankVault), "conflictingDuplicates") == 1)
 
@@ -1370,7 +1386,59 @@ explicitSameKey.queue.sync {
 }
 check("H an existing key in another group is reused, not duplicated", keyCount(fallbackTags.secureEnclave) + keyCount(fallbackTags.software) == 1)
 
-check("phase 1 vaults never deleted a legacy copy", [vault, upgrade, nextLaunch, wipe, bundleVault, earlier, lostVaultG, badVault, mixVault].allSatisfy { counter(diagnostics($0), "duplicatesResolved") == 0 })
+print("--- I a failed legacy deletion keeps the newer cap_sec_v2 value")
+cleanAll()
+let partial = makeVault()
+let faults = DeletionFaults()
+partial.queue.sync {
+    partial.current.deleteMatching = faults.hook(currentService)
+    partial.legacy.deleteMatching = faults.hook(legacyService)
+    partial.standard.deleteMatching = faults.hook(standardService)
+}
+check("I seed a 0.13.0 token and a bundle id only std", wrapper.set("__secured_t0", forKey: "token", withAccessibility: .afterFirstUnlock) && KeychainWrapper.standard.set("__secured_s0", forKey: "std"))
+partial.queue.sync {
+    check("I get copies both, then set writes newer values into cap_sec_v2", describe(partial.loadValue(forKey: "token")) == "resolve __secured_t0" && describe(partial.loadValue(forKey: "std")) == "resolve __secured_s0" && describe(partial.storeValue("__secured_t1", forKey: "token")) == "resolve true" && describe(partial.storeValue("__secured_s1", forKey: "std")) == "resolve true")
+}
+faults.set(legacyService, errSecIO)
+partial.queue.sync {
+    faults.log.reset()
+    let removed = partial.removeValue(forKey: "token")
+    check("I remove rejects STORAGE_ERROR when the cap_sec deletion fails and leaves cap_sec_v2 alone", describe(removed) == "reject Remove failed" && code(removed) == "STORAGE_ERROR" && faults.log.events == [legacyService, standardService], "\(faults.log.events)")
+    check("I get then returns the newer value, the older cap_sec value does not come back", describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1" && currentValue(partial, "token") == "decrypted(__secured_t1)" && storedData("token", in: legacyService) == [Data("__secured_t0".utf8)])
+}
+faults.set(legacyService, nil)
+faults.set(standardService, errSecIO)
+partial.queue.sync {
+    faults.log.reset()
+    let removed = partial.removeValue(forKey: "std")
+    check("I remove rejects when the bundle id deletion fails and leaves cap_sec_v2 alone", describe(removed) == "reject Remove failed" && !faults.log.events.contains(currentService), "\(faults.log.events)")
+    check("I get then returns the newer value, the bundle id value does not come back", describe(partial.loadValue(forKey: "std")) == "resolve __secured_s1" && KeychainWrapper.standard.string(forKey: "std") == "__secured_s0")
+}
+faults.set(standardService, nil)
+faults.set(legacyService, errSecIO)
+partial.queue.sync {
+    faults.log.reset()
+    let cleared = partial.removeAllValues()
+    check("I clear rejects when the cap_sec deletion fails and leaves cap_sec_v2 alone", describe(cleared) == "reject error" && code(cleared) == "STORAGE_ERROR" && faults.log.events.last == legacyService && !faults.log.events.contains(currentService), "\(faults.log.events)")
+    check("I every newer value still reads back", describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1" && describe(partial.loadValue(forKey: "std")) == "resolve __secured_s1")
+    check("I a lost remove resolves and keeps the cap_sec_v2 item when the cap_sec deletion fails", describe(partial.removeLostValue(forKey: "token")) == "resolve true" && describe(partial.loadValue(forKey: "token")) == "resolve __secured_t1")
+    check("I a lost clear resolves and keeps cap_sec_v2 when the cap_sec deletion fails", describe(partial.removeAllLostValues()) == "resolve true" && listed(partial) == ["std", "token"], "\(listed(partial) ?? [])")
+}
+faults.set(legacyService, errSecInteractionNotAllowed)
+partial.queue.sync {
+    check("I a lost remove whose cap_sec deletion is refused still deletes the cap_sec_v2 item", describe(partial.removeLostValue(forKey: "token")) == "resolve true" && items(account: "token").isEmpty && items(account: "token", in: legacyService).count == 1)
+}
+faults.set(legacyService, nil)
+partial.queue.sync {
+    check("I seed r", describe(partial.storeValue("__secured_r", forKey: "r")) == "resolve true")
+    faults.log.reset()
+    check("I remove deletes cap_sec, then the bundle id copy, then cap_sec_v2", describe(partial.removeValue(forKey: "r")) == "resolve true" && faults.log.events == [legacyService, standardService, currentService], "\(faults.log.events)")
+    faults.log.reset()
+    check("I clear deletes cap_sec_v2 last and resolves", describe(partial.removeAllValues()) == "resolve true" && faults.log.events.last == currentService && faults.log.events.dropLast().last == legacyService, "\(faults.log.events)")
+    check("I clear left nothing behind", items().isEmpty && items(in: legacyService).isEmpty && !KeychainWrapper.standard.hasValue(forKey: "std") && code(partial.loadValue(forKey: "token")) == "NOT_FOUND")
+}
+
+check("phase 1 vaults never deleted a legacy copy", [vault, upgrade, nextLaunch, wipe, bundleVault, earlier, lostVaultG, badVault, mixVault, partial].allSatisfy { counter(diagnostics($0), "duplicatesResolved") == 0 })
 
 cleanAll()
 check("cleanup items", items().isEmpty && items(in: legacyService).isEmpty && allKeyCount() == 0)
