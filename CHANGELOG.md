@@ -1,4 +1,4 @@
-## 1.0.0 (unreleased)
+## 1.0.0
 
 - Fork of capacitor-secure-storage-plugin 0.13.0 maintained by Skip Pay
 - Package renamed to `better-capacitor-secure-storage-plugin` (`npm install better-capacitor-secure-storage-plugin`), the plugin name `SecureStoragePlugin` and the JavaScript API are unchanged
